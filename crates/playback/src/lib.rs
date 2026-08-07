@@ -1,6 +1,6 @@
 pub mod audio_engine;
 pub mod video_playback;
-pub use audio_engine::AudioEngine;
+pub use audio_engine::{AudioClock, AudioEngine};
 pub use video_playback::{VideoFrame, VideoPlayback};
 
 #[cfg(test)]
@@ -49,6 +49,26 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(500));
         assert!(engine.current_tick() > right_after_seek, "clock should keep advancing after seek");
+    }
+
+    #[test]
+    fn end_of_stream_freezes_clock_without_spamming_underruns() {
+        // Regression test: running play_clip past the end of a real clip
+        // showed underruns climbing into the hundreds because end-of-stream
+        // silence was being counted the same as the decoder falling behind.
+        media_ffmpeg::init().unwrap();
+        // test_playback_demo.mp4 is 8s; start near its end so EOF hits soon.
+        let near_end = timeline::TIMEBASE * 7;
+        let engine = AudioEngine::start(fixture("test_playback_demo.mp4"), near_end).unwrap();
+
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(engine.has_ended(), "expected to reach end of an 8s clip after 1.5s from the 7s mark");
+
+        let tick_a = engine.current_tick();
+        std::thread::sleep(Duration::from_millis(300));
+        let tick_b = engine.current_tick();
+        assert_eq!(tick_a, tick_b, "clock should hold steady at end of stream, not drift");
+        assert_eq!(engine.underrun_count(), 0, "end-of-stream silence must not count as underrun");
     }
 
     #[test]

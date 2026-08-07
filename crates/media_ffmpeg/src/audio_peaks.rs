@@ -86,10 +86,7 @@ pub fn generate_audio_peaks(source: &Path, samples_per_peak: u32) -> Result<Audi
     let mut decoded = ffmpeg_next::frame::Audio::empty();
     let mut resampled = ffmpeg_next::frame::Audio::empty();
 
-    for (s, packet) in input.packets() {
-        if s.index() != stream_index {
-            continue;
-        }
+    while let Some(packet) = crate::read_next_packet_for_stream(&mut input, stream_index) {
         decoder.send_packet(&packet)?;
         while decoder.receive_frame(&mut decoded).is_ok() {
             resampler.run(&decoded, &mut resampled)?;

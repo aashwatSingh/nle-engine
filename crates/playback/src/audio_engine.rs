@@ -31,6 +31,32 @@ struct ClockState {
     seek_epoch: AtomicU64,
     underruns: AtomicU64,
     playing: AtomicBool,
+    /// Set once the decode-ahead thread hits real end-of-stream. Distinct
+    /// from an underrun: silence after the source is legitimately exhausted
+    /// is expected behavior, not the decoder falling behind, so it must not
+    /// spam the underrun counter (caught by actually running this to the
+    /// end of a clip — see docs/decisions-log.md).
+    ended: AtomicBool,
+}
+
+/// A cheap, genuinely `Send + Sync` handle to the playback clock — separate
+/// from `AudioEngine` because `AudioEngine` owns a `cpal::Stream`, and CPAL
+/// deliberately makes `Stream` `!Send`/`!Sync` on Windows (it wraps COM
+/// objects, which aren't safely shareable across threads without care).
+/// The video decode-ahead thread needs to read the clock but must never
+/// touch the stream itself, so it gets this instead of the whole engine.
+#[derive(Clone)]
+pub struct AudioClock {
+    clock: Arc<ClockState>,
+    sample_rate: u32,
+}
+
+impl AudioClock {
+    pub fn current_tick(&self) -> i64 {
+        let frames = self.clock.consumed_frames.load(Ordering::Relaxed);
+        let base = self.clock.base_ticks.load(Ordering::Relaxed);
+        base + (frames as i128 * TIMEBASE as i128 / self.sample_rate as i128) as i64
+    }
 }
 
 pub struct AudioEngine {
@@ -63,6 +89,7 @@ impl AudioEngine {
             seek_epoch: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
             playing: AtomicBool::new(true),
+            ended: AtomicBool::new(false),
         });
 
         let (command_tx, command_rx) = mpsc::channel::<TransportCommand>();
@@ -83,6 +110,7 @@ impl AudioEngine {
                             decode_clock.base_ticks.store(ticks, Ordering::SeqCst);
                             decode_clock.consumed_frames.store(0, Ordering::SeqCst);
                             decode_clock.seek_epoch.fetch_add(1, Ordering::SeqCst);
+                            decode_clock.ended.store(false, Ordering::SeqCst);
                         }
                     }
                 }
@@ -96,7 +124,12 @@ impl AudioEngine {
                             pending = samples;
                             pending_offset = 0;
                         }
-                        Ok(None) | Err(_) => {
+                        Ok(None) => {
+                            decode_clock.ended.store(true, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => {
                             std::thread::sleep(std::time::Duration::from_millis(20));
                             continue;
                         }
@@ -134,7 +167,7 @@ impl AudioEngine {
                         for s in &mut data[popped..] {
                             *s = 0.0;
                         }
-                        if callback_clock.playing.load(Ordering::Relaxed) {
+                        if !callback_clock.ended.load(Ordering::Relaxed) {
                             callback_clock.underruns.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -154,9 +187,13 @@ impl AudioEngine {
     /// The authoritative playhead: derived from samples actually consumed
     /// by the real hardware callback, not a UI-thread timer.
     pub fn current_tick(&self) -> i64 {
-        let frames = self.clock.consumed_frames.load(Ordering::Relaxed);
-        let base = self.clock.base_ticks.load(Ordering::Relaxed);
-        base + (frames as i128 * TIMEBASE as i128 / self.sample_rate as i128) as i64
+        self.clock().current_tick()
+    }
+
+    /// A `Send + Sync` handle for other threads (e.g. video decode-ahead)
+    /// that only need to read the clock, not control the audio stream.
+    pub fn clock(&self) -> AudioClock {
+        AudioClock { clock: self.clock.clone(), sample_rate: self.sample_rate }
     }
 
     pub fn play(&self) {
@@ -177,5 +214,9 @@ impl AudioEngine {
 
     pub fn underrun_count(&self) -> u64 {
         self.clock.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn has_ended(&self) -> bool {
+        self.clock.ended.load(Ordering::Relaxed)
     }
 }

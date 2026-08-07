@@ -1,0 +1,15 @@
+[package]
+name = "play_clip"
+version = "0.0.1"
+edition = "2021"
+license = "UNLICENSED"
+
+# M2 capstone demo: real audio-clocked A/V playback in a window, with
+# transport controls and seeking. Proof for spec M2's acceptance bar.
+[dependencies]
+media_ffmpeg = { path = "../media_ffmpeg" }
+playback = { path = "../playback" }
+timeline = { path = "../timeline" }
+wgpu = "=0.20.1"
+winit = "=0.29.15"
+pollster = "0.3"

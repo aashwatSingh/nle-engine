@@ -19,6 +19,40 @@ pub use audio_stream::AudioDecoderStream;
 pub use proxy::{generate_proxy, ProxyOptions};
 pub use stream_decoder::VideoDecoderStream;
 
+/// Reads one packet, treating *any* read error as end-of-stream — not just
+/// `ffmpeg_next::Error::Eof`.
+///
+/// This works around a real bug found empirically while building the M2
+/// playback engine: `ffmpeg_next::format::context::input::PacketIter::next`
+/// only stops on the exact `Error::Eof` variant and otherwise loops forever
+/// retrying `av_read_frame` on *any* other error — including whatever a real
+/// (non-corrupt, ffmpeg-generated) file's true end-of-stream condition
+/// actually returns, which isn't always exactly `Eof`. Using `.packets()` /
+/// `for ... in input.packets()` anywhere near true EOF can hang forever with
+/// no error, no panic, and 100% CPU. Every packet-read loop in this crate
+/// goes through this function instead of `Input::packets()`.
+pub(crate) fn read_next_packet(input: &mut ffmpeg_next::format::context::Input) -> Option<ffmpeg_next::Packet> {
+    let mut packet = ffmpeg_next::Packet::empty();
+    match packet.read(input) {
+        Ok(()) => Some(packet),
+        Err(_) => None,
+    }
+}
+
+/// As `read_next_packet`, but skips packets belonging to other streams.
+pub(crate) fn read_next_packet_for_stream(
+    input: &mut ffmpeg_next::format::context::Input,
+    stream_index: usize,
+) -> Option<ffmpeg_next::Packet> {
+    loop {
+        match read_next_packet(input) {
+            Some(packet) if packet.stream() == stream_index => return Some(packet),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ProbeError {
     Io(std::io::Error),
@@ -189,10 +223,7 @@ pub fn probe(path: &Path) -> Result<MediaAsset, ProbeError> {
     let mut pts_index = Vec::new();
     let want_pts_index = video_info.as_ref().map(|(_, _, vfr)| *vfr).unwrap_or(false);
     if let Some((v_idx, _, _)) = &video_info {
-        for (stream, packet) in input.packets() {
-            if stream.index() != *v_idx {
-                continue;
-            }
+        while let Some(packet) = read_next_packet_for_stream(&mut input, *v_idx) {
             let pts = packet.pts().unwrap_or(0);
             if want_pts_index {
                 pts_index.push(pts);
@@ -277,10 +308,7 @@ pub fn decode_frame_at(path: &Path, target_ticks: i64) -> Result<DecodedRgbaFram
     let mut decoded = ffmpeg_next::frame::Video::empty();
     let mut best: Option<DecodedRgbaFrame> = None;
 
-    for (s, packet) in input.packets() {
-        if s.index() != stream_index {
-            continue;
-        }
+    while let Some(packet) = read_next_packet_for_stream(&mut input, stream_index) {
         decoder.send_packet(&packet)?;
         while decoder.receive_frame(&mut decoded).is_ok() {
             let pts_ticks = decoded

@@ -11,9 +11,15 @@ use std::path::Path;
 pub struct AudioDecoderStream {
     input: ffmpeg_next::format::context::Input,
     stream_index: usize,
+    time_base: ffmpeg_next::Rational,
     decoder: ffmpeg_next::codec::decoder::Audio,
     resampler: ffmpeg_next::software::resampling::Context,
     eof_sent: bool,
+    /// Set by `seek`: discard whole chunks before the target (see the
+    /// module-level note on this being coarser-grained than the video
+    /// seek's per-frame precision) — this is `Some` once we've decoded far
+    /// enough forward, `None` while still discarding pre-target chunks.
+    discard_before_ticks: Option<i64>,
 }
 
 impl AudioDecoderStream {
@@ -25,6 +31,7 @@ impl AudioDecoderStream {
             .map(|s| s.index())
             .ok_or(ProbeError::NoDecodableStreams)?;
         let stream = input.stream(stream_index).unwrap();
+        let time_base = stream.time_base();
         let decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?
             .decoder()
             .audio()?;
@@ -37,14 +44,31 @@ impl AudioDecoderStream {
             out_layout,
             target_rate,
         )?;
-        Ok(AudioDecoderStream { input, stream_index, decoder, resampler, eof_sent: false })
+        Ok(AudioDecoderStream {
+            input,
+            stream_index,
+            time_base,
+            decoder,
+            resampler,
+            eof_sent: false,
+            discard_before_ticks: None,
+        })
     }
 
+    /// Seeks to `target_ticks`, same long-GOP-aware discipline as
+    /// `VideoDecoderStream::seek` (see its doc comment for why the
+    /// container-level seek alone isn't enough). Coarser-grained than the
+    /// video seek: whole resampled chunks are discarded rather than
+    /// individual samples, so this can overshoot by up to one chunk's
+    /// duration (typically 10-40ms depending on codec frame size) — audio
+    /// scrubbing precision finer than that is a real follow-up, not built
+    /// speculatively here.
     pub fn seek(&mut self, target_ticks: i64) -> Result<(), ProbeError> {
         let target_us = (target_ticks as i128 * 1_000_000 / crate::timeline_timebase() as i128) as i64;
         self.input.seek(target_us, ..target_us)?;
         self.decoder.flush();
         self.eof_sent = false;
+        self.discard_before_ticks = Some(target_ticks);
         Ok(())
     }
 
@@ -54,6 +78,19 @@ impl AudioDecoderStream {
         let mut decoded = ffmpeg_next::frame::Audio::empty();
         loop {
             if self.decoder.receive_frame(&mut decoded).is_ok() {
+                let pts_ticks = decoded
+                    .pts()
+                    .map(|p| {
+                        (p as i128 * crate::timeline_timebase() as i128 * self.time_base.numerator() as i128
+                            / self.time_base.denominator() as i128) as i64
+                    })
+                    .unwrap_or(0);
+                if let Some(target) = self.discard_before_ticks {
+                    if pts_ticks < target {
+                        continue;
+                    }
+                    self.discard_before_ticks = None;
+                }
                 let mut resampled = ffmpeg_next::frame::Audio::empty();
                 self.resampler.run(&decoded, &mut resampled)?;
                 let n = resampled.samples() * resampled.channels() as usize;
@@ -70,8 +107,8 @@ impl AudioDecoderStream {
             if self.eof_sent {
                 return Ok(None);
             }
-            match self.input.packets().find(|(s, _)| s.index() == self.stream_index) {
-                Some((_, packet)) => self.decoder.send_packet(&packet)?,
+            match crate::read_next_packet_for_stream(&mut self.input, self.stream_index) {
+                Some(packet) => self.decoder.send_packet(&packet)?,
                 None => {
                     self.decoder.send_eof()?;
                     self.eof_sent = true;

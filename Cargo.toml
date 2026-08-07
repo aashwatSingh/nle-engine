@@ -13,6 +13,7 @@ members = [
     "crates/play_frame",
     "crates/spike_cpal",
     "crates/playback",
+    "crates/play_clip",
 ]
 
 [workspace.package]

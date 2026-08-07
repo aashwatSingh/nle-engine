@@ -1,5 +1,48 @@
 # Decisions log
 
+## 2026-08-07 — Two real bugs found building M2, both fixed at the media_ffmpeg layer
+
+Found while getting `play_clip` (the M2 capstone demo) to run cleanly to the
+end of an 8-second test clip — not from fuzzing or adversarial input, from
+completely ordinary use.
+
+**Bug 1 — `ffmpeg_next`'s `PacketIter` can hang forever, not just on corrupt
+files.** `Input::packets()`'s `Iterator::next()` only stops on the exact
+`Error::Eof` variant; any other error from `av_read_frame` (which real,
+non-corrupt files can legitimately return at true end-of-stream depending on
+container/codec specifics) makes it retry forever in a tight loop — no
+panic, no error, 100% CPU, forever. Reproduced empirically: audio decode on
+`test_playback_demo.mp4` hung exactly this way near end-of-stream. Spec
+section 8 requires ingest to never hang — this violated that on ordinary
+input, not even adversarial input. Fixed by adding `read_next_packet` /
+`read_next_packet_for_stream` in `media_ffmpeg/src/lib.rs`, which treat *any*
+read error as end-of-stream, and routing every packet-read loop in the crate
+through them instead of `Input::packets()`.
+
+**Bug 2 — `seek()` only did half of spec 4.1's seek algorithm.** The spec
+text is explicit: "seek to nearest preceding keyframe, decode forward,
+present target frame." The original `VideoDecoderStream::seek` /
+`AudioDecoderStream::seek` only did the container-level keyframe seek and
+stopped — for a sparse-keyframe encode (found empirically: a libx264 test
+fixture with exactly **one** keyframe across its entire 8-second, 240-frame
+duration, from unspecified `-g`/GOP settings), that meant seeking to *any*
+point in the file silently snapped back to frame 0, and every subsequent
+`next_frame()`/`next_samples()` call replayed from the start instead of the
+requested position. Fixed by decoding-and-discarding forward inside `seek()`
+until reaching the actual target: exact per-frame for video
+(`pending_frame` stash), coarser whole-chunk discarding for audio
+(`discard_before_ticks`) — documented as a bounded, honest imprecision
+(up to one resampled chunk's duration, ~10-40ms) rather than pretending it's
+sample-exact.
+
+**Why this matters beyond the fix:** this is exactly the kind of thing that
+would have shipped invisibly in a demo that only ever seeks near real
+keyframes, and only surfaced because the M2 capstone demo actually ran a
+full clip end-to-end with real seeks. Reinforces the project's own
+"verify by measuring, not reading" lesson from prior projects — the bug was
+invisible in code review and only found by running the real thing.
+
+
 ## 2026-08-07 — FFmpeg 7.1 (BtbN win64-gpl-shared), not 8.1; requires libclang + explicit MinGW target triple
 
 **Decision:** `media_ffmpeg` links against BtbN's `ffmpeg-n7.1-latest-win64-gpl-shared-7.1` build (extracted to

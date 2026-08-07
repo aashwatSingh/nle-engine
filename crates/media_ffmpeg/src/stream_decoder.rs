@@ -16,6 +16,10 @@ pub struct VideoDecoderStream {
     decoder: ffmpeg_next::codec::decoder::Video,
     scaler: ffmpeg_next::software::scaling::Context,
     eof_sent: bool,
+    /// Set by `seek`: the first frame at or after the seek target, found by
+    /// decoding forward past whatever the container-level seek landed on.
+    /// `next_frame` returns this before decoding anything further.
+    pending_frame: Option<DecodedRgbaFrame>,
 }
 
 impl VideoDecoderStream {
@@ -40,17 +44,38 @@ impl VideoDecoderStream {
             decoder.height(),
             ffmpeg_next::software::scaling::Flags::BILINEAR,
         )?;
-        Ok(VideoDecoderStream { input, stream_index, time_base, decoder, scaler, eof_sent: false })
+        Ok(VideoDecoderStream {
+            input,
+            stream_index,
+            time_base,
+            decoder,
+            scaler,
+            eof_sent: false,
+            pending_frame: None,
+        })
     }
 
-    /// Seeks near `target_ticks` (our TIMEBASE-based tick) and discards any
-    /// frames buffered in the decoder from before the seek — without this,
-    /// stale reference frames can leak into the post-seek output.
+    /// Seeks to `target_ticks` (our TIMEBASE-based tick), per spec 4.1's
+    /// long-GOP seek algorithm: "seek to nearest preceding keyframe, decode
+    /// forward, present target frame." The container-level seek below only
+    /// does the first half — for a sparse-keyframe encode (confirmed
+    /// empirically: a test fixture with a single keyframe for its entire 8s
+    /// duration), that can land far before the target, so every subsequent
+    /// `next_frame()` would silently replay from the keyframe instead of
+    /// the requested position unless we decode-and-discard forward here.
     pub fn seek(&mut self, target_ticks: i64) -> Result<(), ProbeError> {
         let target_us = (target_ticks as i128 * 1_000_000 / crate::timeline_timebase() as i128) as i64;
         self.input.seek(target_us, ..target_us)?;
         self.decoder.flush();
         self.eof_sent = false;
+        self.pending_frame = None;
+
+        while let Some(frame) = self.decode_next_raw()? {
+            if frame.pts_ticks >= target_ticks {
+                self.pending_frame = Some(frame);
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -58,6 +83,13 @@ impl VideoDecoderStream {
     /// stream. Call `seek` first to jump; without it this just continues
     /// from wherever the previous call left off.
     pub fn next_frame(&mut self) -> Result<Option<DecodedRgbaFrame>, ProbeError> {
+        if let Some(frame) = self.pending_frame.take() {
+            return Ok(Some(frame));
+        }
+        self.decode_next_raw()
+    }
+
+    fn decode_next_raw(&mut self) -> Result<Option<DecodedRgbaFrame>, ProbeError> {
         let mut decoded = ffmpeg_next::frame::Video::empty();
         loop {
             if self.decoder.receive_frame(&mut decoded).is_ok() {
@@ -66,8 +98,8 @@ impl VideoDecoderStream {
             if self.eof_sent {
                 return Ok(None);
             }
-            match self.input.packets().find(|(s, _)| s.index() == self.stream_index) {
-                Some((_, packet)) => self.decoder.send_packet(&packet)?,
+            match crate::read_next_packet_for_stream(&mut self.input, self.stream_index) {
+                Some(packet) => self.decoder.send_packet(&packet)?,
                 None => {
                     self.decoder.send_eof()?;
                     self.eof_sent = true;

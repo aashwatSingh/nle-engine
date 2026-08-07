@@ -99,10 +99,7 @@ pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> R
     let mut encoded_packet = ffmpeg_next::Packet::empty();
     let mut next_pts: i64 = 0;
 
-    for (stream, packet) in input.packets() {
-        if stream.index() != in_stream_index {
-            continue;
-        }
+    while let Some(packet) = crate::read_next_packet_for_stream(&mut input, in_stream_index) {
         decoder.send_packet(&packet)?;
         while decoder.receive_frame(&mut decoded).is_ok() {
             scaler.run(&decoded, &mut scaled)?;
