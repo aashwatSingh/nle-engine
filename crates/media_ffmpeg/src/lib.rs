@@ -215,6 +215,96 @@ pub fn probe(path: &Path) -> Result<MediaAsset, ProbeError> {
     })
 }
 
+/// CPU-side decoded frame, already converted to RGBA8 via swscale. This is
+/// deliberately NOT `media::Frame` (the GPU-texture canonical type) — this
+/// is the pre-upload intermediate, internal to this crate. Note this uses
+/// swscale's RGBA conversion purely to get pixels on screen for the M1
+/// display spike; it is NOT the color-managed working-space pipeline spec
+/// 4.5 describes (linear light, tagged color space) — that's M4 work, done
+/// on the GPU, not here.
+pub struct DecodedRgbaFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub pts_ticks: i64,
+}
+
+/// Decodes the first frame at or after `target_ticks` (our TIMEBASE-based
+/// tick, matching `timeline::TimeTick`). Opens and closes the decoder fresh
+/// each call — no caching, no decoder pool, no generation-based cancellation.
+/// That's the real `media::DecoderPool` (M2, once the playback engine exists
+/// to actually need concurrent/cancellable requests); this is the smallest
+/// thing that proves decode-to-pixels works at all, per spec M1's "display
+/// any frame from any file" acceptance bar.
+pub fn decode_frame_at(path: &Path, target_ticks: i64) -> Result<DecodedRgbaFrame, ProbeError> {
+    let mut input = ffmpeg_next::format::input(path)?;
+    let stream_index = input
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.index())
+        .ok_or(ProbeError::NoDecodableStreams)?;
+
+    let time_base = to_rational(input.stream(stream_index).unwrap().time_base());
+    let target_us = (target_ticks as i128 * 1_000_000 / timeline_timebase() as i128) as i64;
+    // Seeking is best-effort here; if it fails we just decode from wherever
+    // the demuxer currently is (typically the start), which still produces
+    // a correct — just not necessarily fast — result.
+    let _ = input.seek(target_us, ..target_us);
+
+    let stream = input.stream(stream_index).unwrap();
+    let mut decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?
+        .decoder()
+        .video()?;
+    let mut scaler = ffmpeg_next::software::scaling::Context::get(
+        decoder.format(),
+        decoder.width(),
+        decoder.height(),
+        ffmpeg_next::format::Pixel::RGBA,
+        decoder.width(),
+        decoder.height(),
+        ffmpeg_next::software::scaling::Flags::BILINEAR,
+    )?;
+
+    let mut decoded = ffmpeg_next::frame::Video::empty();
+    let mut best: Option<DecodedRgbaFrame> = None;
+
+    for (s, packet) in input.packets() {
+        if s.index() != stream_index {
+            continue;
+        }
+        decoder.send_packet(&packet)?;
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            let pts_ticks = decoded
+                .pts()
+                .map(|p| {
+                    (p as i128 * timeline_timebase() as i128 * time_base.num as i128
+                        / time_base.den as i128) as i64
+                })
+                .unwrap_or(0);
+            let mut rgba_frame = ffmpeg_next::frame::Video::empty();
+            scaler.run(&decoded, &mut rgba_frame)?;
+            let width = rgba_frame.width();
+            let height = rgba_frame.height();
+            let stride = rgba_frame.stride(0);
+            let data = rgba_frame.data(0);
+            let mut rgba = vec![0u8; (width * height * 4) as usize];
+            for row in 0..height as usize {
+                let src = &data[row * stride..row * stride + (width as usize * 4)];
+                let dst_start = row * width as usize * 4;
+                rgba[dst_start..dst_start + width as usize * 4].copy_from_slice(src);
+            }
+            let frame = DecodedRgbaFrame { width, height, rgba, pts_ticks };
+            let reached_target = pts_ticks >= target_ticks;
+            best = Some(frame);
+            if reached_target {
+                return Ok(best.unwrap());
+            }
+        }
+    }
+
+    best.ok_or(ProbeError::NoDecodableStreams)
+}
+
 fn timeline_timebase() -> i64 {
     // Duplicated constant rather than a dependency on `timeline` — `media`
     // (and this crate, which extends it) must not depend on `timeline` per
@@ -281,6 +371,30 @@ mod tests {
         assert_eq!(color.transfer, TransferFunction::Bt709);
         assert_eq!(color.matrix, MatrixCoefficients::Bt709);
         assert!(!color.full_range, "encoded with tv (limited) range");
+    }
+
+    #[test]
+    fn decodes_a_real_frame_with_varied_pixels() {
+        init().unwrap();
+        let frame = decode_frame_at(&fixture("test_h264.mp4"), 0).unwrap();
+        assert_eq!((frame.width, frame.height), (640, 360));
+        assert_eq!(frame.rgba.len(), 640 * 360 * 4);
+        // testsrc is a colorful gradient/pattern, not a flat color — if this
+        // decoded to all-zero or all-one-value pixels, the scaler/decode
+        // path is broken even though it "succeeded" with no error.
+        let first = frame.rgba[0];
+        assert!(
+            frame.rgba.iter().any(|&b| b != first),
+            "decoded frame is a flat color, decode/scale path is likely broken"
+        );
+    }
+
+    #[test]
+    fn decode_advances_past_first_frame_for_a_later_target() {
+        init().unwrap();
+        let early = decode_frame_at(&fixture("test_h264.mp4"), 0).unwrap();
+        let later = decode_frame_at(&fixture("test_h264.mp4"), timeline_timebase() * 2).unwrap();
+        assert!(later.pts_ticks > early.pts_ticks);
     }
 
     #[test]
