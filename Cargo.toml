@@ -9,6 +9,7 @@ members = [
     "crates/command",
     "crates/app",
     "crates/spike_wgpu",
+    "crates/media_ffmpeg",
 ]
 
 [workspace.package]

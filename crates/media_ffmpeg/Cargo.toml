@@ -1,0 +1,9 @@
+[package]
+name = "media_ffmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+media = { workspace = true }
+ffmpeg-next = "7"
