@@ -10,6 +10,11 @@ use media::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+pub mod audio_peaks;
+pub mod proxy;
+pub use audio_peaks::{generate_audio_peaks, AudioPeaks};
+pub use proxy::{generate_proxy, ProxyOptions};
+
 #[derive(Debug)]
 pub enum ProbeError {
     Io(std::io::Error),
