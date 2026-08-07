@@ -12,6 +12,7 @@ members = [
     "crates/media_ffmpeg",
     "crates/play_frame",
     "crates/spike_cpal",
+    "crates/playback",
 ]
 
 [workspace.package]

@@ -1,0 +1,11 @@
+[package]
+name = "playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+timeline = { workspace = true }
+media_ffmpeg = { path = "../media_ffmpeg" }
+cpal = "0.15"
+ringbuf = "0.4"
