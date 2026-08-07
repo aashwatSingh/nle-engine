@@ -12,8 +12,10 @@ use std::path::Path;
 
 pub mod audio_peaks;
 pub mod proxy;
+pub mod stream_decoder;
 pub use audio_peaks::{generate_audio_peaks, AudioPeaks};
 pub use proxy::{generate_proxy, ProxyOptions};
+pub use stream_decoder::VideoDecoderStream;
 
 #[derive(Debug)]
 pub enum ProbeError {
@@ -310,7 +312,7 @@ pub fn decode_frame_at(path: &Path, target_ticks: i64) -> Result<DecodedRgbaFram
     best.ok_or(ProbeError::NoDecodableStreams)
 }
 
-fn timeline_timebase() -> i64 {
+pub(crate) fn timeline_timebase() -> i64 {
     // Duplicated constant rather than a dependency on `timeline` — `media`
     // (and this crate, which extends it) must not depend on `timeline` per
     // docs/architecture.md's dependency direction. Kept in sync by the
