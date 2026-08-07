@@ -1,0 +1,9 @@
+[package]
+name = "timeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+media = { workspace = true }
+serde = { version = "1", features = ["derive"] }

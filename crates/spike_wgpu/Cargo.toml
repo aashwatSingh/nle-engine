@@ -1,0 +1,14 @@
+[package]
+name = "spike_wgpu"
+version = "0.0.1"
+edition = "2021"
+license = "UNLICENSED"
+
+# Pinned to exact versions, not "latest" — this is a spike meant to answer a
+# specific question (docs/risks.md #1 and #2), and an API-drift build error
+# from an unplanned wgpu/winit upgrade would just be noise against that.
+[dependencies]
+wgpu = "=0.20.1"
+winit = "=0.29.15"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }

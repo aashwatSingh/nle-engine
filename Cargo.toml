@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/timeline",
+    "crates/media",
+    "crates/render",
+    "crates/audio",
+    "crates/project",
+    "crates/command",
+    "crates/app",
+    "crates/spike_wgpu",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+timeline = { path = "crates/timeline" }
+media = { path = "crates/media" }
+render = { path = "crates/render" }
+audio = { path = "crates/audio" }
+project = { path = "crates/project" }
+command = { path = "crates/command" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = true

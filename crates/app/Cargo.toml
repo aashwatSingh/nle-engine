@@ -1,0 +1,17 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nle"
+path = "src/main.rs"
+
+[dependencies]
+timeline = { workspace = true }
+media = { workspace = true }
+render = { workspace = true }
+audio = { workspace = true }
+project = { workspace = true }
+command = { workspace = true }
