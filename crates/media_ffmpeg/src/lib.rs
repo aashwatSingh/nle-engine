@@ -398,6 +398,65 @@ mod tests {
     }
 
     #[test]
+    fn probes_h265_mp4() {
+        init().unwrap();
+        let asset = probe(&fixture("test_h265.mp4")).unwrap();
+        assert_eq!((asset.video.unwrap().width, 360), (640, 360));
+    }
+
+    #[test]
+    fn probes_av1_mkv() {
+        init().unwrap();
+        let asset = probe(&fixture("test_av1.mkv")).unwrap();
+        assert_eq!((asset.video.unwrap().width, 360), (640, 360));
+    }
+
+    #[test]
+    fn probes_4k() {
+        init().unwrap();
+        let asset = probe(&fixture("test_4k.mp4")).unwrap();
+        let video = asset.video.unwrap();
+        assert_eq!((video.width, video.height), (3840, 2160));
+    }
+
+    #[test]
+    fn probes_vertical_phone_style() {
+        init().unwrap();
+        let asset = probe(&fixture("test_vertical.mp4")).unwrap();
+        let video = asset.video.unwrap();
+        assert_eq!((video.width, video.height), (1080, 1920));
+    }
+
+    #[test]
+    fn detects_vfr_source_as_variable_not_silently_constant() {
+        // Spec 4.1: "Do not silently treat VFR as CFR — this is the single
+        // most common source of drifting audio in amateur editors."
+        init().unwrap();
+        let asset = probe(&fixture("test_vfr.mp4")).unwrap();
+        let video = asset.video.unwrap();
+        assert!(
+            matches!(video.frame_rate, FrameRateKind::Variable { .. }),
+            "expected Variable, got {:?}",
+            video.frame_rate
+        );
+        assert!(
+            !video.pts_index.is_empty(),
+            "VFR sources must get a real PTS index, not just a nominal rate"
+        );
+    }
+
+    #[test]
+    fn corrupt_file_fails_cleanly_instead_of_panicking() {
+        // Not a substitute for the real fuzzing pass spec section 8
+        // requires before v1.0 — just a first, cheap check that the obvious
+        // case (truncated file) returns Err rather than panicking or
+        // hanging, since that's the actual M1-relevant risk right now.
+        init().unwrap();
+        let result = probe(&fixture("test_corrupt.mp4"));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn content_hash_is_stable_across_probes() {
         init().unwrap();
         let a = probe(&fixture("test_h264.mp4")).unwrap();
