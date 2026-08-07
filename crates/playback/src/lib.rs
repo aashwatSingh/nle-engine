@@ -1,5 +1,7 @@
 pub mod audio_engine;
+pub mod video_playback;
 pub use audio_engine::AudioEngine;
+pub use video_playback::{VideoFrame, VideoPlayback};
 
 #[cfg(test)]
 mod tests {
@@ -47,6 +49,37 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(500));
         assert!(engine.current_tick() > right_after_seek, "clock should keep advancing after seek");
+    }
+
+    #[test]
+    fn video_playback_publishes_frames_tracking_a_driven_clock() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        media_ffmpeg::init().unwrap();
+        let clock_ticks = std::sync::Arc::new(AtomicI64::new(0));
+        let clock_for_thread = clock_ticks.clone();
+        let video = VideoPlayback::start(fixture("test_h264.mp4"), move || {
+            clock_for_thread.load(Ordering::Relaxed)
+        })
+        .unwrap();
+
+        // Drive the clock forward in real-ish steps, like the audio engine
+        // would, and confirm the published frame's pts tracks it.
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            clock_ticks.fetch_add(timeline::TIMEBASE / 20, Ordering::Relaxed); // +50ms
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let frame = video.latest_frame().expect("should have published at least one frame");
+        assert_eq!((frame.width, frame.height), (640, 360));
+        let clock_now = clock_ticks.load(Ordering::Relaxed);
+        assert!(
+            (clock_now - frame.pts_ticks).abs() < timeline::TIMEBASE / 2,
+            "published frame's pts ({}) should track the driven clock ({})",
+            frame.pts_ticks,
+            clock_now
+        );
     }
 
     #[test]
