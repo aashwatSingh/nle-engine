@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 media = { workspace = true }
 ffmpeg-next = "7"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

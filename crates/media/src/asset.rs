@@ -67,13 +67,20 @@ pub struct ColorMetadata {
 
 /// Pixel format as decoded, before any working-space conversion. Kept small
 /// deliberately for M0 — extended as real sources force it in M1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PixelFormat {
     Yuv420p8,
     Yuv422p10le,
     Yuv420p10le,
     Rgba8,
     Rgba16Float,
+    /// A real FFmpeg pixel format encountered during probing that doesn't
+    /// map to one of the named variants above yet (e.g. `yuvj420p`, `nv12`).
+    /// Named-not-panicking is the M1 policy: ingest must never fail just
+    /// because a format hasn't been explicitly enumerated here. Add a named
+    /// variant above once a real workflow needs to *decode* that format
+    /// specifically, not just probe and display its name.
+    Other(String),
 }
 
 /// One entry in the ingest-time keyframe index (spec 4.1). Lets a seek be a
