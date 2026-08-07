@@ -1,0 +1,8 @@
+[package]
+name = "spike_cpal"
+version = "0.0.1"
+edition = "2021"
+license = "UNLICENSED"
+
+[dependencies]
+cpal = "0.15"

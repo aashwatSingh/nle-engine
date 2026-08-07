@@ -11,6 +11,7 @@ members = [
     "crates/spike_wgpu",
     "crates/media_ffmpeg",
     "crates/play_frame",
+    "crates/spike_cpal",
 ]
 
 [workspace.package]
