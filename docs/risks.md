@@ -24,6 +24,18 @@ triangle. Trivial in isolation — the point is proving the full chain
 (rustc -> wgpu -> driver -> swapchain -> visible pixels) works before
 anything is built on top of it.
 
+**Result (2026-08-07):** ran. wgpu 0.20.1 (via `crates/spike_wgpu`) picked
+`Backends::PRIMARY`, which selected **Vulkan** on the RTX 4060 Laptop GPU
+(not D3D12 — wgpu's primary-backend selection on this machine preferred
+Vulkan; not investigated further since either backend answers the question).
+Adapter reported: `NVIDIA GeForce RTX 4060 Laptop GPU`, driver `560.94`.
+Window opened, triangle+quad rendered, sustained 165+ fps uncapped (present
+mode was whatever `caps.present_modes[0]` returned — not forced to
+`Fifo`/vsync, so this number isn't a real playback-rate result, just
+evidence the pipeline runs). Ran cleanly for 15s with no panics, no
+validation errors on stderr. Toolchain chain confirmed working end to end
+on the GNU/MinGW route (see decisions-log.md).
+
 ## 2. Concurrent multi-thread GPU texture upload
 
 **Risk:** the playback pipeline's core assumption (spec 4.4) is that decoder
@@ -38,6 +50,24 @@ single queue, the decode-pool-to-compositor handoff design in
 concurrently records and submits a render pass reading a different texture.
 Measure whether this actually parallelizes or serializes on `wgpu::Queue`'s
 internal lock.
+
+**Result (2026-08-07):** ran with 1 background thread (not N — that's a
+sharper version of this same test, worth doing once real decoder threads
+exist in M1) writing a full 256x256 RGBA8 frame via `queue.write_texture`
+at a 16ms-sleep target rate (~60Hz) while the main thread concurrently
+recorded and submitted a render pass sampling that same texture every
+frame. Measured over 15s: main thread sustained 165+ fps; background thread
+sustained 52-55 writes/s (below the 60Hz target — bottlenecked by the CPU
+cost of generating the 256KB gradient buffer per iteration in Rust, not by
+GPU contention; the `write_texture` call itself wasn't separately timed).
+No crash, no deadlock, no `wgpu` validation errors. This is real but weak
+evidence: it shows the two threads *coexist* without corrupting state, not
+that `wgpu::Queue` internals actually let them execute in parallel rather
+than politely taking turns on an internal lock — telling those apart needs
+per-call timing instrumentation, which wasn't built. Good enough to
+unblock M1/M2 design; not good enough to certify the throughput headroom
+the playback budget table needs. Revisit with N decoder threads and
+instrumented timing once real decode exists.
 
 ## 3. Real-time reverse playback on long-GOP 4K
 

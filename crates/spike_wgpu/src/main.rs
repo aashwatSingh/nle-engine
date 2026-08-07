@@ -47,7 +47,7 @@ fn main() {
 
     println!("adapter: {:?}", adapter.get_info());
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
+    let (device, queue_owned) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: None,
             required_features: wgpu::Features::empty(),
@@ -56,6 +56,9 @@ fn main() {
         None,
     ))
     .expect("request_device failed");
+    // wgpu::Queue/Texture don't implement Clone directly; Arc is the
+    // standard way to share a handle with the background upload thread.
+    let queue = Arc::new(queue_owned);
 
     let size = window.inner_size();
     let caps = surface.get_capabilities(&adapter);
@@ -110,11 +113,10 @@ fn main() {
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
-        cache: None,
     });
 
     // The texture a background "decoder" thread writes into concurrently.
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
+    let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
         label: Some("upload spike texture"),
         size: wgpu::Extent3d {
             width: TEXTURE_SIZE,
@@ -127,7 +129,7 @@ fn main() {
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
-    });
+    }));
     let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         mag_filter: wgpu::FilterMode::Linear,
@@ -198,7 +200,6 @@ fn main() {
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
-        cache: None,
     });
 
     // --- Background "decoder" thread: continuous concurrent GPU uploads ---
@@ -227,7 +228,7 @@ fn main() {
             }
             bg_queue.write_texture(
                 wgpu::ImageCopyTexture {
-                    texture: &bg_texture,
+                    texture: bg_texture.as_ref(),
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
