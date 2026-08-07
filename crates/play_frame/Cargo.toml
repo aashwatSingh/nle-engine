@@ -1,0 +1,15 @@
+[package]
+name = "play_frame"
+version = "0.0.1"
+edition = "2021"
+license = "UNLICENSED"
+
+# M1 capstone demo: decode a real frame from a real file (media_ffmpeg) and
+# display it in a wgpu window (same pattern spike_wgpu proved out for M0).
+# Not the real compositor (that's M4) — just visual proof decode-to-pixels
+# actually works end to end.
+[dependencies]
+media_ffmpeg = { path = "../media_ffmpeg" }
+wgpu = "=0.20.1"
+winit = "=0.29.15"
+pollster = "0.3"
