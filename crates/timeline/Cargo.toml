@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 media = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"

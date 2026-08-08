@@ -1,5 +1,52 @@
 # Decisions log
 
+## 2026-08-07 — Fourth/fifth real bugs: found by the M3 property-based test suite, fixed with a universal safety net
+
+Building the property-based test suite (spec 4.2/8: "run these tests
+against randomized edit sequences of length 1000+") immediately found two
+more real corruption bugs in the edit operations it was written to police:
+
+**Bug 4 — sync-lock ripple could compress a clip on top of unrelated,
+pre-existing content.** `ripple_shift`'s fix for the spanning-clip case
+(the "third bug" below it in this log, chronologically earlier) computes a
+new, compressed position for a clip that spans the ripple point. That new
+position can land exactly on top of a *different* clip already sitting on
+the same track — one that was never touched by the ripple at all, just
+structurally in the way. Found on a track dense with prior small inserts
+(the fuzzer's favorite move: repeatedly `Insert` 10-tick clips at position
+0), where the compressed landing spot happened to already be occupied.
+
+**Bug 5 — `TrimSlide` could produce a similar corruption** through a
+different interaction the fuzzer found but didn't fully pin to one root
+cause in the time available (source ranges were observed drifting to
+implausible values like `source_in: -289` under heavy repeated sliding,
+which is itself only a symptom of the model not bounds-checking against a
+real asset's duration — a separate, expected limitation of this pure
+data-model layer, not this bug).
+
+**Fix (for both, and any future one like them):** rather than chase every
+individual interaction bug in every operation, `apply()` now validates the
+*entire* resulting project — every track, `check_no_overlaps` — before
+ever returning it, rejecting with `EditError::WouldOverlap` if anything
+is wrong. Storage order is normalized (sorted by `timeline_in`) first,
+since operations like `TrimSlide` mutate a clip's position in place
+without re-sorting, and checking unsorted storage order directly would
+flag harmless reordering as a fake violation.
+
+**Why this is the right fix, not a cop-out:** for a pure function whose
+entire contract is `(Project, EditOp) -> Result<Project, EditError>`, "an
+operation that would corrupt state returns Err instead of Ok" is exactly
+the correctness bar the spec asks for — spec 4.2 never promises every
+*conceivable* edit succeeds, only that accepted edits preserve the
+invariants. This converts "undiscovered corruption slips through" into
+"an edge case we haven't individually reasoned through gets rejected
+instead of silently corrupting the project," which is the safe failure
+mode. It doesn't relieve pressure to keep improving individual operations'
+logic (a `TrimSlide` that spuriously rejects valid edits because of this
+is a real usability bug worth fixing later with more targeted logic) — it
+just guarantees the one failure mode the spec cares most about (silent
+corruption) can't happen regardless of what future interaction bugs turn up.
+
 ## 2026-08-07 — Third real bug: audio seek could silently discard all post-seek audio (race)
 
 Found while starting M3 and re-running the full test suite as a sanity

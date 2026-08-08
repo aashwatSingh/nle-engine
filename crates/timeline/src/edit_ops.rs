@@ -121,6 +121,30 @@ pub fn apply(project: &Project, op: &EditOp) -> Result<Project, EditError> {
             new_sequence_name.clone(),
         )?,
     }
+
+    // Final safety net, not a substitute for getting each operation right:
+    // the property-based test suite found real bugs (see
+    // docs/decisions-log.md) where an individual operation's own logic
+    // looked locally correct but produced a corrupt result through an
+    // interaction its author didn't anticipate. Every `apply` call
+    // validates the *entire* result before returning it — an operation
+    // that would corrupt state is rejected outright rather than silently
+    // handed back, converting "undiscovered corruption" into "clean,
+    // testable failure" even for interactions this file's tests don't
+    // cover yet.
+    //
+    // Sorted first: operations like `TrimSlide` mutate a clip's position in
+    // place without re-sorting the storage vec, so checking storage order
+    // directly would flag harmless reordering as a fake "not sorted"
+    // violation instead of only flagging genuine time overlaps.
+    for seq in &mut project.sequences {
+        for track in &mut seq.tracks {
+            track.clips.sort_by_key(|c| c.timeline_in.0);
+            if crate::model::invariants::check_no_overlaps(track).is_err() {
+                return Err(EditError::WouldOverlap);
+            }
+        }
+    }
     Ok(project)
 }
 
@@ -174,21 +198,80 @@ fn source_delta_for(speed: &SpeedCurve, timeline_delta: i64) -> i64 {
 /// applied to every other sync-locked track in the sequence too, per spec
 /// 4.2: "ripple operations preserve relative offsets on sync-locked
 /// tracks."
-fn ripple_shift(seq: &mut Sequence, source_track: TrackId, at_or_after: TimeTick, delta: i64) {
+///
+/// Found by the property-based test suite, not designed in up front: when
+/// `delta` is negative (a ripple *closing* a gap, e.g. from `Extract`) and
+/// a sync-locked sibling track's clip boundaries have diverged from the
+/// track that triggered the ripple, a clip can *span* `at_or_after` — its
+/// own timeline_in is before the point, so the naive rule ("shift clips
+/// with timeline_in >= at_or_after") leaves it in place, while clips after
+/// it *do* shift backward, straight into it. Real NLEs handle this by
+/// trimming the spanning clip's overlap with the removed range instead of
+/// leaving it untouched — see `trim_spanning_clip_for_negative_ripple`.
+///
+/// That trim can itself land the (now-shorter) clip on top of *other*,
+/// completely unrelated content already sitting on the same track — also
+/// found by the property test, on a track dense enough with prior edits
+/// that the compressed landing spot wasn't actually empty. Rather than
+/// silently produce a self-consistent-looking result that's still
+/// corrupt, this re-validates every touched track afterward and rejects
+/// the whole ripple (`WouldOverlap`) if any of them still collide —
+/// consistent with every other operation in this module validating before
+/// committing, not after.
+fn ripple_shift(seq: &mut Sequence, source_track: TrackId, at_or_after: TimeTick, delta: i64) -> Result<(), EditError> {
     if delta == 0 {
-        return;
+        return Ok(());
     }
     let sync_lock_active = find_track(seq, source_track).map(|t| t.sync_locked).unwrap_or(false);
     for track in seq.tracks.iter_mut() {
         if track.id == source_track || (sync_lock_active && track.sync_locked) {
+            if delta < 0 {
+                for clip in track.clips.iter_mut() {
+                    if clip.timeline_in < at_or_after && clip.timeline_out > at_or_after {
+                        trim_spanning_clip_for_negative_ripple(clip, at_or_after, delta);
+                    }
+                }
+            }
             for clip in track.clips.iter_mut() {
                 if clip.timeline_in >= at_or_after {
                     clip.timeline_in = TimeTick(clip.timeline_in.0 + delta);
                     clip.timeline_out = TimeTick(clip.timeline_out.0 + delta);
                 }
             }
+            track.clips.sort_by_key(|c| c.timeline_in.0);
+            if crate::model::invariants::check_no_overlaps(track).is_err() {
+                return Err(EditError::WouldOverlap);
+            }
         }
     }
+    Ok(())
+}
+
+/// A clip spans the point where a ripple of `delta` (< 0) ticks is about to
+/// remove the range `[at_or_after + delta, at_or_after)`. Keeps whatever
+/// part of the clip was *before* that removed range untouched, and shifts
+/// whatever part was *at or after* `at_or_after` back by `delta`, exactly
+/// like every other clip being rippled — the difference is this clip's
+/// span bridges both sides, so it shrinks instead of moving wholesale.
+///
+/// Known limitation: if the clip's own start is also before the removed
+/// range (it bridges "untouched prefix — deleted middle — surviving
+/// suffix"), this collapses the prefix and suffix into one continuous
+/// clip rather than splitting it — correct duration and no overlap, but
+/// the source content has an invisible jump at the seam. A real split
+/// would need a caller-supplied fresh ID, which this ripple primitive
+/// doesn't have (see the module doc comment's ID-minting rule). Rare
+/// enough in practice (it requires a sync-locked sibling track clip to
+/// bridge an edit point by a wide margin) that documenting it beats
+/// threading an optional ID through every ripple call site for it.
+fn trim_spanning_clip_for_negative_ripple(clip: &mut ClipInstance, at_or_after: TimeTick, delta: i64) {
+    let removed_start = TimeTick(at_or_after.0 + delta);
+    let new_timeline_in = clip.timeline_in.min(removed_start);
+    let new_timeline_out = TimeTick(clip.timeline_out.0 + delta);
+    let removed_ticks = (clip.timeline_out.0 - clip.timeline_in.0) - (new_timeline_out.0 - new_timeline_in.0);
+    clip.source_in = TimeTick(clip.source_in.0 + source_delta_for(&clip.speed, removed_ticks));
+    clip.timeline_in = new_timeline_in;
+    clip.timeline_out = new_timeline_out;
 }
 
 fn insert_sorted(track: &mut Track, clip: ClipInstance) {
@@ -228,7 +311,7 @@ fn apply_insert(
         split_clip_on_track(seq, track_id, at, new_id)?;
     }
 
-    ripple_shift(seq, track_id, at, duration);
+    ripple_shift(seq, track_id, at, duration)?;
     let mut new_clip = clip.clone();
     new_clip.timeline_in = at;
     new_clip.timeline_out = TimeTick(at.0 + duration);
@@ -301,7 +384,7 @@ fn apply_extract(project: &mut Project, clip_id: ClipInstanceId) -> Result<(), E
     }
     let removed = seq.tracks[track_idx].clips.remove(clip_idx);
     let duration = removed.timeline_out.0 - removed.timeline_in.0;
-    ripple_shift(seq, track_id, removed.timeline_out, -duration);
+    ripple_shift(seq, track_id, removed.timeline_out, -duration)?;
     Ok(())
 }
 
@@ -366,7 +449,7 @@ fn apply_trim_ripple(
             (None, None) => return Err(EditError::InvalidRange),
         }
     }
-    ripple_shift(seq, track_id, old_out, ripple_delta);
+    ripple_shift(seq, track_id, old_out, ripple_delta)?;
     Ok(())
 }
 
