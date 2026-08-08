@@ -20,7 +20,8 @@
 use playback::{AudioEngine, VideoPlayback};
 use render::wgpu;
 use render::{
-    transform, BuiltinRegistry, Compositor, DeliverySpace, GraphCompiler, SourceFrames,
+    color_correction, gaussian_blur, transform, BuiltinRegistry, Compositor, DeliverySpace,
+    GraphCompiler, SourceFrames,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -67,17 +68,16 @@ fn seek_all(
     *top_last_pts = None;
 }
 
-fn transform_fx(params: Vec<(&str, ParamValue)>) -> EffectInstance {
+fn effect_fx(id: u64, type_id: &str, params: Vec<(&str, ParamValue)>) -> EffectInstance {
     let mut map = BTreeMap::new();
     for (name, value) in params {
         map.insert(name.to_string(), ParamTrack::constant(value));
     }
-    EffectInstance {
-        id: EffectInstanceId(1),
-        effect_type: transform::TYPE_ID.to_string(),
-        enabled: true,
-        params: map,
-    }
+    EffectInstance { id: EffectInstanceId(id), effect_type: type_id.to_string(), enabled: true, params: map }
+}
+
+fn transform_fx(params: Vec<(&str, ParamValue)>) -> EffectInstance {
+    effect_fx(1, transform::TYPE_ID, params)
 }
 
 fn clip(id: u64, asset: media::MediaAssetId, duration: i64, effects: Vec<EffectInstance>) -> ClipInstance {
@@ -142,7 +142,31 @@ fn main() {
                 drop_frame_timecode: false,
             },
             tracks: vec![
-                video_track(1, "V1", vec![clip(1, bottom_asset.id, bottom_asset.duration_ticks, vec![])]),
+                video_track(
+                    1,
+                    "V1",
+                    // M5 exercise: a warm grade + a touch of softening,
+                    // running the multi-stage pipeline (prepare -> effect
+                    // chain -> place) continuously across all 8 seconds of
+                    // real playback, not just in a single static test frame.
+                    vec![clip(
+                        1,
+                        bottom_asset.id,
+                        bottom_asset.duration_ticks,
+                        vec![
+                            effect_fx(
+                                10,
+                                color_correction::TYPE_ID,
+                                vec![
+                                    (color_correction::TEMPERATURE, ParamValue::Number(0.25)),
+                                    (color_correction::CONTRAST, ParamValue::Number(0.1)),
+                                    (color_correction::SATURATION, ParamValue::Number(1.15)),
+                                ],
+                            ),
+                            effect_fx(11, gaussian_blur::TYPE_ID, vec![(gaussian_blur::RADIUS, ParamValue::Number(1.5))]),
+                        ],
+                    )],
+                ),
                 video_track(
                     2,
                     "V2",
