@@ -7,3 +7,8 @@ license.workspace = true
 [dependencies]
 timeline = { workspace = true }
 media = { workspace = true }
+# Pinned to match spike_wgpu / play_frame / play_clip — a version skew here
+# would mean two incompatible wgpu types in one binary.
+wgpu = "=0.20.1"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"

@@ -122,3 +122,28 @@ frame both through the "preview" path and the "export" path at matched
 resolution and diff them. This tells us now whether the render graph itself
 is deterministic and reusable, independent of the proxy-resolution question,
 which needs a product decision, not a spike.
+
+**RESOLVED (M4).** Two parts:
+
+*The engineering half is done and proven.* `Compositor::render_to_view`
+(preview) and `Compositor::render_to_rgba` (export) are thin wrappers over
+one shared `composite_to_working` + `deliver` core — there is no second
+copy of the compositing logic to keep in sync, so "preview matches export"
+is structural rather than maintained by hand.
+`acceptance_preview_and_export_paths_produce_identical_pixels` (in
+`crates/render/tests/compositor_gpu.rs`) renders a non-trivial two-track
+graph — blending, opacity, scale, rotation, position, colour conversion —
+through both entry points and asserts the readbacks are **byte-identical**,
+plus asserts the frame isn't a flat colour so the comparison can't pass
+vacuously. This satisfies spec M4's acceptance criterion.
+
+*The definitional half is now settled as a documented decision:* "preview is
+a true representation of export" means **same render graph, same effect
+math, same colour pipeline, byte-identical at matched resolution.** It
+explicitly does *not* claim a proxy-resolution preview is byte-identical to
+a full-resolution export — that's impossible by construction, and any spec
+reading that demands it is unachievable rather than merely unimplemented.
+When proxies are enabled, the correct bar is the spec's own golden-frame
+methodology (section 8): perceptual-difference threshold, not bit equality.
+The P0-bug bar from section 4.8 therefore applies to *graph/math/colour*
+divergence, which is what's now tested, and not to resolution.

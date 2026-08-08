@@ -1,5 +1,58 @@
 # Decisions log
 
+## 2026-08-07 — M4 compositing: conventions fixed, and why each one
+
+Five decisions that the rest of the renderer now depends on. Recording them
+because each had a defensible alternative and picking differently later
+would be a rewrite rather than a tweak.
+
+**1. Track order is bottom-to-top (`tracks[0]` is the bottom layer).**
+Matches how V1/V2/V3 read in every NLE. The compiler emits `track_plans` in
+that order and the compositor draws in that order, so "the list order *is*
+the composite order" — no separate z-index to keep consistent.
+
+**2. Effect keyframes are clip-relative, not absolute sequence time.**
+A `ParamTrack` on a clip's effect is evaluated at `tick -
+clip.timeline_in`. This is what makes a clip carry its own animation when
+it's moved or rippled. The alternative (absolute ticks) would mean every
+ripple edit silently re-times every animation downstream of it — which is
+the kind of bug that only shows up after a long edit session and is
+miserable to attribute. Pinned by
+`effect_keyframes_are_clip_relative_so_moving_a_clip_carries_its_animation`.
+
+**3. Blending happens in linear light, in a 16-bit-float working space.**
+Non-negotiable per spec 4.5, and now actually verified rather than assumed:
+`opacity_blends_the_top_track_over_the_bottom` asserts a 50% white-over-black
+blend produces ~180/255, not 128. 128 would mean blending in encoded space —
+the classic cause of "why do my dissolves look muddy". The working target is
+never clamped mid-pipeline, so out-of-gamut negatives from wide-gamut
+sources survive to the delivery pass, where clamping happens once.
+
+**4. The Rec.709 transfer function uses the camera OETF, not a display
+EOTF.** So `linear_to_rec709(rec709_to_linear(x)) == x` exactly, making a
+709-in/709-out edit with no colour work a true no-op — verified on both CPU
+(`rec709_identity_conversion_is_a_true_no_op`) and GPU
+(`rec709_source_round_trips_through_the_gpu_unchanged`). A display-referred
+pipeline using the ~2.4 EOTF is an equally valid design; the difference
+manifests as a subtle global contrast shift, so it's called out in
+`color.rs` rather than left implicit.
+
+**5. The WGSL colour math mirrors `color.rs`, and the matrices are passed in
+from it.** The transfer functions are necessarily duplicated (CPU reference
+vs. GPU implementation), but the gamut matrices are uploaded as uniforms
+from the tested CPU constants rather than hardcoded in the shader —
+specifically because a transposed or subtly wrong matrix still looks
+plausible and is the hardest kind of colour bug to see. The GPU round-trip
+test is what catches the transfer functions drifting.
+
+**Deferred, deliberately:** HDR (PQ/HLG) is *refused* by
+`transfer_to_linear`/`to_delivery` rather than approximated — it needs a
+tone-mapping policy and nit target, which are product decisions, and
+silently emitting wrong-looking HDR is worse than a clear error. Effects
+other than Transform are M5; the compiler already resolves them generically
+and counts unrecognised ones in `unknown_effects` rather than dropping them
+silently.
+
 ## 2026-08-07 — Fourth/fifth real bugs: found by the M3 property-based test suite, fixed with a universal safety net
 
 Building the property-based test suite (spec 4.2/8: "run these tests
