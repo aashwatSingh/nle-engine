@@ -12,8 +12,8 @@
 use media::{ColorMetadata, ColorPrimaries, MatrixCoefficients, MediaAssetId, TransferFunction};
 use render::wgpu;
 use render::{
-    headless_context, transform, BuiltinRegistry, Compositor, DeliverySpace, GraphCompiler,
-    SourceFrames,
+    color_correction, crop, gaussian_blur, headless_context, mask, transform, BuiltinRegistry,
+    Compositor, DeliverySpace, GraphCompiler, SourceFrames,
 };
 use std::collections::BTreeMap;
 use timeline::{
@@ -80,17 +80,29 @@ fn clip(id: u64, asset: u128, tin: i64, tout: i64) -> ClipInstance {
     }
 }
 
-fn transform_fx(params: Vec<(&str, ParamValue)>) -> EffectInstance {
+fn effect_fx(id: u64, type_id: &str, params: Vec<(&str, ParamValue)>) -> EffectInstance {
     let mut map = BTreeMap::new();
     for (name, value) in params {
         map.insert(name.to_string(), ParamTrack::constant(value));
     }
-    EffectInstance {
-        id: EffectInstanceId(1),
-        effect_type: transform::TYPE_ID.to_string(),
-        enabled: true,
-        params: map,
+    EffectInstance { id: EffectInstanceId(id), effect_type: type_id.to_string(), enabled: true, params: map }
+}
+
+fn transform_fx(params: Vec<(&str, ParamValue)>) -> EffectInstance {
+    effect_fx(1, transform::TYPE_ID, params)
+}
+
+/// A checkerboard so blur has real high-frequency content to smooth out.
+fn checkerboard(w: u32, h: u32, cell: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let on = ((x / cell) + (y / cell)) % 2 == 0;
+            let v = if on { 255 } else { 0 };
+            out.extend_from_slice(&[v, v, v, 255]);
+        }
     }
+    out
 }
 
 fn video_track(id: u64, clips: Vec<ClipInstance>) -> Track {
@@ -522,6 +534,297 @@ fn acceptance_preview_and_export_paths_produce_identical_pixels() {
 
 /// Copies a texture back to the CPU, stripping the 256-byte row padding the
 /// GPU requires.
+// --- M5: Gaussian Blur ---
+
+#[test]
+fn gaussian_blur_smooths_a_checkerboard() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    // Cells wider than the blur radius so the centre of each cell stays
+    // near its original value while cell BOUNDARIES get smoothed.
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&checkerboard(SEQ_W, SEQ_H, 16), SEQ_W, SEQ_H, rec709()));
+
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![effect_fx(2, gaussian_blur::TYPE_ID, vec![(gaussian_blur::RADIUS, ParamValue::Number(6.0))])];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, stats) = render(&comp, &p, &sources);
+    assert_eq!(stats.layers_drawn, 1);
+
+    // A cell boundary (e.g. x=16, the edge between the first two cells) must
+    // no longer be pure black or white — the whole point of the blur.
+    let boundary = frame.pixel(16, 32)[0];
+    assert!(
+        boundary > 20 && boundary < 235,
+        "cell boundary should be smoothed to an intermediate value, got {boundary}"
+    );
+    // Deep inside a cell, far from any boundary, should stay close to the
+    // original value — the blur must not smear the whole image uniformly.
+    let cell_centre = frame.pixel(8, 8)[0];
+    assert!(cell_centre > 200, "cell centre should stay close to its original white, got {cell_centre}");
+}
+
+#[test]
+fn gaussian_blur_radius_zero_matches_the_fast_path() {
+    // Regression test for the multi-stage plumbing itself: prepare + a
+    // skipped (radius=0) blur pass + place should be numerically identical
+    // to the single-pass fast path, since it's the same conversion math
+    // split across two draws instead of one.
+    let comp = compositor();
+    let pixels = solid(SEQ_W, SEQ_H, [180, 90, 40, 255]);
+
+    let mut sources_plain = SourceFrames::default();
+    sources_plain.insert(MediaAssetId(1), 0, comp.upload_rgba(&pixels, SEQ_W, SEQ_H, rec709()));
+    let plain = project_with(vec![video_track(1, vec![clip(1, 1, 0, 100)])]);
+    let (plain_frame, _) = render(&comp, &plain, &sources_plain);
+
+    let mut sources_blur = SourceFrames::default();
+    sources_blur.insert(MediaAssetId(1), 0, comp.upload_rgba(&pixels, SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![effect_fx(2, gaussian_blur::TYPE_ID, vec![(gaussian_blur::RADIUS, ParamValue::Number(0.0))])];
+    let with_zero_blur = project_with(vec![video_track(1, vec![c])]);
+    let (blurred_frame, _) = render(&comp, &with_zero_blur, &sources_blur);
+
+    assert_eq!(
+        plain_frame.pixel(SEQ_W / 2, SEQ_H / 2),
+        blurred_frame.pixel(SEQ_W / 2, SEQ_H / 2),
+        "a zero-radius blur must not change the image"
+    );
+}
+
+// --- M5: Color Correction ---
+
+#[test]
+fn color_correction_exposure_brightens_and_darkens() {
+    let comp = compositor();
+    let base = [80u8, 80, 80, 255];
+
+    let render_with_exposure = |ev: f64| {
+        let mut sources = SourceFrames::default();
+        sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, base), SEQ_W, SEQ_H, rec709()));
+        let mut c = clip(1, 1, 0, 100);
+        c.effects = vec![effect_fx(2, color_correction::TYPE_ID, vec![(color_correction::EXPOSURE, ParamValue::Number(ev))])];
+        let p = project_with(vec![video_track(1, vec![c])]);
+        render(&comp, &p, &sources).0.pixel(SEQ_W / 2, SEQ_H / 2)[0]
+    };
+
+    let neutral = render_with_exposure(0.0);
+    let brighter = render_with_exposure(1.0);
+    let darker = render_with_exposure(-1.0);
+    assert!(brighter > neutral, "+1 stop should brighten: {brighter} vs {neutral}");
+    assert!(darker < neutral, "-1 stop should darken: {darker} vs {neutral}");
+}
+
+#[test]
+fn color_correction_saturation_zero_desaturates_to_grey() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [220, 40, 40, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![effect_fx(2, color_correction::TYPE_ID, vec![(color_correction::SATURATION, ParamValue::Number(0.0))])];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, _) = render(&comp, &p, &sources);
+    let px = frame.pixel(SEQ_W / 2, SEQ_H / 2);
+    let max_diff = px[0].abs_diff(px[1]).max(px[1].abs_diff(px[2])).max(px[0].abs_diff(px[2]));
+    assert!(max_diff <= 2, "saturation=0 should produce a neutral grey, got {px:?}");
+}
+
+#[test]
+fn color_correction_saturation_two_increases_difference_from_grey() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [180, 100, 100, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![effect_fx(2, color_correction::TYPE_ID, vec![(color_correction::SATURATION, ParamValue::Number(2.0))])];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, _) = render(&comp, &p, &sources);
+    let px = frame.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert!(px[0].abs_diff(px[1]) > 80, "saturation=2 should exaggerate the red/green gap, got {px:?}");
+}
+
+#[test]
+fn color_correction_temperature_shifts_red_blue_balance() {
+    let comp = compositor();
+    let render_with_temp = |t: f64| {
+        let mut sources = SourceFrames::default();
+        sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [128, 128, 128, 255]), SEQ_W, SEQ_H, rec709()));
+        let mut c = clip(1, 1, 0, 100);
+        c.effects = vec![effect_fx(2, color_correction::TYPE_ID, vec![(color_correction::TEMPERATURE, ParamValue::Number(t))])];
+        let p = project_with(vec![video_track(1, vec![c])]);
+        render(&comp, &p, &sources).0.pixel(SEQ_W / 2, SEQ_H / 2)
+    };
+    let warm = render_with_temp(1.0);
+    let cool = render_with_temp(-1.0);
+    assert!(warm[0] > warm[2], "warm should push red above blue, got {warm:?}");
+    assert!(cool[2] > cool[0], "cool should push blue above red, got {cool:?}");
+}
+
+#[test]
+fn color_correction_contrast_increases_spread_between_tones() {
+    let comp = compositor();
+    let render_patch = |contrast: f64, value: u8| {
+        let mut sources = SourceFrames::default();
+        sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [value, value, value, 255]), SEQ_W, SEQ_H, rec709()));
+        let mut c = clip(1, 1, 0, 100);
+        c.effects = vec![effect_fx(2, color_correction::TYPE_ID, vec![(color_correction::CONTRAST, ParamValue::Number(contrast))])];
+        let p = project_with(vec![video_track(1, vec![c])]);
+        render(&comp, &p, &sources).0.pixel(SEQ_W / 2, SEQ_H / 2)[0]
+    };
+    let dark_neutral = render_patch(0.0, 40);
+    let light_neutral = render_patch(0.0, 220);
+    let dark_high = render_patch(0.8, 40);
+    let light_high = render_patch(0.8, 220);
+    assert!(
+        light_high - dark_high > light_neutral - dark_neutral,
+        "higher contrast should widen the gap between a dark and light tone: neutral gap {} vs high-contrast gap {}",
+        light_neutral - dark_neutral,
+        light_high - dark_high
+    );
+}
+
+// --- M5: Crop ---
+
+#[test]
+fn crop_makes_edges_transparent_and_preserves_the_centre() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [200, 200, 200, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![effect_fx(
+        2,
+        crop::TYPE_ID,
+        vec![
+            (crop::LEFT, ParamValue::Number(0.25)),
+            (crop::RIGHT, ParamValue::Number(0.25)),
+            (crop::TOP, ParamValue::Number(0.25)),
+            (crop::BOTTOM, ParamValue::Number(0.25)),
+        ],
+    )];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, _) = render(&comp, &p, &sources);
+
+    assert_eq!(frame.pixel(2, 2)[3], 0, "corner should be cropped away");
+    assert_eq!(frame.pixel(SEQ_W / 2, SEQ_H / 2)[3], 255, "centre should survive a 25%-per-edge crop");
+    assert_channel_near(frame.pixel(SEQ_W / 2, SEQ_H / 2)[0], 200, 2, "centre colour preserved");
+}
+
+// --- M5: Mask ---
+
+fn mask_fx(is_rect: bool, center: (f64, f64), size: (f64, f64), feather: f64, invert: bool) -> EffectInstance {
+    effect_fx(
+        3,
+        mask::TYPE_ID,
+        vec![
+            (mask::IS_RECTANGLE, ParamValue::Bool(is_rect)),
+            (mask::CENTER, ParamValue::Vec2(center.0, center.1)),
+            (mask::SIZE, ParamValue::Vec2(size.0, size.1)),
+            (mask::FEATHER, ParamValue::Number(feather)),
+            (mask::INVERT, ParamValue::Bool(invert)),
+        ],
+    )
+}
+
+#[test]
+fn rectangle_mask_shows_inside_and_hides_outside() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 255, 255, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![mask_fx(true, (0.5, 0.5), (0.2, 0.2), 0.001, false)];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, _) = render(&comp, &p, &sources);
+
+    assert_eq!(frame.pixel(SEQ_W / 2, SEQ_H / 2)[3], 255, "centre is inside the rectangle mask");
+    assert_eq!(frame.pixel(2, 2)[3], 0, "corner is well outside the rectangle mask");
+}
+
+#[test]
+fn ellipse_mask_shows_inside_and_hides_outside() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 255, 255, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![mask_fx(false, (0.5, 0.5), (0.2, 0.2), 0.001, false)];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, _) = render(&comp, &p, &sources);
+
+    assert_eq!(frame.pixel(SEQ_W / 2, SEQ_H / 2)[3], 255, "centre is inside the ellipse mask");
+    assert_eq!(frame.pixel(2, 2)[3], 0, "corner is well outside the ellipse mask's radius");
+    // A point inside the mask's bounding box but outside its actual circular
+    // radius (a corner of the box, not of the frame) — this is what
+    // distinguishes an ellipse from a same-sized rectangle mask.
+    let box_corner_but_outside_circle = frame.pixel(
+        (0.5 * SEQ_W as f32 + 0.19 * SEQ_W as f32) as u32,
+        (0.5 * SEQ_H as f32 + 0.19 * SEQ_H as f32) as u32,
+    );
+    assert_eq!(box_corner_but_outside_circle[3], 0, "diagonal corner of the bounding box should be outside the ellipse");
+}
+
+#[test]
+fn mask_feather_produces_a_smooth_gradient_not_a_hard_edge() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 255, 255, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![mask_fx(true, (0.5, 0.5), (0.2, 0.2), 0.15, false)];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, _) = render(&comp, &p, &sources);
+
+    // Walking outward from the centre across the feathered edge, alpha
+    // should decrease monotonically rather than jumping straight from
+    // 255 to 0.
+    let y = SEQ_H / 2;
+    let alphas: Vec<u8> = (SEQ_W / 2..SEQ_W).map(|x| frame.pixel(x, y)[3]).collect();
+    assert_eq!(alphas[0], 255, "still fully inside at the centre");
+    assert!(*alphas.last().unwrap() < 10, "fully outside by the frame edge");
+    let mut saw_intermediate = false;
+    for &a in &alphas {
+        if a > 10 && a < 245 {
+            saw_intermediate = true;
+            break;
+        }
+    }
+    assert!(saw_intermediate, "expected a soft gradient somewhere in the feather zone, got {alphas:?}");
+}
+
+#[test]
+fn mask_invert_swaps_inside_and_outside() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 255, 255, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![mask_fx(true, (0.5, 0.5), (0.2, 0.2), 0.001, true)];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, _) = render(&comp, &p, &sources);
+
+    assert_eq!(frame.pixel(SEQ_W / 2, SEQ_H / 2)[3], 0, "inverted mask hides the centre");
+    assert_eq!(frame.pixel(2, 2)[3], 255, "inverted mask shows the corner");
+}
+
+#[test]
+fn mask_moves_with_the_clip_not_with_the_sequence() {
+    // Masks are defined in the clip's own source-UV space (see
+    // effect.rs's `mask` module doc comment), so a clip repositioned via
+    // `transform::POSITION` must carry its mask along with it rather than
+    // leaving the mask fixed in sequence space.
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 255, 255, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![
+        mask_fx(true, (0.5, 0.5), (0.2, 0.2), 0.001, false),
+        transform_fx(vec![(transform::POSITION, ParamValue::Vec2(1000.0, 0.0))]),
+    ];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let (frame, _) = render(&comp, &p, &sources);
+    // The clip (and its mask) have been pushed far off-frame, so nothing
+    // from this clip should be visible anywhere in the sequence — if the
+    // mask were evaluated in sequence space instead, the old on-screen mask
+    // position could still show content.
+    for (x, y) in [(0, 0), (SEQ_W / 2, SEQ_H / 2), (SEQ_W - 1, SEQ_H - 1)] {
+        assert_eq!(frame.pixel(x, y)[3], 0, "clip moved off-frame; nothing of it (mask included) should show at ({x},{y})");
+    }
+}
+
 fn read_back(comp: &Compositor, texture: &wgpu::Texture, width: u32, height: u32) -> Vec<u8> {
     let unpadded = width * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;

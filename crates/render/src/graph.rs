@@ -19,7 +19,7 @@
 //!    it's moved or rippled — the alternative (absolute ticks) would mean
 //!    every ripple edit silently re-times every animation downstream of it.
 
-use crate::effect::{transform, EffectRegistry};
+use crate::effect::{mask, transform, EffectRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use timeline::{
@@ -75,6 +75,43 @@ impl EffectPass {
             _ => None,
         }
     }
+
+    pub fn bool_param(&self, name: &str) -> Option<bool> {
+        match self.resolved_params.get(name) {
+            Some(ParamValue::Bool(v)) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+/// A resolved mask shape, folded from a clip's `mask` effect instance (at
+/// most one is meaningful — see `mask` module doc comment). `enabled` is
+/// `false` when the clip has no mask, which the compositor treats as "no
+/// masking, alpha unmodified."
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaskShape {
+    pub enabled: bool,
+    pub is_rectangle: bool,
+    /// Normalised 0..1 within the source frame.
+    pub center: (f32, f32),
+    /// Normalised 0..1 half-extents (rectangle) or radii (ellipse).
+    pub size: (f32, f32),
+    /// Normalised 0..1 fraction of the frame diagonal.
+    pub feather: f32,
+    pub invert: bool,
+}
+
+impl Default for MaskShape {
+    fn default() -> Self {
+        MaskShape {
+            enabled: false,
+            is_rectangle: false,
+            center: (0.5, 0.5),
+            size: (0.25, 0.25),
+            feather: 0.0,
+            invert: false,
+        }
+    }
 }
 
 /// Where a track's pixels come from for this frame.
@@ -103,7 +140,14 @@ pub struct ActiveClipPlan {
     /// the registry are dropped here (with a count in
     /// `CompiledFrameGraph::unknown_effects`) rather than silently ignored
     /// deeper down.
+    ///
+    /// Includes `transform` and `mask` instances (already folded into
+    /// `transform`/`mask` below) as well as pixel effects (blur, color
+    /// correction, crop) in stack order — the compositor iterates this list,
+    /// skipping the ones it applies by folding, to build the effect chain.
     pub effect_passes: Vec<EffectPass>,
+    /// Folded from this clip's `mask` effect instance, if any.
+    pub mask: MaskShape,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,13 +264,14 @@ impl<R: EffectRegistry> GraphCompiler<R> {
                     };
 
                     source.map(|source| {
-                        let (transform, passes, unknown) = self.resolve_effects(clip, at);
+                        let (transform, mask, passes, unknown) = self.resolve_effects(clip, at);
                         unknown_effects += unknown;
                         ActiveClipPlan {
                             clip: clip.id,
                             source,
                             transform,
                             effect_passes: passes,
+                            mask,
                         }
                     })
                 }
@@ -257,10 +302,11 @@ impl<R: EffectRegistry> GraphCompiler<R> {
         &self,
         clip: &ClipInstance,
         at: TimeTick,
-    ) -> (Transform2D, Vec<EffectPass>, usize) {
+    ) -> (Transform2D, MaskShape, Vec<EffectPass>, usize) {
         // Clip-relative — see the module doc comment.
         let local = TimeTick(at.0 - clip.timeline_in.0);
         let mut transform = Transform2D::default();
+        let mut mask_shape = MaskShape::default();
         let mut passes = Vec::new();
         let mut unknown = 0usize;
 
@@ -298,10 +344,27 @@ impl<R: EffectRegistry> GraphCompiler<R> {
                 if let Some(o) = pass.number(transform::OPACITY) {
                     transform.opacity *= o as f32;
                 }
+            } else if pass.type_id == mask::TYPE_ID {
+                mask_shape.enabled = true;
+                if let Some(v) = pass.bool_param(mask::IS_RECTANGLE) {
+                    mask_shape.is_rectangle = v;
+                }
+                if let Some((x, y)) = pass.vec2(mask::CENTER) {
+                    mask_shape.center = (x as f32, y as f32);
+                }
+                if let Some((x, y)) = pass.vec2(mask::SIZE) {
+                    mask_shape.size = (x as f32, y as f32);
+                }
+                if let Some(f) = pass.number(mask::FEATHER) {
+                    mask_shape.feather = f as f32;
+                }
+                if let Some(v) = pass.bool_param(mask::INVERT) {
+                    mask_shape.invert = v;
+                }
             }
             passes.push(pass);
         }
-        (transform, passes, unknown)
+        (transform, mask_shape, passes, unknown)
     }
 }
 
@@ -447,6 +510,63 @@ mod tests {
             enabled: true,
             params: map,
         }
+    }
+
+    fn generic_effect(type_id: &str, params: Vec<(&str, ParamTrack)>) -> EffectInstance {
+        let mut map = BTreeMap::new();
+        for (name, track) in params {
+            map.insert(name.to_string(), track);
+        }
+        EffectInstance { id: EffectInstanceId(2), effect_type: type_id.to_string(), enabled: true, params: map }
+    }
+
+    #[test]
+    fn clip_with_no_mask_effect_has_mask_disabled() {
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 100)])])], assets: vec![] };
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
+        assert!(!g.track_plans[0].active_clip.as_ref().unwrap().mask.enabled);
+    }
+
+    #[test]
+    fn mask_effect_params_are_resolved() {
+        use crate::effect::mask;
+        let mut c = clip(1, 0, 100);
+        c.effects = vec![generic_effect(
+            mask::TYPE_ID,
+            vec![
+                (mask::IS_RECTANGLE, ParamTrack::constant(ParamValue::Bool(true))),
+                (mask::CENTER, ParamTrack::constant(ParamValue::Vec2(0.3, 0.7))),
+                (mask::SIZE, ParamTrack::constant(ParamValue::Vec2(0.1, 0.2))),
+                (mask::FEATHER, ParamTrack::constant(ParamValue::Number(0.05))),
+                (mask::INVERT, ParamTrack::constant(ParamValue::Bool(true))),
+            ],
+        )];
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
+        let m = g.track_plans[0].active_clip.as_ref().unwrap().mask;
+        assert!(m.enabled);
+        assert!(m.is_rectangle);
+        assert_eq!(m.center, (0.3, 0.7));
+        assert_eq!(m.size, (0.1, 0.2));
+        assert_eq!(m.feather, 0.05);
+        assert!(m.invert);
+    }
+
+    #[test]
+    fn mask_and_transform_fold_independently() {
+        use crate::effect::mask;
+        let mut c = clip(1, 0, 100);
+        c.effects = vec![
+            transform_effect(vec![(transform::OPACITY, ParamTrack::constant(ParamValue::Number(0.4)))]),
+            generic_effect(mask::TYPE_ID, vec![(mask::IS_RECTANGLE, ParamTrack::constant(ParamValue::Bool(true)))]),
+        ];
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
+        let active = g.track_plans[0].active_clip.as_ref().unwrap();
+        assert_eq!(active.transform.opacity, 0.4, "transform folding must be unaffected by a mask being present");
+        assert!(active.mask.enabled);
+        assert!(active.mask.is_rectangle);
+        assert_eq!(active.effect_passes.len(), 2, "both effects should still appear in effect_passes");
     }
 
     #[test]

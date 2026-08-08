@@ -17,8 +17,8 @@ pub use color::{
     WORKING_SPACE_PRIMARIES, WORKING_SPACE_TRANSFER,
 };
 pub use effect::{
-    transform, BuiltinRegistry, EffectDescriptor, EffectLocality, EffectRegistry, ParamSchema,
-    ParamType,
+    color_correction, crop, gaussian_blur, mask, transform, BuiltinRegistry, EffectDescriptor,
+    EffectLocality, EffectRegistry, ParamSchema, ParamType,
 };
 pub use graph::{
     ActiveClipPlan, CompiledFrameGraph, EffectPass, FrameSource, GraphCache, GraphCompiler,

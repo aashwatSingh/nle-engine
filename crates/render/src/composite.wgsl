@@ -1,17 +1,30 @@
-// Compositing shaders for M4. Two passes:
+// Compositing shaders, M4 + M5.
 //
-//   1. `vs_clip` / `fs_clip` — draw one clip's source frame into the linear
-//      working-space target (Rgba16Float), applying transform + opacity and
-//      converting the source out of its encoded colour space into linear
-//      light on the way in.
-//   2. `vs_fullscreen` / `fs_deliver` — convert the accumulated linear
-//      working-space target into the encoded delivery space for output.
+// Per-clip pipeline (see compositor.rs's `process_clip_source` /
+// `composite_to_working`):
 //
-// The transfer-function and gamut math here MIRRORS crates/render/src/color.rs.
-// That duplication is deliberate and load-bearing: the CPU version is the
-// tested reference, and the gamut matrices are fed in from it via uniforms
-// (rather than hardcoded here) precisely so the two can't silently diverge on
-// the thing that's hardest to eyeball — a subtly wrong matrix.
+//   1. `vs_fullscreen` / `fs_prepare` — convert the encoded source into the
+//      linear working space, into an intermediate texture at source
+//      resolution. Skipped entirely for a clip with no pixel effects (the
+//      fast path folds this into step 4).
+//   2. `vs_fullscreen` / `fs_gaussian_blur`, `fs_color_correction`, `fs_crop`
+//      — the clip's pixel-effect stack, in order, ping-ponging between two
+//      intermediate textures. Only present if the clip has that effect.
+//   3. `vs_clip` / `fs_clip` — place the (already-linear) result into the
+//      shared working-space composite target: transform, opacity, mask, and
+//      blend. The FAST PATH (no pixel effects) also uses this shader
+//      directly on the raw encoded source, with its transfer/gamut uniforms
+//      doing the colour conversion that step 1 would otherwise have done —
+//      one draw call instead of three for the common case of an untouched
+//      clip.
+//   4. `vs_fullscreen` / `fs_deliver` — convert the accumulated working-space
+//      target into the encoded delivery space for output.
+//
+// The transfer-function, gamut, and effect math here MIRRORS
+// crates/render/src/color.rs and crates/render/src/effect.rs's documented
+// formulas. That duplication is deliberate: the CPU side is the tested
+// reference, and matrices/codes are fed in via uniforms rather than
+// hardcoded here, specifically so the two can't silently diverge.
 
 struct ClipUniforms {
     src_size: vec2<f32>,
@@ -21,7 +34,9 @@ struct ClipUniforms {
     anchor: vec2<f32>,
     rotation: f32,
     opacity: f32,
-    // Rows of the source-primaries -> Rec.709 matrix; .w unused.
+    // Rows of the source-primaries -> Rec.709 matrix; .w unused. Identity
+    // when the source texture is already linear-working-space (the
+    // multi-stage path's placement step).
     gamut0: vec4<f32>,
     gamut1: vec4<f32>,
     gamut2: vec4<f32>,
@@ -31,9 +46,23 @@ struct ClipUniforms {
     _pad2: u32,
 };
 
+struct MaskUniforms {
+    // Vec2 fields grouped first: WGSL aligns vec2<f32> to 8 bytes, and this
+    // ordering is what makes the Rust #[repr(C)] mirror's natural 4-byte
+    // packing land on the same offsets without manual padding — see
+    // compositor.rs's comment on this struct for the reasoning.
+    center: vec2<f32>,
+    size: vec2<f32>,
+    feather: f32,
+    enabled: u32,
+    is_rectangle: u32,
+    invert: u32,
+};
+
 @group(0) @binding(0) var<uniform> clip_u: ClipUniforms;
 @group(0) @binding(1) var t_source: texture_2d<f32>;
 @group(0) @binding(2) var s_source: sampler;
+@group(0) @binding(3) var<uniform> mask_u: MaskUniforms;
 
 struct ClipVertexOut {
     @builtin(position) clip_position: vec4<f32>,
@@ -134,13 +163,52 @@ fn to_linear(rgb: vec3<f32>, code: u32) -> vec3<f32> {
     return vec3<f32>(rec709_to_linear_1(rgb.r), rec709_to_linear_1(rgb.g), rec709_to_linear_1(rgb.b));
 }
 
+// Mask factor at `uv` (source-space, 0..1): 1.0 = fully shown, 0.0 = fully
+// masked out, with a smooth ramp across `feather`. Evaluated in source UV
+// space — see effect.rs's `mask` module doc comment for why: a mask is
+// attached to the clip's own frame, so it moves/scales/rotates with the clip
+// rather than staying fixed in sequence space.
+fn mask_factor(uv: vec2<f32>) -> f32 {
+    if (mask_u.enabled == 0u) {
+        return 1.0;
+    }
+    var d: f32;
+    if (mask_u.is_rectangle == 1u) {
+        // Signed distance to the rectangle's edge, positive outside, in a
+        // space where the rectangle's half-extents are (1,1) — so `feather`
+        // (a fraction of the frame diagonal) needs converting into that same
+        // normalised space via the size, avoided here by instead measuring
+        // distance in UV space directly and normalising by size below.
+        let delta = abs(uv - mask_u.center) - mask_u.size;
+        let outside = max(delta, vec2<f32>(0.0));
+        let inside = min(max(delta.x, delta.y), 0.0);
+        d = length(outside) + inside;
+    } else {
+        // Ellipse: scale into a unit-circle space so `size` can be
+        // non-uniform (different x/y radii).
+        let normalised = (uv - mask_u.center) / max(mask_u.size, vec2<f32>(1e-5));
+        d = length(normalised) - 1.0;
+    }
+    // `d` is in UV units for the rectangle case and in "radii" units for the
+    // ellipse case — close enough for a feather fraction of the frame
+    // diagonal in both cases without over-engineering a unified metric.
+    let feather = max(mask_u.feather, 1e-5);
+    var factor = 1.0 - smoothstep(0.0, feather, d);
+    if (mask_u.invert == 1u) {
+        factor = 1.0 - factor;
+    }
+    return factor;
+}
+
 @fragment
 fn fs_clip(in: ClipVertexOut) -> @location(0) vec4<f32> {
     let src = textureSample(t_source, s_source, in.uv);
 
     // Encoded -> linear light, then source primaries -> Rec.709 working
     // primaries. No clamping: out-of-gamut negatives are meaningful here and
-    // only get clamped at delivery.
+    // only get clamped at delivery. A no-op (identity gamut, linear
+    // transfer) when the source is already a linear working-space
+    // intermediate from the multi-stage effect pipeline.
     let linear = to_linear(src.rgb, clip_u.transfer_code);
     let working = vec3<f32>(
         dot(clip_u.gamut0.xyz, linear),
@@ -148,21 +216,16 @@ fn fs_clip(in: ClipVertexOut) -> @location(0) vec4<f32> {
         dot(clip_u.gamut2.xyz, linear),
     );
 
-    return vec4<f32>(working, src.a * clip_u.opacity);
+    let m = mask_factor(in.uv);
+    return vec4<f32>(working, src.a * clip_u.opacity * m);
 }
 
-// --- delivery pass ---
-
-struct OutputUniforms {
-    delivery_code: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-};
-
-@group(0) @binding(0) var<uniform> out_u: OutputUniforms;
-@group(0) @binding(1) var t_working: texture_2d<f32>;
-@group(0) @binding(2) var s_working: sampler;
+// --- single-uniform passes: prepare, effect chain, deliver ---
+//
+// These all share one bind group shape (one small uniform buffer + source
+// texture + sampler) and the same full-screen vertex stage, since none of
+// them position anything — they transform a texture into another texture of
+// the same size.
 
 struct FullscreenVertexOut {
     @builtin(position) clip_position: vec4<f32>,
@@ -177,6 +240,160 @@ fn vs_fullscreen(@builtin(vertex_index) vertex_index: u32) -> FullscreenVertexOu
     out.uv = uv;
     return out;
 }
+
+// -- prepare: encoded source -> linear working space --
+
+struct PrepareUniforms {
+    gamut0: vec4<f32>,
+    gamut1: vec4<f32>,
+    gamut2: vec4<f32>,
+    transfer_code: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> prep_u: PrepareUniforms;
+@group(0) @binding(1) var t_prep_src: texture_2d<f32>;
+@group(0) @binding(2) var s_prep_src: sampler;
+
+@fragment
+fn fs_prepare(in: FullscreenVertexOut) -> @location(0) vec4<f32> {
+    let src = textureSample(t_prep_src, s_prep_src, in.uv);
+    let linear = to_linear(src.rgb, prep_u.transfer_code);
+    let working = vec3<f32>(
+        dot(prep_u.gamut0.xyz, linear),
+        dot(prep_u.gamut1.xyz, linear),
+        dot(prep_u.gamut2.xyz, linear),
+    );
+    return vec4<f32>(working, src.a);
+}
+
+// -- Gaussian Blur (separable: one draw per direction) --
+
+struct BlurUniforms {
+    direction: vec2<f32>, // (1,0) for the horizontal pass, (0,1) for vertical
+    radius: f32,          // source pixels
+    _pad0: f32,
+};
+
+@group(0) @binding(0) var<uniform> blur_u: BlurUniforms;
+@group(0) @binding(1) var t_blur_src: texture_2d<f32>;
+@group(0) @binding(2) var s_blur_src: sampler;
+
+@fragment
+fn fs_gaussian_blur(in: FullscreenVertexOut) -> @location(0) vec4<f32> {
+    let radius = max(blur_u.radius, 0.0);
+    if (radius < 0.001) {
+        return textureSample(t_blur_src, s_blur_src, in.uv);
+    }
+    let dims = vec2<f32>(textureDimensions(t_blur_src));
+    let texel = blur_u.direction / dims;
+    // sigma chosen so `radius` is roughly "2 standard deviations", a
+    // common, visually reasonable convention (not a claim of matching any
+    // specific NLE's blur curve).
+    let sigma = max(radius * 0.5, 0.5);
+    let taps = i32(ceil(radius));
+
+    // NOTE: blurs RGB and (straight, non-premultiplied) alpha independently.
+    // For a clip with partial transparency inside the blurred radius this can
+    // fringe colour at the alpha edge — the correct fix is premultiplying
+    // before the blur and un-premultiplying after, which is real, scoped-out
+    // follow-up work rather than a claim that this is colour-fringe-free.
+    var sum = vec4<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var i = -taps; i <= taps; i = i + 1) {
+        let w = exp(-0.5 * f32(i * i) / (sigma * sigma));
+        sum = sum + textureSample(t_blur_src, s_blur_src, in.uv + texel * f32(i)) * w;
+        weight_sum = weight_sum + w;
+    }
+    return sum / weight_sum;
+}
+
+// -- Color Correction --
+
+struct ColorCorrectionUniforms {
+    exposure: f32,
+    contrast: f32,
+    saturation: f32,
+    temperature: f32,
+    tint: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+
+@group(0) @binding(0) var<uniform> cc_u: ColorCorrectionUniforms;
+@group(0) @binding(1) var t_cc_src: texture_2d<f32>;
+@group(0) @binding(2) var s_cc_src: sampler;
+
+@fragment
+fn fs_color_correction(in: FullscreenVertexOut) -> @location(0) vec4<f32> {
+    let src = textureSample(t_cc_src, s_cc_src, in.uv);
+    var rgb = src.rgb;
+
+    // Exposure: stops, multiplicative in linear light — physically what a
+    // camera exposure stop actually does.
+    rgb = rgb * exp2(cc_u.exposure);
+
+    // Temperature/tint: a simple linear RGB gain shift, NOT a physically
+    // based Planckian-locus white balance. Warmer (+temperature) pushes red
+    // up and blue down; +tint pushes toward magenta (red and blue up
+    // slightly, green down). Good enough for "warm this up a bit"; a
+    // colour-managed white-balance model is real follow-up work.
+    rgb.r = rgb.r * (1.0 + cc_u.temperature * 0.3 + cc_u.tint * 0.15);
+    rgb.g = rgb.g * (1.0 - cc_u.tint * 0.3);
+    rgb.b = rgb.b * (1.0 - cc_u.temperature * 0.3 + cc_u.tint * 0.15);
+
+    // Contrast: pivots around linear 0.18 (conventional "18% grey" mid-tone),
+    // not around 0.5 — 0.5 in LINEAR light is far brighter than perceptual
+    // mid-grey, and pivoting there makes "contrast" visibly also change
+    // overall exposure, which is the wrong feel for the control.
+    let pivot = 0.18;
+    rgb = (rgb - pivot) * (1.0 + cc_u.contrast) + pivot;
+
+    // Saturation: lerp toward Rec.709 luma (matches the working space's
+    // primaries).
+    let luma = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    rgb = mix(vec3<f32>(luma, luma, luma), rgb, cc_u.saturation);
+
+    return vec4<f32>(rgb, src.a);
+}
+
+// -- Crop --
+
+struct CropUniforms {
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+};
+
+@group(0) @binding(0) var<uniform> crop_u: CropUniforms;
+@group(0) @binding(1) var t_crop_src: texture_2d<f32>;
+@group(0) @binding(2) var s_crop_src: sampler;
+
+@fragment
+fn fs_crop(in: FullscreenVertexOut) -> @location(0) vec4<f32> {
+    if (in.uv.x < crop_u.left || in.uv.x > 1.0 - crop_u.right
+        || in.uv.y < crop_u.top || in.uv.y > 1.0 - crop_u.bottom) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    return textureSample(t_crop_src, s_crop_src, in.uv);
+}
+
+// -- deliver: linear working space -> encoded delivery space --
+
+struct OutputUniforms {
+    delivery_code: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> out_u: OutputUniforms;
+@group(0) @binding(1) var t_working: texture_2d<f32>;
+@group(0) @binding(2) var s_working: sampler;
 
 @fragment
 fn fs_deliver(in: FullscreenVertexOut) -> @location(0) vec4<f32> {

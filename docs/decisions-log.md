@@ -1,5 +1,64 @@
 # Decisions log
 
+## 2026-08-07 — M5 scope: four real effects + masks, not spec 4.5's full list
+
+Spec 4.5's built-in effect set is ~15 items plus a full masking system and a
+titling/graphics layer. Building that entire list at M4's level of rigor
+(real shaders, real pixel-verified tests, not stubs) in one pass isn't
+credible, so M5 shipped a representative, real slice and left the rest
+explicitly open rather than half-implementing everything.
+
+**Shipped, with real GPU shaders and pixel-verified tests (26 tests):**
+- **Gaussian Blur** — separable two-pass kernel, `SpatiallyLocal` (the first
+  effect to actually exercise that `EffectLocality` distinction from M0).
+- **Color Correction** — exposure, contrast, saturation, temperature, tint,
+  as *one* effect with five params — matching how Lumetri is actually one
+  effect with many params in real NLEs, not ten separate effect instances.
+  This covers a meaningful slice of spec 4.5's "Lumetri-class color" without
+  claiming to be Lumetri.
+- **Crop** — geometry group.
+- **Mask** — rectangle + ellipse with feather, applied clip-level (gates the
+  whole clip, evaluated in the clip's own source-UV space so it travels with
+  the clip when transformed — verified by
+  `mask_moves_with_the_clip_not_with_the_sequence`).
+
+**Architecture change this forced, which is the more durable part of the
+work:** a clip with pixel effects now goes through a three-stage pipeline
+(`fs_prepare` -> effect chain via ping-pong intermediates -> `fs_clip`
+placement) instead of M4's single fused convert+place pass. A clip with no
+pixel effects still uses the M4 fast path unchanged
+(`gaussian_blur_radius_zero_matches_the_fast_path` pins that the two paths
+produce numerically identical output). This is the seam the rest of spec
+4.5's effect list plugs into — adding curves or HSL secondary later is
+"write a shader + register it," not another compositor rewrite.
+
+**Explicitly NOT built — real gaps, not oversights:**
+- **Curves, vibrance, highlights/shadows/whites/blacks, HSL secondary, LUT
+  loading** — the rest of "Lumetri-class color." Curves in particular need
+  UI (a spline editor) as much as shader work.
+- **Mirror, sharpen** — small, but genuinely not done; sharpen would reuse
+  the blur infrastructure (unsharp mask) as a natural follow-up.
+- **Transitions** (cross dissolve, dip to black/white, wipe, slide) — these
+  need two clips active simultaneously on one track during the overlap
+  region, which the timeline model and render graph don't support yet (the
+  graph compiler picks exactly one active clip per track). This is a data
+  model change, not just a shader — sized more like a graph-compiler task
+  than an effect.
+- **Text/titling** — a separate graphics layer, not a pixel effect on video.
+- **Pen-tool bezier masks** — only rectangle/ellipse exist. A bezier mask
+  needs point-in-polygon evaluation (or a rasterized coverage texture) in
+  the shader, plus a fair amount of UI for the pen tool itself.
+- **Effect Controls panel** — this is UI. There is still no UI at all in
+  this project; every effect here is exercised through hand-built
+  `timeline::EffectInstance` values in tests and demos, not through anything
+  a user could click.
+
+**One real simplification inside what WAS built, stated plainly:** the blur
+shader operates on straight (non-premultiplied) alpha, which can fringe
+colour at a semi-transparent edge inside the blurred radius. The correct fix
+(premultiply before blur, un-premultiply after) is real follow-up work, not
+done here — noted in the shader itself, not hidden.
+
 ## 2026-08-07 — M4 compositing: conventions fixed, and why each one
 
 Five decisions that the rest of the renderer now depends on. Recording them

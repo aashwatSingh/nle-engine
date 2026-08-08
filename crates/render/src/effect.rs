@@ -139,15 +139,178 @@ pub mod transform {
     }
 }
 
-/// The effect registry M4 ships: Transform only. M5 extends this with the
-/// rest of spec 4.5's built-in set.
+/// Gaussian Blur — spec 4.5's spatially-local blur, implemented as a
+/// separable two-pass (horizontal then vertical) kernel in `compositor.rs`.
+/// `EffectLocality::SpatiallyLocal` here is load-bearing, not decorative: it's
+/// what a future tiled/partial-redraw compositor would use to know this
+/// effect needs pixel padding around a clip's visible region, unlike a
+/// per-pixel effect such as Color Correction.
+pub mod gaussian_blur {
+    use super::{EffectDescriptor, EffectLocality, ParamSchema, ParamType};
+    use timeline::ParamValue;
+
+    pub const TYPE_ID: &str = "gaussian_blur";
+    /// `Number`, in source pixels. 0 = no blur.
+    pub const RADIUS: &str = "radius";
+
+    pub fn descriptor() -> EffectDescriptor {
+        EffectDescriptor {
+            type_id: TYPE_ID,
+            display_name: "Gaussian Blur",
+            locality: EffectLocality::SpatiallyLocal,
+            shader_entry_point: "fs_gaussian_blur",
+            params: vec![ParamSchema {
+                name: RADIUS,
+                display_name: "Blur Radius",
+                param_type: ParamType::Number,
+                range: Some((0.0, 100.0)),
+                default: ParamValue::Number(0.0),
+            }],
+        }
+    }
+}
+
+/// Color Correction — spec 4.5's "Lumetri-class color", scoped to the
+/// sub-list that's meaningfully implementable as one effect without a
+/// dedicated curves UI: exposure, contrast, saturation, temperature, tint.
+/// Real NLEs also model this as one effect with many params rather than as
+/// separate effect instances, so this mirrors that rather than inventing a
+/// different shape. Curves, vibrance, highlights/shadows/whites/blacks, HSL
+/// secondary, and LUT loading are the parts of spec 4.5's list this does NOT
+/// cover — see docs/decisions-log.md for the M5 scope note.
+pub mod color_correction {
+    use super::{EffectDescriptor, EffectLocality, ParamSchema, ParamType};
+    use timeline::ParamValue;
+
+    pub const TYPE_ID: &str = "color_correction";
+    /// `Number`, stops (photographic EV). 0 = no change.
+    pub const EXPOSURE: &str = "exposure";
+    /// `Number`, 0 = no change. Negative reduces, positive increases.
+    pub const CONTRAST: &str = "contrast";
+    /// `Number`, 1.0 = no change, 0.0 = greyscale.
+    pub const SATURATION: &str = "saturation";
+    /// `Number`, -1.0 (cooler/blue) .. 1.0 (warmer/orange), 0 = no change.
+    pub const TEMPERATURE: &str = "temperature";
+    /// `Number`, -1.0 (green) .. 1.0 (magenta), 0 = no change.
+    pub const TINT: &str = "tint";
+
+    pub fn descriptor() -> EffectDescriptor {
+        EffectDescriptor {
+            type_id: TYPE_ID,
+            display_name: "Color Correction",
+            locality: EffectLocality::Global,
+            shader_entry_point: "fs_color_correction",
+            params: vec![
+                ParamSchema { name: EXPOSURE, display_name: "Exposure", param_type: ParamType::Number, range: Some((-5.0, 5.0)), default: ParamValue::Number(0.0) },
+                ParamSchema { name: CONTRAST, display_name: "Contrast", param_type: ParamType::Number, range: Some((-1.0, 1.0)), default: ParamValue::Number(0.0) },
+                ParamSchema { name: SATURATION, display_name: "Saturation", param_type: ParamType::Number, range: Some((0.0, 2.0)), default: ParamValue::Number(1.0) },
+                ParamSchema { name: TEMPERATURE, display_name: "Temperature", param_type: ParamType::Number, range: Some((-1.0, 1.0)), default: ParamValue::Number(0.0) },
+                ParamSchema { name: TINT, display_name: "Tint", param_type: ParamType::Number, range: Some((-1.0, 1.0)), default: ParamValue::Number(0.0) },
+            ],
+        }
+    }
+}
+
+/// Crop — spec 4.5's geometry group. Edges are normalised 0..1 fractions of
+/// the source frame cut away from each side.
+pub mod crop {
+    use super::{EffectDescriptor, EffectLocality, ParamSchema, ParamType};
+    use timeline::ParamValue;
+
+    pub const TYPE_ID: &str = "crop";
+    pub const LEFT: &str = "left";
+    pub const RIGHT: &str = "right";
+    pub const TOP: &str = "top";
+    pub const BOTTOM: &str = "bottom";
+
+    pub fn descriptor() -> EffectDescriptor {
+        let edge = |name: &'static str, display: &'static str| ParamSchema {
+            name,
+            display_name: display,
+            param_type: ParamType::Number,
+            range: Some((0.0, 1.0)),
+            default: ParamValue::Number(0.0),
+        };
+        EffectDescriptor {
+            type_id: TYPE_ID,
+            display_name: "Crop",
+            locality: EffectLocality::Global,
+            shader_entry_point: "fs_crop",
+            params: vec![
+                edge(LEFT, "Left"),
+                edge(RIGHT, "Right"),
+                edge(TOP, "Top"),
+                edge(BOTTOM, "Bottom"),
+            ],
+        }
+    }
+}
+
+/// Mask — spec 4.5's masking system, scoped to rectangle/ellipse with
+/// feather. Applied clip-level (gates the whole clip's contribution) rather
+/// than per-sub-effect: the common real case ("only show this clip in this
+/// region") needs that, and per-effect masking is a bigger data-model change
+/// (which effect in the stack does the mask apply *before*?) that's a real
+/// follow-up rather than a guess. Pen-tool bezier masks are NOT covered —
+/// see docs/decisions-log.md.
+pub mod mask {
+    use super::{EffectDescriptor, EffectLocality, ParamSchema, ParamType};
+    use timeline::ParamValue;
+
+    pub const TYPE_ID: &str = "mask";
+    /// `Bool`. `false` = ellipse, `true` = rectangle. A proper enum param
+    /// type is more honest than this, but `ParamType` (spec-defined, M0)
+    /// only has Number/Vec2/Color/Bool — extending it is a bigger, separate
+    /// decision than this one effect needs to force.
+    pub const IS_RECTANGLE: &str = "is_rectangle";
+    /// `Vec2`, normalised 0..1, the shape's centre.
+    pub const CENTER: &str = "center";
+    /// `Vec2`, normalised 0..1, half-width/half-height (rectangle) or
+    /// radii (ellipse).
+    pub const SIZE: &str = "size";
+    /// `Number`, normalised 0..1 (fraction of frame diagonal), the softness
+    /// of the mask edge.
+    pub const FEATHER: &str = "feather";
+    /// `Bool`. When true, the mask is inverted (shows outside the shape).
+    pub const INVERT: &str = "invert";
+
+    pub fn descriptor() -> EffectDescriptor {
+        EffectDescriptor {
+            type_id: TYPE_ID,
+            display_name: "Mask",
+            locality: EffectLocality::SpatiallyLocal,
+            shader_entry_point: "fs_mask",
+            params: vec![
+                ParamSchema { name: IS_RECTANGLE, display_name: "Rectangle", param_type: ParamType::Bool, range: None, default: ParamValue::Bool(false) },
+                ParamSchema { name: CENTER, display_name: "Center", param_type: ParamType::Vec2, range: None, default: ParamValue::Vec2(0.5, 0.5) },
+                ParamSchema { name: SIZE, display_name: "Size", param_type: ParamType::Vec2, range: None, default: ParamValue::Vec2(0.25, 0.25) },
+                ParamSchema { name: FEATHER, display_name: "Feather", param_type: ParamType::Number, range: Some((0.0, 1.0)), default: ParamValue::Number(0.0) },
+                ParamSchema { name: INVERT, display_name: "Invert", param_type: ParamType::Bool, range: None, default: ParamValue::Bool(false) },
+            ],
+        }
+    }
+}
+
+/// The effect registry M5 ships: Transform (M4) plus Gaussian Blur, Color
+/// Correction, Crop, and Mask. The rest of spec 4.5's built-in list —
+/// curves, HSL secondary, LUT loading, mirror, sharpen, transitions,
+/// text/titling — is documented as out of scope in docs/decisions-log.md,
+/// not silently missing.
 pub struct BuiltinRegistry {
     descriptors: Vec<EffectDescriptor>,
 }
 
 impl Default for BuiltinRegistry {
     fn default() -> Self {
-        BuiltinRegistry { descriptors: vec![transform::descriptor()] }
+        BuiltinRegistry {
+            descriptors: vec![
+                transform::descriptor(),
+                gaussian_blur::descriptor(),
+                color_correction::descriptor(),
+                crop::descriptor(),
+                mask::descriptor(),
+            ],
+        }
     }
 }
 

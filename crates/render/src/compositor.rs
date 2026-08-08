@@ -59,6 +59,83 @@ struct OutputUniforms {
     _pad: [u32; 3],
 }
 
+/// Mirrors `composite.wgsl`'s `MaskUniforms`. Vec2 fields are grouped first
+/// deliberately: WGSL aligns `vec2<f32>` to 8 bytes, while Rust's `[f32; 2]`
+/// only naturally aligns to 4. Two consecutive 8-byte fields starting at
+/// offset 0 land on 8-byte boundaries under *either* alignment rule, so this
+/// ordering is what makes Rust's `#[repr(C)]` packing coincide with what WGSL
+/// expects without hand-computed padding. Breaking this grouping (e.g.
+/// interleaving a lone `f32` between two `[f32; 2]` fields) would silently
+/// desync the two layouts — there's no compiler check across the language
+/// boundary here, which is exactly why the ordering rule is spelled out
+/// rather than left implicit.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaskUniforms {
+    center: [f32; 2],
+    size: [f32; 2],
+    feather: f32,
+    enabled: u32,
+    is_rectangle: u32,
+    invert: u32,
+}
+
+impl MaskUniforms {
+    fn from_shape(mask: crate::graph::MaskShape) -> Self {
+        MaskUniforms {
+            center: [mask.center.0, mask.center.1],
+            size: [mask.size.0, mask.size.1],
+            feather: mask.feather,
+            enabled: mask.enabled as u32,
+            is_rectangle: mask.is_rectangle as u32,
+            invert: mask.invert as u32,
+        }
+    }
+}
+
+/// Mirrors `composite.wgsl`'s `PrepareUniforms`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PrepareUniforms {
+    gamut0: [f32; 4],
+    gamut1: [f32; 4],
+    gamut2: [f32; 4],
+    transfer_code: u32,
+    _pad: [u32; 3],
+}
+
+/// Mirrors `composite.wgsl`'s `BlurUniforms`. `direction` first — see the
+/// `MaskUniforms` comment on why vec2 fields must come before scalars.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BlurUniforms {
+    direction: [f32; 2],
+    radius: f32,
+    _pad: f32,
+}
+
+/// Mirrors `composite.wgsl`'s `ColorCorrectionUniforms`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ColorCorrectionUniforms {
+    exposure: f32,
+    contrast: f32,
+    saturation: f32,
+    temperature: f32,
+    tint: f32,
+    _pad: [f32; 3],
+}
+
+/// Mirrors `composite.wgsl`'s `CropUniforms`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CropUniforms {
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+}
+
 /// A decoded source frame living on the GPU.
 pub struct SourceTexture {
     pub view: wgpu::TextureView,
@@ -169,9 +246,21 @@ pub struct Compositor {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     clip_pipeline: wgpu::RenderPipeline,
+    prepare_pipeline: wgpu::RenderPipeline,
+    blur_pipeline: wgpu::RenderPipeline,
+    color_correction_pipeline: wgpu::RenderPipeline,
+    crop_pipeline: wgpu::RenderPipeline,
     deliver_pipeline: wgpu::RenderPipeline,
+    /// Bind group layout for the "place" pass (`fs_clip`): a `ClipUniforms`
+    /// buffer, the source texture + sampler, and a `MaskUniforms` buffer.
     clip_bgl: wgpu::BindGroupLayout,
-    deliver_bgl: wgpu::BindGroupLayout,
+    /// Shared by every pass that just transforms one texture into another of
+    /// the same size (prepare, blur, color correction, crop, deliver): one
+    /// small uniform buffer + source texture + sampler. The layout doesn't
+    /// encode the uniform struct's actual size (`min_binding_size: None`), so
+    /// one layout genuinely works for all of them despite their uniform
+    /// structs differing.
+    single_uniform_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     output_format: wgpu::TextureFormat,
 }
@@ -199,102 +288,86 @@ impl Compositor {
             source: wgpu::ShaderSource::Wgsl(include_str!("composite.wgsl").into()),
         });
 
+        let buffer_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let texture_entry = wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let sampler_entry = wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+
         let clip_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("clip bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
+                buffer_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                texture_entry,
+                sampler_entry,
+                buffer_entry(3, wgpu::ShaderStages::FRAGMENT),
             ],
         });
-        // Same shape; separate layout so the two pipelines stay independent.
-        let deliver_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("deliver bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+        let single_uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("single uniform bgl"),
+            entries: &[buffer_entry(0, wgpu::ShaderStages::FRAGMENT), texture_entry, sampler_entry],
+        });
+
+        // Standard source-over alpha blending. This is what makes stacking
+        // tracks bottom-to-top produce the expected result.
+        let source_over_blend = Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
         });
 
         let clip_pipeline = Self::make_pipeline(
-            &device,
-            &shader,
-            &clip_bgl,
-            "vs_clip",
-            "fs_clip",
-            WORKING_FORMAT,
-            // Standard source-over alpha blending. This is what makes
-            // stacking tracks bottom-to-top produce the expected result.
-            Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::SrcAlpha,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            }),
-            "clip pipeline",
+            &device, &shader, &clip_bgl, "vs_clip", "fs_clip", WORKING_FORMAT, source_over_blend, "clip pipeline",
+        );
+        // Prepare/blur/color-correction/crop all write a fresh intermediate
+        // texture (never blend with what's already there), so REPLACE.
+        let prepare_pipeline = Self::make_pipeline(
+            &device, &shader, &single_uniform_bgl, "vs_fullscreen", "fs_prepare", WORKING_FORMAT,
+            Some(wgpu::BlendState::REPLACE), "prepare pipeline",
+        );
+        let blur_pipeline = Self::make_pipeline(
+            &device, &shader, &single_uniform_bgl, "vs_fullscreen", "fs_gaussian_blur", WORKING_FORMAT,
+            Some(wgpu::BlendState::REPLACE), "blur pipeline",
+        );
+        let color_correction_pipeline = Self::make_pipeline(
+            &device, &shader, &single_uniform_bgl, "vs_fullscreen", "fs_color_correction", WORKING_FORMAT,
+            Some(wgpu::BlendState::REPLACE), "color correction pipeline",
+        );
+        let crop_pipeline = Self::make_pipeline(
+            &device, &shader, &single_uniform_bgl, "vs_fullscreen", "fs_crop", WORKING_FORMAT,
+            Some(wgpu::BlendState::REPLACE), "crop pipeline",
         );
         let deliver_pipeline = Self::make_pipeline(
-            &device,
-            &shader,
-            &deliver_bgl,
-            "vs_fullscreen",
-            "fs_deliver",
-            output_format,
-            Some(wgpu::BlendState::REPLACE),
-            "deliver pipeline",
+            &device, &shader, &single_uniform_bgl, "vs_fullscreen", "fs_deliver", output_format,
+            Some(wgpu::BlendState::REPLACE), "deliver pipeline",
         );
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -312,9 +385,13 @@ impl Compositor {
             device,
             queue,
             clip_pipeline,
+            prepare_pipeline,
+            blur_pipeline,
+            color_correction_pipeline,
+            crop_pipeline,
             deliver_pipeline,
             clip_bgl,
-            deliver_bgl,
+            single_uniform_bgl,
             sampler,
             output_format,
         }
@@ -469,6 +546,10 @@ impl Compositor {
             _marker: std::marker::PhantomData<&'a ()>,
         }
         let mut layers: Vec<Layer> = Vec::new();
+        // Keeps intermediate effect-chain textures alive until the shared
+        // render pass below has executed — mirrors `nested_textures` above
+        // for the same reason (the bind groups reference their views).
+        let mut processed_textures: Vec<wgpu::Texture> = Vec::new();
 
         for (i, plan) in graph.track_plans.iter().enumerate() {
             let Some(active) = &plan.active_clip else { continue };
@@ -501,7 +582,42 @@ impl Compositor {
                 }
             };
 
-            let gamut = color::primaries_to_working(src_color.primaries);
+            let has_pixel_effects = active.effect_passes.iter().any(|p| {
+                p.type_id == crate::effect::gaussian_blur::TYPE_ID
+                    || p.type_id == crate::effect::color_correction::TYPE_ID
+                    || p.type_id == crate::effect::crop::TYPE_ID
+            });
+
+            // Either run the clip's pixel-effect chain into its own
+            // intermediate (already linear when it comes back), or use the
+            // raw source directly — the fast path for the common case of an
+            // untouched clip, avoiding two extra texture allocations and
+            // passes per layer.
+            //
+            // `processed_view_holder` exists purely so `place_view` below can
+            // borrow from it: it's declared fresh each iteration and lives
+            // exactly as long as this loop body needs it (through the
+            // `create_bind_group` call), which Rust's borrow checker unifies
+            // fine with `view`'s longer lifetime in the other branch — no
+            // 'static tricks or leaking required.
+            #[allow(unused_assignments)]
+            let mut processed_view_holder: Option<wgpu::TextureView> = None;
+            let (place_view, place_gamut, place_transfer): (&wgpu::TextureView, color::Matrix3, u32) =
+                if has_pixel_effects {
+                    let processed =
+                        self.process_clip_source(view, src_w, src_h, src_color, &active.effect_passes);
+                    processed_textures.push(processed);
+                    processed_view_holder =
+                        Some(processed_textures.last().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
+                    (processed_view_holder.as_ref().unwrap(), color::IDENTITY_3X3, color::shader_codes::TRANSFER_LINEAR)
+                } else {
+                    (
+                        view,
+                        color::primaries_to_working(src_color.primaries),
+                        color::shader_transfer_code(src_color.transfer),
+                    )
+                };
+
             let t: Transform2D = active.transform;
             let uniforms = ClipUniforms {
                 src_size: [src_w as f32, src_h as f32],
@@ -511,10 +627,10 @@ impl Compositor {
                 anchor: [t.anchor.0, t.anchor.1],
                 rotation: t.rotation_degrees,
                 opacity: t.opacity,
-                gamut0: [gamut[0][0], gamut[0][1], gamut[0][2], 0.0],
-                gamut1: [gamut[1][0], gamut[1][1], gamut[1][2], 0.0],
-                gamut2: [gamut[2][0], gamut[2][1], gamut[2][2], 0.0],
-                transfer_code: color::shader_transfer_code(src_color.transfer),
+                gamut0: [place_gamut[0][0], place_gamut[0][1], place_gamut[0][2], 0.0],
+                gamut1: [place_gamut[1][0], place_gamut[1][1], place_gamut[1][2], 0.0],
+                gamut2: [place_gamut[2][0], place_gamut[2][1], place_gamut[2][2], 0.0],
+                transfer_code: place_transfer,
                 _pad: [0; 3],
             };
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -525,13 +641,22 @@ impl Compositor {
             });
             self.queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&uniforms));
 
+            let mask_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mask uniforms"),
+                size: std::mem::size_of::<MaskUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&mask_buffer, 0, bytemuck::bytes_of(&MaskUniforms::from_shape(active.mask)));
+
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("clip bind group"),
                 layout: &self.clip_bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(place_view) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: mask_buffer.as_entire_binding() },
                 ],
             });
             layers.push(Layer { bind_group, _marker: std::marker::PhantomData });
@@ -570,42 +695,48 @@ impl Compositor {
     }
 
     /// Converts a linear working-space texture into the encoded delivery
-    /// space, writing into `output_view` (which must be `OUTPUT_FORMAT`).
-    fn deliver(
-        &self,
-        working: &wgpu::Texture,
-        output_view: &wgpu::TextureView,
-        delivery: DeliverySpace,
-    ) {
+    /// space, writing into `output_view` (which must match this
+    /// compositor's `output_format`).
+    fn deliver(&self, working: &wgpu::Texture, output_view: &wgpu::TextureView, delivery: DeliverySpace) {
         let working_view = working.create_view(&wgpu::TextureViewDescriptor::default());
-        let uniforms = OutputUniforms {
-            delivery_code: color::shader_delivery_code(delivery),
-            _pad: [0; 3],
-        };
+        let uniforms = OutputUniforms { delivery_code: color::shader_delivery_code(delivery), _pad: [0; 3] };
+        self.run_single_uniform_pass(&self.deliver_pipeline, bytemuck::bytes_of(&uniforms), &working_view, output_view);
+    }
+
+    /// Runs one full-screen shader pass: `input_view` -> `output_view`,
+    /// through `pipeline`, with `uniform_bytes` as the pass's single uniform
+    /// buffer. Shared by deliver, prepare, blur, color correction, and crop
+    /// — every pass with the "one small uniform + one input texture -> one
+    /// output texture, no blending" shape.
+    fn run_single_uniform_pass(
+        &self,
+        pipeline: &wgpu::RenderPipeline,
+        uniform_bytes: &[u8],
+        input_view: &wgpu::TextureView,
+        output_view: &wgpu::TextureView,
+    ) {
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("output uniforms"),
-            size: std::mem::size_of::<OutputUniforms>() as u64,
+            label: Some("single uniform buffer"),
+            size: uniform_bytes.len() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&uniforms));
-
+        self.queue.write_buffer(&buffer, 0, uniform_bytes);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("deliver bind group"),
-            layout: &self.deliver_bgl,
+            label: Some("single uniform bind group"),
+            layout: &self.single_uniform_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&working_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
-
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("deliver") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("single pass") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("deliver pass"),
+                label: Some("single pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: output_view,
                     resolve_target: None,
@@ -618,11 +749,112 @@ impl Compositor {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.deliver_pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn make_scratch_texture(&self, width: u32, height: u32, label: &str) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    }
+
+    /// Runs a clip's pixel-effect stack (Gaussian Blur, Color Correction,
+    /// Crop — in stack order, skipping anything else including `transform`
+    /// and `mask`, which are folded and applied separately) at the clip's own
+    /// resolution. First converts the encoded source into the linear working
+    /// space (`fs_prepare`), then ping-pongs through the effect chain.
+    ///
+    /// Returns an owned `Rgba16Float` texture already in the linear working
+    /// space — the caller places it with `fs_clip` using an identity gamut
+    /// and `TRANSFER_LINEAR`, since colour conversion already happened here.
+    fn process_clip_source(
+        &self,
+        source_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        color_meta: ColorMetadata,
+        effects: &[crate::graph::EffectPass],
+    ) -> wgpu::Texture {
+        let mut current = self.make_scratch_texture(width, height, "effect chain A");
+        let mut other = self.make_scratch_texture(width, height, "effect chain B");
+
+        let gamut = color::primaries_to_working(color_meta.primaries);
+        let prepare_uniforms = PrepareUniforms {
+            gamut0: [gamut[0][0], gamut[0][1], gamut[0][2], 0.0],
+            gamut1: [gamut[1][0], gamut[1][1], gamut[1][2], 0.0],
+            gamut2: [gamut[2][0], gamut[2][1], gamut[2][2], 0.0],
+            transfer_code: color::shader_transfer_code(color_meta.transfer),
+            _pad: [0; 3],
+        };
+        self.run_single_uniform_pass(
+            &self.prepare_pipeline,
+            bytemuck::bytes_of(&prepare_uniforms),
+            source_view,
+            &current.create_view(&wgpu::TextureViewDescriptor::default()),
+        );
+
+        use crate::effect::{color_correction, crop, gaussian_blur};
+        for pass in effects {
+            if pass.type_id == gaussian_blur::TYPE_ID {
+                let radius = pass.number(gaussian_blur::RADIUS).unwrap_or(0.0) as f32;
+                if radius <= 0.0 {
+                    continue;
+                }
+                for direction in [[1.0f32, 0.0], [0.0, 1.0]] {
+                    let u = BlurUniforms { direction, radius, _pad: 0.0 };
+                    self.run_single_uniform_pass(
+                        &self.blur_pipeline,
+                        bytemuck::bytes_of(&u),
+                        &current.create_view(&wgpu::TextureViewDescriptor::default()),
+                        &other.create_view(&wgpu::TextureViewDescriptor::default()),
+                    );
+                    std::mem::swap(&mut current, &mut other);
+                }
+            } else if pass.type_id == color_correction::TYPE_ID {
+                let u = ColorCorrectionUniforms {
+                    exposure: pass.number(color_correction::EXPOSURE).unwrap_or(0.0) as f32,
+                    contrast: pass.number(color_correction::CONTRAST).unwrap_or(0.0) as f32,
+                    saturation: pass.number(color_correction::SATURATION).unwrap_or(1.0) as f32,
+                    temperature: pass.number(color_correction::TEMPERATURE).unwrap_or(0.0) as f32,
+                    tint: pass.number(color_correction::TINT).unwrap_or(0.0) as f32,
+                    _pad: [0.0; 3],
+                };
+                self.run_single_uniform_pass(
+                    &self.color_correction_pipeline,
+                    bytemuck::bytes_of(&u),
+                    &current.create_view(&wgpu::TextureViewDescriptor::default()),
+                    &other.create_view(&wgpu::TextureViewDescriptor::default()),
+                );
+                std::mem::swap(&mut current, &mut other);
+            } else if pass.type_id == crop::TYPE_ID {
+                let u = CropUniforms {
+                    left: pass.number(crop::LEFT).unwrap_or(0.0) as f32,
+                    right: pass.number(crop::RIGHT).unwrap_or(0.0) as f32,
+                    top: pass.number(crop::TOP).unwrap_or(0.0) as f32,
+                    bottom: pass.number(crop::BOTTOM).unwrap_or(0.0) as f32,
+                };
+                self.run_single_uniform_pass(
+                    &self.crop_pipeline,
+                    bytemuck::bytes_of(&u),
+                    &current.create_view(&wgpu::TextureViewDescriptor::default()),
+                    &other.create_view(&wgpu::TextureViewDescriptor::default()),
+                );
+                std::mem::swap(&mut current, &mut other);
+            }
+        }
+
+        current
     }
 
     /// Full composite into a caller-owned output texture view. This is the
