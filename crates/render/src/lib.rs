@@ -3,5 +3,11 @@ pub mod effect;
 pub mod graph;
 
 pub use color::{ColorConverter, DeliverySpace, WORKING_SPACE_PRIMARIES, WORKING_SPACE_TRANSFER};
-pub use effect::{EffectDescriptor, EffectLocality, EffectRegistry, ParamSchema, ParamType};
-pub use graph::{ActiveClipPlan, CompiledFrameGraph, EffectPass, RenderGraphCompiler, TrackRenderPlan};
+pub use effect::{
+    transform, BuiltinRegistry, EffectDescriptor, EffectLocality, EffectRegistry, ParamSchema,
+    ParamType,
+};
+pub use graph::{
+    ActiveClipPlan, CompiledFrameGraph, EffectPass, FrameSource, GraphCache, GraphCompiler,
+    TrackRenderPlan, Transform2D,
+};

@@ -44,8 +44,29 @@ pub enum SpeedCurve {
     /// e.g. 200% speed = Constant { numerator: 2, denominator: 1 }.
     Constant { numerator: i64, denominator: i64 },
     /// Keyframed rate; resolving timeline-tick -> source-tick under a
-    /// non-constant curve is M3/M7 (time remapping) work.
+    /// non-constant curve is M7 (time remapping) work.
     Keyframed(ParamTrack),
+}
+
+impl SpeedCurve {
+    /// Converts a timeline-tick delta into the corresponding source-tick
+    /// delta. Exact for `Constant`.
+    ///
+    /// For `Keyframed` this returns the 1x (unmodified) delta: correctly
+    /// integrating a keyframed rate curve to get elapsed source time is
+    /// time-remapping (M7), and a wrong-but-plausible approximation here
+    /// would silently desync audio against video. Returning 1x is at least
+    /// a predictable, documented placeholder rather than a guess — every
+    /// caller in `timeline` and `render` funnels through this one function,
+    /// so M7 has exactly one place to fix.
+    pub fn source_delta(&self, timeline_delta: i64) -> i64 {
+        match self {
+            SpeedCurve::Constant { numerator, denominator } if *denominator != 0 => {
+                timeline_delta * numerator / denominator
+            }
+            _ => timeline_delta,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -180,17 +180,12 @@ fn find_clip_location(seq: &Sequence, clip_id: ClipInstanceId) -> Option<(usize,
 
 // --- shared primitives ---
 
-/// Converts a timeline-tick delta into the corresponding source-tick delta
-/// for a clip's speed. Exact for constant speed; for a keyframed speed
-/// curve this is a 1x approximation — true time-remap-aware trimming is M7
-/// (time remapping) work, not guessed at here.
+/// Thin alias for `SpeedCurve::source_delta` — the shared implementation
+/// lives on the type itself so `render`'s graph compiler (which needs the
+/// same timeline-tick -> source-tick mapping to pick a source frame) uses
+/// exactly this logic rather than a second copy that could drift.
 fn source_delta_for(speed: &SpeedCurve, timeline_delta: i64) -> i64 {
-    match speed {
-        SpeedCurve::Constant { numerator, denominator } if *denominator != 0 => {
-            timeline_delta * numerator / denominator
-        }
-        _ => timeline_delta,
-    }
+    speed.source_delta(timeline_delta)
 }
 
 /// Shifts every clip at or after `at_or_after` on `source_track` by `delta`
