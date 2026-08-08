@@ -40,7 +40,7 @@ mod tests {
 
         let one_sec = timeline::TIMEBASE;
         engine.seek(one_sec);
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
         let right_after_seek = engine.current_tick();
         assert!(
             (right_after_seek - one_sec).abs() < timeline::TIMEBASE / 2,

@@ -5,10 +5,18 @@
 //! CPAL callback only pops from a lock-free ring buffer and does atomic
 //! bookkeeping.
 //!
-//! Known, documented imprecision (see `seek`): a seek can leave up to one
-//! ring-buffer-fill's worth of stale or slightly-early audio audible before
-//! the callback catches up to the new seek epoch. Acceptable for this M2
-//! proof; not a v1.0 guarantee.
+//! Seek correctness note: a seek bumps a shared epoch counter to tell the
+//! real-time callback to flush whatever's currently in the ring buffer.
+//! That flush is NOT just a nice-to-have — found empirically, it's load-
+//! bearing: the decode-ahead thread can decode and push an entire
+//! remaining clip's worth of post-seek audio in microseconds (decoding is
+//! far faster than real time), so without synchronization the callback's
+//! *one* post-seek flush can race past that fresh audio and discard it
+//! right along with the stale pre-seek audio it was meant to clear —
+//! silently eating all the audio between a seek and the next real
+//! decode-ahead cycle, or the whole rest of a short clip. The decode
+//! thread therefore waits for `flush_acked_epoch` to catch up before
+//! pushing anything new after a seek.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use media_ffmpeg::AudioDecoderStream;
@@ -31,6 +39,12 @@ struct ClockState {
     seek_epoch: AtomicU64,
     underruns: AtomicU64,
     playing: AtomicBool,
+    /// Set by the CPAL callback to the epoch it just flushed the ring
+    /// buffer for. The decode-ahead thread waits for this to catch up to
+    /// the epoch it just bumped before pushing any post-seek content — see
+    /// the module doc comment and `TransportCommand::Seek` handling for why
+    /// this is necessary, not just a nice-to-have.
+    flush_acked_epoch: AtomicU64,
     /// Set once the decode-ahead thread hits real end-of-stream. Distinct
     /// from an underrun: silence after the source is legitimately exhausted
     /// is expected behavior, not the decoder falling behind, so it must not
@@ -90,6 +104,7 @@ impl AudioEngine {
             underruns: AtomicU64::new(0),
             playing: AtomicBool::new(true),
             ended: AtomicBool::new(false),
+            flush_acked_epoch: AtomicU64::new(0),
         });
 
         let (command_tx, command_rx) = mpsc::channel::<TransportCommand>();
@@ -104,13 +119,34 @@ impl AudioEngine {
                         TransportCommand::Play => decode_clock.playing.store(true, Ordering::SeqCst),
                         TransportCommand::Pause => decode_clock.playing.store(false, Ordering::SeqCst),
                         TransportCommand::Seek(ticks) => {
-                            let _ = decoder.seek(ticks);
                             pending.clear();
                             pending_offset = 0;
                             decode_clock.base_ticks.store(ticks, Ordering::SeqCst);
                             decode_clock.consumed_frames.store(0, Ordering::SeqCst);
-                            decode_clock.seek_epoch.fetch_add(1, Ordering::SeqCst);
                             decode_clock.ended.store(false, Ordering::SeqCst);
+
+                            // Bump the epoch and wait for the callback to
+                            // actually flush the ring buffer before we
+                            // reposition the decoder and start pushing
+                            // post-seek content — otherwise decode-ahead
+                            // (which can outrun real time by orders of
+                            // magnitude) can push the entire rest of the
+                            // clip before the callback's flush runs, and
+                            // that flush would discard it right along with
+                            // the stale audio it's meant to clear. Bounded
+                            // wait: the callback runs every ~10ms in
+                            // practice; 200ms is a generous ceiling so a
+                            // stalled audio device degrades to "seek had no
+                            // effect" rather than hanging this thread.
+                            let target_epoch = decode_clock.seek_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+                            while decode_clock.flush_acked_epoch.load(Ordering::SeqCst) < target_epoch
+                                && std::time::Instant::now() < deadline
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+
+                            let _ = decoder.seek(ticks);
                         }
                     }
                 }
@@ -161,6 +197,7 @@ impl AudioEngine {
                     if epoch_now != local_epoch {
                         while consumer.try_pop().is_some() {}
                         local_epoch = epoch_now;
+                        callback_clock.flush_acked_epoch.store(epoch_now, Ordering::SeqCst);
                     }
                     let popped = consumer.pop_slice(data);
                     if popped < data.len() {

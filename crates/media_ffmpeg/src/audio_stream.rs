@@ -147,6 +147,30 @@ mod tests {
     }
 
     #[test]
+    fn seek_works_after_reading_to_genuine_eof() {
+        // AudioEngine's decode-ahead thread routinely reads all the way to
+        // real EOF (it races far ahead of real time, filling its ring
+        // buffer) before a later seek arrives — this exercises exactly
+        // that: read to genuine EOF, poll past it a few times the way the
+        // engine's retry loop does, then seek backward and confirm it
+        // resumes producing real samples.
+        crate::init().unwrap();
+        let mut stream = AudioDecoderStream::open(&fixture("test_h264.mp4"), 48000, 2).unwrap();
+        let mut chunks_before_eof = 0;
+        while stream.next_samples().unwrap().is_some() {
+            chunks_before_eof += 1;
+        }
+        assert!(chunks_before_eof > 0, "should have decoded real content before EOF");
+        for _ in 0..5 {
+            assert!(stream.next_samples().unwrap().is_none(), "should keep reporting EOF until seeked");
+        }
+
+        stream.seek(crate::timeline_timebase()).unwrap(); // 1 second into a 3-second file
+        let after_seek = stream.next_samples().unwrap();
+        assert!(after_seek.is_some(), "seeking backward after reaching real EOF should resume producing samples");
+    }
+
+    #[test]
     fn seek_repositions_audio_stream() {
         crate::init().unwrap();
         let mut stream = AudioDecoderStream::open(&fixture("test_h264.mp4"), 48000, 2).unwrap();

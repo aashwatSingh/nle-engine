@@ -1,5 +1,44 @@
 # Decisions log
 
+## 2026-08-07 — Third real bug: audio seek could silently discard all post-seek audio (race)
+
+Found while starting M3 and re-running the full test suite as a sanity
+check: `seek_resets_clock_to_target_and_keeps_playing` failed consistently
+(not flaky — same failure every run), with the audio clock freezing exactly
+at the seek target forever, zero underruns logged, `has_ended()` true
+almost immediately.
+
+**Root cause:** `AudioEngine`'s seek used a shared epoch counter — bump it,
+and the real-time callback flushes (discards) whatever's in the ring buffer
+on its next invocation, to clear stale pre-seek audio. The bug: the
+decode-ahead thread races far ahead of real time (it decoded and pushed an
+entire remaining ~1.8s of a 3s test clip in microseconds after seeking), so
+it could — and reliably did, given how CPU-cheap decoding a small audio
+file is relative to a ~10ms callback period — push *all* of the fresh
+post-seek audio into the ring buffer before the callback's one-time flush
+ran. The flush doesn't distinguish "stale, pre-seek" from "fresh,
+post-seek" — it just clears everything currently in the buffer — so it
+discarded the real post-seek audio right along with the stale audio it was
+meant to clear, and since decode had already reached the file's actual end
+producing it, there was nothing left to replace what got thrown away.
+
+**Fix:** added `flush_acked_epoch`, set by the callback immediately after
+it performs the flush. The decode-ahead thread now bumps the epoch and
+*waits* (bounded, 200ms ceiling) for the callback to acknowledge that
+epoch before repositioning the decoder and pushing any post-seek content —
+so the flush can only ever discard stale audio, never fresh audio, because
+none exists yet in the buffer when the flush runs.
+
+**Why this one is worth flagging on its own:** the original code even had
+a doc comment anticipating "some stale audio might play right after a
+seek" — but that framing assumed the failure mode was *too little*
+flushing (leftover staleness), when the actual failure mode empirically
+was the opposite: *too aggressive* flushing racing ahead of correctness
+and eating audio that hadn't even had a chance to be stale yet. Recorded
+because the lesson generalizes: a race's actual failure mode can invert the
+one you designed against, and "I already wrote a caveat comment about
+this" is not the same as having verified the caveat is the right one.
+
 ## 2026-08-07 — Two real bugs found building M2, both fixed at the media_ffmpeg layer
 
 Found while getting `play_clip` (the M2 capstone demo) to run cleanly to the
