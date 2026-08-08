@@ -67,30 +67,72 @@ pub struct SourceTexture {
     pub color: ColorMetadata,
 }
 
-/// The frames a `CompiledFrameGraph` needs, keyed exactly the way
-/// `FrameSource::Media` names them. The compositor never decodes — it asks
-/// for what the graph said it needs and skips any track whose frame is
-/// missing (a dropped frame, not a crash; see spec 4.4's frame-drop policy).
+/// The frames available to satisfy a `CompiledFrameGraph`'s
+/// `FrameSource::Media` requests. The compositor never decodes — it asks for
+/// what the graph said it needs and skips any track whose frame is missing (a
+/// dropped frame, not a crash; see spec 4.4's frame-drop policy).
+///
+/// Lookup is deliberately **nearest-at-or-before**, not exact match. The
+/// graph computes an exact source tick from timeline arithmetic, but a real
+/// decoder only ever yields the frames that actually exist in the file, whose
+/// PTS values almost never land on that exact tick. Exact matching therefore
+/// works fine in a test that uploads at the tick it renders and fails ~100%
+/// of the time during real playback. "The most recent frame whose PTS is at
+/// or before the requested time" is the correct presentation rule.
 #[derive(Default)]
 pub struct SourceFrames {
-    frames: HashMap<(MediaAssetId, i64), SourceTexture>,
+    /// Per asset, sorted ascending by PTS.
+    frames: HashMap<MediaAssetId, Vec<(i64, SourceTexture)>>,
 }
 
 impl SourceFrames {
     pub fn insert(&mut self, asset: MediaAssetId, pts_ticks: i64, texture: SourceTexture) {
-        self.frames.insert((asset, pts_ticks), texture);
+        let entries = self.frames.entry(asset).or_default();
+        match entries.binary_search_by_key(&pts_ticks, |(p, _)| *p) {
+            Ok(existing) => entries[existing] = (pts_ticks, texture),
+            Err(pos) => entries.insert(pos, (pts_ticks, texture)),
+        }
     }
 
+    /// The frame that should be *presented* at `pts_ticks`: the latest frame
+    /// at or before it. Falls back to the earliest available frame when the
+    /// request precedes everything held, so a slightly-early request shows
+    /// the first frame rather than nothing.
     pub fn get(&self, asset: MediaAssetId, pts_ticks: i64) -> Option<&SourceTexture> {
-        self.frames.get(&(asset, pts_ticks))
+        let entries = self.frames.get(&asset)?;
+        match entries.binary_search_by_key(&pts_ticks, |(p, _)| *p) {
+            Ok(exact) => Some(&entries[exact].1),
+            Err(0) => entries.first().map(|(_, t)| t),
+            Err(pos) => Some(&entries[pos - 1].1),
+        }
     }
 
+    /// Drops frames older than `keep_from_ticks` for `asset`, always leaving
+    /// at least one so a still playhead never loses its frame. Bounds memory
+    /// during sustained playback, where frames arrive continuously.
+    pub fn retain_from(&mut self, asset: MediaAssetId, keep_from_ticks: i64) {
+        if let Some(entries) = self.frames.get_mut(&asset) {
+            let cutoff = entries.partition_point(|(p, _)| *p < keep_from_ticks);
+            // Keep one frame before the cutoff: it's the one currently being
+            // presented for any tick between it and the next.
+            let drop_count = cutoff.saturating_sub(1);
+            if drop_count > 0 {
+                entries.drain(..drop_count);
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    /// Total frames held across all assets.
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.frames.values().map(|v| v.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.len() == 0
     }
 }
 
@@ -131,10 +173,27 @@ pub struct Compositor {
     clip_bgl: wgpu::BindGroupLayout,
     deliver_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    output_format: wgpu::TextureFormat,
 }
 
 impl Compositor {
+    /// Compositor writing `OUTPUT_FORMAT` (`Rgba8Unorm`) — the export shape,
+    /// and what `render_to_rgba` reads back.
     pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
+        Self::with_output_format(device, queue, OUTPUT_FORMAT)
+    }
+
+    /// Compositor writing a caller-chosen format, so preview can render
+    /// straight into a swapchain texture instead of through an extra blit.
+    ///
+    /// Pass a **non-sRGB** format. The delivery pass applies the transfer
+    /// function itself, so an `*Srgb` target would encode a second time and
+    /// produce a visibly washed-out image.
+    pub fn with_output_format(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        output_format: wgpu::TextureFormat,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite"),
             source: wgpu::ShaderSource::Wgsl(include_str!("composite.wgsl").into()),
@@ -233,7 +292,7 @@ impl Compositor {
             &deliver_bgl,
             "vs_fullscreen",
             "fs_deliver",
-            OUTPUT_FORMAT,
+            output_format,
             Some(wgpu::BlendState::REPLACE),
             "deliver pipeline",
         );
@@ -249,7 +308,20 @@ impl Compositor {
             ..Default::default()
         });
 
-        Compositor { device, queue, clip_pipeline, deliver_pipeline, clip_bgl, deliver_bgl, sampler }
+        Compositor {
+            device,
+            queue,
+            clip_pipeline,
+            deliver_pipeline,
+            clip_bgl,
+            deliver_bgl,
+            sampler,
+            output_format,
+        }
+    }
+
+    pub fn output_format(&self) -> wgpu::TextureFormat {
+        self.output_format
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -577,6 +649,11 @@ impl Compositor {
         sources: &SourceFrames,
         delivery: DeliverySpace,
     ) -> (RenderedFrame, CompositeStats) {
+        assert_eq!(
+            self.output_format, OUTPUT_FORMAT,
+            "render_to_rgba reads back {OUTPUT_FORMAT:?}; this compositor was built for a different \
+             output format, so use render_to_view instead"
+        );
         let (width, height) = (graph.width, graph.height);
         let output = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("output"),

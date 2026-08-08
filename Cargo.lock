@@ -1481,6 +1481,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "play_timeline"
+version = "0.0.1"
+dependencies = [
+ "media",
+ "media_ffmpeg",
+ "playback",
+ "pollster",
+ "render",
+ "timeline",
+ "winit",
+]
+
+[[package]]
 name = "playback"
 version = "0.0.1"
 dependencies = [

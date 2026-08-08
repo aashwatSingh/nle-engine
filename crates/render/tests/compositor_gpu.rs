@@ -369,6 +369,32 @@ fn positive_rotation_reads_as_clockwise() {
 }
 
 #[test]
+fn source_lookup_presents_the_latest_frame_at_or_before_the_request() {
+    // The rule real playback depends on: the graph asks for an exact source
+    // tick, and the decoder only has the PTS values that exist in the file.
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    let red = solid(4, 4, [255, 0, 0, 255]);
+    let green = solid(4, 4, [0, 255, 0, 255]);
+    sources.insert(MediaAssetId(1), 1000, comp.upload_rgba(&red, 4, 4, rec709()));
+    sources.insert(MediaAssetId(1), 2000, comp.upload_rgba(&green, 4, 4, rec709()));
+
+    assert!(sources.get(MediaAssetId(1), 1000).is_some(), "exact hit");
+    assert!(sources.get(MediaAssetId(1), 1500).is_some(), "between frames should resolve, not miss");
+    assert!(sources.get(MediaAssetId(1), 99_999).is_some(), "past the last frame holds the last frame");
+    assert!(sources.get(MediaAssetId(1), 0).is_some(), "before the first frame falls back to the first");
+    assert!(sources.get(MediaAssetId(2), 1000).is_none(), "an asset with no frames at all is a real miss");
+
+    assert_eq!(sources.len(), 2);
+    // Retaining from 2000 should drop nothing yet: the frame at 1000 is still
+    // the one presented for ticks in [1000, 2000).
+    sources.retain_from(MediaAssetId(1), 2000);
+    assert_eq!(sources.len(), 2, "must keep the frame currently being presented");
+    sources.retain_from(MediaAssetId(1), 5000);
+    assert_eq!(sources.len(), 1, "older frames beyond the playhead should be released");
+}
+
+#[test]
 fn missing_source_frame_is_reported_not_crashed() {
     let comp = compositor();
     // The graph asks for asset 1 @ pts 0, but nothing is uploaded.

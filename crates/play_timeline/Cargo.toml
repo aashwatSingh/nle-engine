@@ -1,0 +1,18 @@
+[package]
+name = "play_timeline"
+version = "0.0.1"
+edition = "2021"
+license = "UNLICENSED"
+
+# M4 capstone: spec M4's "Timeline playback with real compositing" — a real
+# multi-track Project, audio-clocked, GPU-composited every frame. This is the
+# first demo that exercises M1 (decode) + M2 (playback clock) + M3 (timeline
+# model) + M4 (graph + compositor) together.
+[dependencies]
+media = { path = "../media" }
+media_ffmpeg = { path = "../media_ffmpeg" }
+playback = { path = "../playback" }
+render = { path = "../render" }
+timeline = { path = "../timeline" }
+winit = "=0.29.15"
+pollster = "0.3"
