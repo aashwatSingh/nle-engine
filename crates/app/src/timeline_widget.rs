@@ -9,6 +9,7 @@
 //! Each drag coalesces into one undo step (spec 4.3: "dragging a clip is
 //! one undo step, not 400").
 
+use crate::icons::{icon_button, icon_toggle, Icon};
 use crate::state::{Drag, EditorState, Tool};
 use crate::waveform_cache::{column_range, WaveformCache};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
@@ -36,25 +37,30 @@ fn snap_tolerance_ticks(state: &EditorState) -> i64 {
 
 pub fn show(ui: &mut egui::Ui, state: &mut EditorState, waveforms: &mut WaveformCache) {
     ui.horizontal(|ui| {
-        ui.selectable_value(&mut state.tool, Tool::Select, "Select (V)");
-        ui.selectable_value(&mut state.tool, Tool::Razor, "Razor (C)");
+        if icon_toggle(ui, Icon::Select, "Select", state.tool == Tool::Select).on_hover_text("V").clicked() {
+            state.tool = Tool::Select;
+        }
+        if icon_toggle(ui, Icon::Razor, "Razor", state.tool == Tool::Razor).on_hover_text("C").clicked() {
+            state.tool = Tool::Razor;
+        }
         ui.separator();
-        if ui.button("Zoom in").clicked() {
+        if icon_button(ui, Icon::ZoomIn, "").on_hover_text("Zoom in").clicked() {
             state.ticks_per_px = (state.ticks_per_px / 1.5).max(TIMEBASE as f64 / 4000.0);
         }
-        if ui.button("Zoom out").clicked() {
+        if icon_button(ui, Icon::ZoomOut, "").on_hover_text("Zoom out").clicked() {
             state.ticks_per_px = (state.ticks_per_px * 1.5).min(TIMEBASE as f64 * 2.0);
         }
         ui.separator();
-        ui.checkbox(&mut state.snapping, "Snap (S)");
-        if ui
-            .button("Mark In (I)")
-            .on_hover_text("set the in point at the playhead")
+        if icon_toggle(ui, Icon::Snap, "", state.snapping).on_hover_text("Snap (S)").clicked() {
+            state.snapping = !state.snapping;
+        }
+        if icon_button(ui, Icon::MarkIn, "")
+            .on_hover_text("set the in point at the playhead (I)")
             .clicked()
         {
             state.mark_in();
         }
-        if ui.button("Mark Out (O)").clicked() {
+        if icon_button(ui, Icon::MarkOut, "").on_hover_text("set the out point at the playhead (O)").clicked() {
             state.mark_out();
         }
         if state.in_point.is_some() || state.out_point.is_some() {

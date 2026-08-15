@@ -13,12 +13,14 @@
 mod autosave;
 mod effects_panel;
 mod export_job;
+mod icons;
 mod mixer_panel;
 mod proxy_jobs;
 mod preview;
 mod project_panel;
 mod scopes_panel;
 mod state;
+mod theme;
 mod title_panel;
 mod transcript_panel;
 mod waveform_cache;
@@ -90,6 +92,7 @@ fn main() {
     surface.configure(&device, &config);
 
     let egui_ctx = egui::Context::default();
+    theme::apply(&egui_ctx);
     let mut egui_winit_state = egui_winit::State::new(
         egui_ctx.clone(),
         egui::ViewportId::ROOT,
@@ -943,29 +946,23 @@ fn build_ui(
                 }
             });
             ui.separator();
-            if ui
-                .button("Add Title")
+            if icons::icon_button(ui, icons::Icon::AddTitle, "Add Title")
                 .on_hover_text("insert a text title at the playhead on the topmost video track")
                 .clicked()
             {
                 state.add_title_at_playhead(TimeTick(TIMEBASE * 3));
             }
             ui.separator();
-            if ui.button("Undo (Z)").clicked() {
+            if icons::icon_button(ui, icons::Icon::Undo, "Undo").on_hover_text("Z").clicked() {
                 state.undo.undo();
             }
-            if ui.button("Redo (Y)").clicked() {
+            if icons::icon_button(ui, icons::Icon::Redo, "Redo").on_hover_text("Y").clicked() {
                 state.undo.redo();
             }
             ui.separator();
-            if ui
-                .button(if state.playing {
-                    "Pause (Space)"
-                } else {
-                    "Play (Space)"
-                })
-                .clicked()
-            {
+            let (play_icon, play_label) =
+                if state.playing { (icons::Icon::Pause, "Pause") } else { (icons::Icon::Play, "Play") };
+            if icons::icon_button(ui, play_icon, play_label).on_hover_text("Space").clicked() {
                 if state.playing {
                     stop_playback(state, transport);
                 } else {

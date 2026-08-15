@@ -147,7 +147,7 @@ pub fn show(
 ) {
     ui.horizontal(|ui| {
         ui.heading("Project");
-        if ui.button("Import...").clicked() {
+        if crate::icons::icon_button(ui, crate::icons::Icon::Import, "Import").clicked() {
             if let Some(paths) = rfd::FileDialog::new()
                 .set_title("Import media")
                 .add_filter("Video files", VIDEO_EXTENSIONS)
