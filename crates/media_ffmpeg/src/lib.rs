@@ -13,10 +13,12 @@ use std::path::Path;
 pub mod audio_peaks;
 pub mod audio_stream;
 pub mod proxy;
+pub mod source_reader;
 pub mod stream_decoder;
 pub use audio_peaks::{generate_audio_peaks, AudioPeaks};
-pub use audio_stream::AudioDecoderStream;
+pub use audio_stream::{AudioChunk, AudioDecoderStream};
 pub use proxy::{generate_proxy, ProxyOptions};
+pub use source_reader::SourceReader;
 pub use stream_decoder::VideoDecoderStream;
 
 /// Reads one packet, treating *any* read error as end-of-stream — not just
@@ -204,10 +206,30 @@ pub fn probe(path: &Path) -> Result<MediaAsset, ProbeError> {
             let decoder = ffmpeg_next::codec::context::Context::from_parameters(params)?
                 .decoder()
                 .audio()?;
+            // Derived from the stream's own duration in its own timebase,
+            // then converted to samples at the decoder's rate. Previously
+            // hardcoded to 0 with a TODO, which is worse than absent: it's a
+            // public field that silently reports "no audio length" for every
+            // file, so anything trusting it (an export length check, a
+            // waveform's extent) gets a wrong answer rather than an error.
+            // Falls back to the container duration when the stream doesn't
+            // carry its own, and to 0 only when neither is known.
+            let rate = decoder.rate();
+            let stream_duration = stream.duration();
+            let tb = stream.time_base();
+            let duration_samples = if stream_duration > 0 && tb.denominator() != 0 {
+                (stream_duration as i128 * tb.numerator() as i128 * rate as i128
+                    / tb.denominator() as i128) as u64
+            } else if input.duration() > 0 {
+                // Container duration is in AV_TIME_BASE (microseconds).
+                (input.duration() as i128 * rate as i128 / 1_000_000) as u64
+            } else {
+                0
+            };
             Some(AudioStreamInfo {
-                sample_rate: decoder.rate(),
+                sample_rate: rate,
                 channel_count: decoder.channels(),
-                duration_samples: 0, // TODO(M1 follow-up): derive from stream duration + rate
+                duration_samples,
             })
         }
         None => None,
@@ -342,7 +364,7 @@ pub fn decode_frame_at(path: &Path, target_ticks: i64) -> Result<DecodedRgbaFram
     best.ok_or(ProbeError::NoDecodableStreams)
 }
 
-pub(crate) fn timeline_timebase() -> i64 {
+pub(crate) const fn timeline_timebase() -> i64 {
     // Duplicated constant rather than a dependency on `timeline` — `media`
     // (and this crate, which extends it) must not depend on `timeline` per
     // docs/architecture.md's dependency direction. Kept in sync by the
@@ -365,7 +387,14 @@ mod tests {
 
     #[test]
     fn timebase_matches_timeline_crate() {
-        assert_eq!(timeline_timebase(), 254_016_000_000);
+        // Compares against the real `timeline::TIMEBASE`, not a second copy of
+        // the literal — otherwise this test passes no matter how far the two
+        // drift, which is exactly the failure it exists to catch.
+        assert_eq!(
+            timeline_timebase(),
+            timeline::TIMEBASE,
+            "media_ffmpeg's duplicated timebase has drifted from timeline::TIMEBASE"
+        );
     }
 
     #[test]

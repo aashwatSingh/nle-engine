@@ -64,7 +64,11 @@ impl ParamValue {
         }
     }
 
-    fn as_scalar(&self) -> Option<f64> {
+    /// The numeric value, or `None` for non-`Number` variants. Public
+    /// because every consumer that evaluates a scalar parameter (the render
+    /// graph's effect params, the audio mixer's gain/pan) needs exactly this
+    /// and would otherwise re-match the enum locally.
+    pub fn as_scalar(&self) -> Option<f64> {
         match self {
             ParamValue::Number(v) => Some(*v),
             _ => None,
@@ -126,6 +130,110 @@ fn auto_tangents(keyframes: &[Keyframe], i: usize) -> ((f64, f64), (f64, f64)) {
 impl ParamTrack {
     pub fn constant(value: ParamValue) -> Self {
         ParamTrack { default: value, keyframes: Vec::new() }
+    }
+
+    /// True when this parameter animates. An empty keyframe list means the
+    /// parameter is a constant at `default` — that's the distinction the UI's
+    /// stopwatch toggle exposes.
+    pub fn is_animated(&self) -> bool {
+        !self.keyframes.is_empty()
+    }
+
+    /// Index of the keyframe exactly at `at`, if there is one.
+    pub fn keyframe_index_at(&self, at: TimeTick) -> Option<usize> {
+        self.keyframes.binary_search_by(|k| k.at.cmp(&at)).ok()
+    }
+
+    /// Sets `at` to `value`, replacing an existing keyframe there or inserting
+    /// a new one in sorted position.
+    ///
+    /// **Every mutator here maintains `keyframes` sorted ascending by `at`.**
+    /// That isn't cosmetic: `evaluate_at` locates the surrounding segment with
+    /// `binary_search_by`, which silently returns nonsense on an unsorted
+    /// slice — the parameter would interpolate between the wrong pair of
+    /// keyframes with no error anywhere. Appending and forgetting to re-sort
+    /// is the obvious way to introduce that, so insertion position is computed
+    /// rather than fixed up afterwards.
+    pub fn upsert_keyframe(
+        &mut self,
+        at: TimeTick,
+        value: ParamValue,
+        interpolation: InterpolationMode,
+    ) {
+        match self.keyframes.binary_search_by(|k| k.at.cmp(&at)) {
+            Ok(i) => self.keyframes[i].value = value,
+            Err(i) => self
+                .keyframes
+                .insert(i, Keyframe { at, value, interpolation, tangents: None }),
+        }
+    }
+
+    /// Removes the keyframe at `at`. Returns whether one was there.
+    pub fn remove_keyframe_at(&mut self, at: TimeTick) -> bool {
+        match self.keyframes.binary_search_by(|k| k.at.cmp(&at)) {
+            Ok(i) => {
+                self.keyframes.remove(i);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Moves the keyframe at `from` to `to`, keeping the list sorted. A move
+    /// onto an existing keyframe's time replaces it, matching how dragging one
+    /// keyframe onto another behaves in an NLE.
+    pub fn move_keyframe(&mut self, from: TimeTick, to: TimeTick) -> bool {
+        let Ok(i) = self.keyframes.binary_search_by(|k| k.at.cmp(&from)) else {
+            return false;
+        };
+        if from == to {
+            return true;
+        }
+        let mut kf = self.keyframes.remove(i);
+        kf.at = to;
+        match self.keyframes.binary_search_by(|k| k.at.cmp(&to)) {
+            Ok(j) => self.keyframes[j] = kf,
+            Err(j) => self.keyframes.insert(j, kf),
+        }
+        true
+    }
+
+    /// Sets the interpolation mode of the keyframe at `at`. Since the *left*
+    /// keyframe governs the segment leaving it, this changes the curve from
+    /// `at` to the following keyframe.
+    pub fn set_interpolation_at(&mut self, at: TimeTick, mode: InterpolationMode) -> bool {
+        match self.keyframes.binary_search_by(|k| k.at.cmp(&at)) {
+            Ok(i) => {
+                self.keyframes[i].interpolation = mode;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Sets the explicit (out, in) tangent handles of the keyframe at `at`.
+    /// Only meaningful when that keyframe's interpolation is `Bezier` —
+    /// `evaluate_at` ignores `tangents` for every other mode — but setting
+    /// them regardless of the current mode lets the UI drag a handle before
+    /// committing to Bezier without losing the drag's result.
+    pub fn set_tangents_at(&mut self, at: TimeTick, tangents: ((f64, f64), (f64, f64))) -> bool {
+        match self.keyframes.binary_search_by(|k| k.at.cmp(&at)) {
+            Ok(i) => {
+                self.keyframes[i].tangents = Some(tangents);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Latest keyframe strictly before `at` — "go to previous keyframe".
+    pub fn prev_keyframe_before(&self, at: TimeTick) -> Option<TimeTick> {
+        self.keyframes.iter().rev().find(|k| k.at < at).map(|k| k.at)
+    }
+
+    /// Earliest keyframe strictly after `at` — "go to next keyframe".
+    pub fn next_keyframe_after(&self, at: TimeTick) -> Option<TimeTick> {
+        self.keyframes.iter().find(|k| k.at > at).map(|k| k.at)
     }
 
     /// Resolves this parameter to a concrete value at `tick`.
@@ -329,6 +437,112 @@ mod tests {
         };
         assert_eq!(t.evaluate_at(TimeTick(50)), ParamValue::Bool(false));
         assert_eq!(t.evaluate_at(TimeTick(100)), ParamValue::Bool(true));
+    }
+
+    /// The invariant every mutator must preserve, checked as a property
+    /// rather than trusted: an unsorted list makes `evaluate_at`'s binary
+    /// search interpolate between the wrong keyframes, silently.
+    fn assert_sorted(t: &ParamTrack) {
+        assert!(
+            t.keyframes.windows(2).all(|w| w[0].at < w[1].at),
+            "keyframes must stay sorted and unique by time, got {:?}",
+            t.keyframes.iter().map(|k| k.at.0).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn upsert_inserts_in_sorted_position_regardless_of_call_order() {
+        let mut t = ParamTrack::constant(ParamValue::Number(0.0));
+        // Deliberately out of order — the UI adds keyframes wherever the
+        // playhead happens to be, which is not monotonic.
+        for at in [500, 100, 900, 300, 700] {
+            t.upsert_keyframe(TimeTick(at), ParamValue::Number(at as f64), InterpolationMode::Linear);
+        }
+        assert_sorted(&t);
+        assert_eq!(t.keyframes.len(), 5);
+        // And the engine reads them back correctly: midway between 100 and 300.
+        assert_eq!(num(t.evaluate_at(TimeTick(200))), 200.0);
+    }
+
+    #[test]
+    fn upsert_at_an_existing_time_replaces_rather_than_duplicating() {
+        let mut t = ParamTrack::constant(ParamValue::Number(0.0));
+        t.upsert_keyframe(TimeTick(100), ParamValue::Number(1.0), InterpolationMode::Linear);
+        t.upsert_keyframe(TimeTick(100), ParamValue::Number(9.0), InterpolationMode::Linear);
+        assert_eq!(t.keyframes.len(), 1, "a second edit at the same tick must not add a keyframe");
+        assert_eq!(num(t.evaluate_at(TimeTick(100))), 9.0);
+        assert_sorted(&t);
+    }
+
+    #[test]
+    fn set_tangents_at_writes_the_handles_of_the_keyframe_at_that_time() {
+        let mut t = ParamTrack::constant(ParamValue::Number(0.0));
+        t.upsert_keyframe(TimeTick(100), ParamValue::Number(1.0), InterpolationMode::Bezier);
+
+        let tangents = ((-20.0, -0.5), (20.0, 0.5));
+        assert!(t.set_tangents_at(TimeTick(100), tangents));
+        assert_eq!(t.keyframes[0].tangents, Some(tangents));
+    }
+
+    #[test]
+    fn set_tangents_at_a_time_with_no_keyframe_reports_failure() {
+        let mut t = ParamTrack::constant(ParamValue::Number(0.0));
+        t.upsert_keyframe(TimeTick(100), ParamValue::Number(1.0), InterpolationMode::Bezier);
+        assert!(!t.set_tangents_at(TimeTick(250), ((0.0, 0.0), (0.0, 0.0))));
+    }
+
+    #[test]
+    fn moving_a_keyframe_past_its_neighbours_keeps_the_list_sorted() {
+        // Dragging a keyframe across another one is ordinary UI behaviour, and
+        // the naive implementation (mutate `at` in place) breaks the ordering
+        // invariant without any visible error.
+        let mut t = ParamTrack::constant(ParamValue::Number(0.0));
+        for at in [100, 200, 300] {
+            t.upsert_keyframe(TimeTick(at), ParamValue::Number(at as f64), InterpolationMode::Linear);
+        }
+        assert!(t.move_keyframe(TimeTick(100), TimeTick(250)));
+        assert_sorted(&t);
+        assert_eq!(
+            t.keyframes.iter().map(|k| k.at.0).collect::<Vec<_>>(),
+            vec![200, 250, 300]
+        );
+        assert_eq!(num(t.evaluate_at(TimeTick(250))), 100.0, "the moved keyframe keeps its value");
+    }
+
+    #[test]
+    fn moving_onto_an_occupied_time_replaces_instead_of_duplicating() {
+        let mut t = ParamTrack::constant(ParamValue::Number(0.0));
+        t.upsert_keyframe(TimeTick(100), ParamValue::Number(1.0), InterpolationMode::Linear);
+        t.upsert_keyframe(TimeTick(200), ParamValue::Number(2.0), InterpolationMode::Linear);
+        assert!(t.move_keyframe(TimeTick(100), TimeTick(200)));
+        assert_eq!(t.keyframes.len(), 1);
+        assert_eq!(num(t.evaluate_at(TimeTick(200))), 1.0, "the dragged keyframe wins");
+        assert_sorted(&t);
+    }
+
+    #[test]
+    fn navigation_finds_strictly_adjacent_keyframes() {
+        let mut t = ParamTrack::constant(ParamValue::Number(0.0));
+        for at in [100, 200, 300] {
+            t.upsert_keyframe(TimeTick(at), ParamValue::Number(0.0), InterpolationMode::Linear);
+        }
+        // Strictly, so that sitting exactly on a keyframe still steps off it
+        // rather than returning the one under the playhead forever.
+        assert_eq!(t.next_keyframe_after(TimeTick(200)), Some(TimeTick(300)));
+        assert_eq!(t.prev_keyframe_before(TimeTick(200)), Some(TimeTick(100)));
+        assert_eq!(t.next_keyframe_after(TimeTick(300)), None);
+        assert_eq!(t.prev_keyframe_before(TimeTick(100)), None);
+    }
+
+    #[test]
+    fn removing_the_last_keyframe_makes_the_track_constant_again() {
+        let mut t = ParamTrack::constant(ParamValue::Number(4.0));
+        t.upsert_keyframe(TimeTick(100), ParamValue::Number(1.0), InterpolationMode::Linear);
+        assert!(t.is_animated());
+        assert!(t.remove_keyframe_at(TimeTick(100)));
+        assert!(!t.is_animated());
+        assert_eq!(num(t.evaluate_at(TimeTick(100))), 4.0, "falls back to default");
+        assert!(!t.remove_keyframe_at(TimeTick(100)), "removing again reports nothing removed");
     }
 
     #[test]

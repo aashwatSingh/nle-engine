@@ -41,9 +41,15 @@ struct ClipUniforms {
     gamut1: vec4<f32>,
     gamut2: vec4<f32>,
     transfer_code: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    // Multiplies working-space colour only, never alpha. 1.0 = untouched,
+    // 0.0 = opaque black. See compositor.rs's mirror of this struct for why
+    // dip-to-black needs this rather than reusing `opacity`.
+    rgb_scale: f32,
+    // Wipe boundary position in this clip's UV space, 0..1, read only when
+    // `wipe_enabled` is 1. Kept separate from MaskUniforms so a wipe and the
+    // clip's own mask compose instead of one replacing the other.
+    wipe_progress: f32,
+    wipe_enabled: u32,
 };
 
 struct MaskUniforms {
@@ -200,6 +206,31 @@ fn mask_factor(uv: vec2<f32>) -> f32 {
     return factor;
 }
 
+// 1 where a wipe has already revealed this clip, 0 where it hasn't yet.
+//
+// The edge is softened over a fraction of a UV unit rather than being a bare
+// `step`: a hard boundary on a diagonal-free vertical edge still crawls with
+// visible stair-stepping as it moves sub-pixel amounts per frame, and this is
+// the cheapest fix that doesn't need multisampling.
+fn wipe_factor(uv: vec2<f32>) -> f32 {
+    if (clip_u.wipe_enabled == 0u) {
+        return 1.0;
+    }
+    let softness = 0.003;
+    let revealed = 1.0 - smoothstep(
+        clip_u.wipe_progress - softness,
+        clip_u.wipe_progress + softness,
+        uv.x,
+    );
+    // Mode 2 is the same boundary sweeping the same way, but hiding rather
+    // than revealing — what a wipe at the tail of a track with nothing after
+    // it has to do, mirroring how a cross dissolve there becomes a fade out.
+    if (clip_u.wipe_enabled == 2u) {
+        return 1.0 - revealed;
+    }
+    return revealed;
+}
+
 @fragment
 fn fs_clip(in: ClipVertexOut) -> @location(0) vec4<f32> {
     let src = textureSample(t_source, s_source, in.uv);
@@ -216,8 +247,12 @@ fn fs_clip(in: ClipVertexOut) -> @location(0) vec4<f32> {
         dot(clip_u.gamut2.xyz, linear),
     );
 
+    // Scaling colour here — in linear light, after the gamut conversion and
+    // after any effect chain — is what makes a dip fade to a true black rather
+    // than to a gamma-encoded grey. Alpha deliberately untouched: see
+    // `rgb_scale`'s doc.
     let m = mask_factor(in.uv);
-    return vec4<f32>(working, src.a * clip_u.opacity * m);
+    return vec4<f32>(working * clip_u.rgb_scale, src.a * clip_u.opacity * m * wipe_factor(in.uv));
 }
 
 // --- single-uniform passes: prepare, effect chain, deliver ---
@@ -380,6 +415,74 @@ fn fs_crop(in: FullscreenVertexOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
     return textureSample(t_crop_src, s_crop_src, in.uv);
+}
+
+// -- Chroma Key --
+
+struct ChromaKeyUniforms {
+    key_color: vec4<f32>,
+    similarity: f32,
+    smoothness: f32,
+    spill_suppression: f32,
+    _pad: f32,
+};
+
+@group(0) @binding(0) var<uniform> ck_u: ChromaKeyUniforms;
+@group(0) @binding(1) var t_ck_src: texture_2d<f32>;
+@group(0) @binding(2) var s_ck_src: sampler;
+
+// Rec.709 Cb/Cr, luma discarded — the same matrix `render::scopes` uses on
+// the CPU for the vectorscope, mirrored here for the same reason `color.rs`'s
+// gamut matrices are: a transposed or subtly wrong copy still looks
+// plausible, so the two are kept as small, easily-compared constants rather
+// than one shared abstraction spanning the CPU/GPU boundary.
+fn chroma_uv(rgb: vec3<f32>) -> vec2<f32> {
+    let kr = 0.2126;
+    let kb = 0.0722;
+    let y = kr * rgb.r + (1.0 - kr - kb) * rgb.g + kb * rgb.b;
+    let cb = (rgb.b - y) / (2.0 * (1.0 - kb));
+    let cr = (rgb.r - y) / (2.0 * (1.0 - kr));
+    return vec2<f32>(cb, cr);
+}
+
+// Real min/max despill: pulls whichever channel `key` is dominant in down to
+// the larger of the other two, and only down — never boosts a channel, never
+// touches the other two. That's what keeps this from just desaturating the
+// subject wherever they happen to have some green in their own colour.
+fn despill(rgb: vec3<f32>, key: vec3<f32>) -> vec3<f32> {
+    if (key.g >= key.r && key.g >= key.b) {
+        return vec3<f32>(rgb.r, min(rgb.g, max(rgb.r, rgb.b)), rgb.b);
+    } else if (key.b >= key.r && key.b >= key.g) {
+        return vec3<f32>(rgb.r, rgb.g, min(rgb.b, max(rgb.r, rgb.g)));
+    } else {
+        return vec3<f32>(min(rgb.r, max(rgb.g, rgb.b)), rgb.g, rgb.b);
+    }
+}
+
+@fragment
+fn fs_chroma_key(in: FullscreenVertexOut) -> @location(0) vec4<f32> {
+    let src = textureSample(t_ck_src, s_ck_src, in.uv);
+    let dist = distance(chroma_uv(src.rgb), chroma_uv(ck_u.key_color.rgb));
+
+    // 0 (fully keyed) inside the similarity radius, ramping to 1 (fully
+    // opaque) over the next `smoothness` of distance beyond it.
+    let alpha = smoothstep(ck_u.similarity, ck_u.similarity + max(ck_u.smoothness, 1e-5), dist);
+
+    // Despill scales with the suppression amount and `alpha`, so a fully
+    // transparent (keyed-out) background isn't pointlessly desaturated —
+    // deliberately NOT scaled by proximity to the key hue on top of that.
+    // Real spill sits on edge/hair pixels that are a *mix* of foreground and
+    // reflected key light, which is usually well outside the tight
+    // `similarity` radius used for alpha — gating despill on that radius too
+    // would exclude exactly the pixels it exists to fix. `despill` is
+    // already self-limiting: it's a no-op wherever the key channel isn't
+    // actually elevated above the other two, spilled or not.
+    var rgb = src.rgb;
+    if (ck_u.spill_suppression > 0.0) {
+        rgb = mix(rgb, despill(rgb, ck_u.key_color.rgb), ck_u.spill_suppression * alpha);
+    }
+
+    return vec4<f32>(rgb, src.a * alpha);
 }
 
 // -- deliver: linear working space -> encoded delivery space --

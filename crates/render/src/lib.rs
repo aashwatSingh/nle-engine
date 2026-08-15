@@ -2,6 +2,10 @@ pub mod color;
 pub mod compositor;
 pub mod effect;
 pub mod graph;
+pub mod scene_cut;
+pub mod scopes;
+pub mod stabilize;
+pub mod text;
 
 /// Re-exported so callers bind against exactly the wgpu version this crate
 /// was compiled with. Two different wgpu versions in one binary produce
@@ -9,7 +13,8 @@ pub mod graph;
 pub use wgpu;
 
 pub use compositor::{
-    headless_context, Compositor, CompositeStats, RenderedFrame, SourceFrames, SourceTexture,
+    headless_context, read_texture_rgba, upload_rgba_to_gpu, Compositor, CompositeStats, RenderedFrame,
+    SourceFrames, SourceTexture,
 };
 
 pub use color::{
@@ -17,8 +22,8 @@ pub use color::{
     WORKING_SPACE_PRIMARIES, WORKING_SPACE_TRANSFER,
 };
 pub use effect::{
-    color_correction, crop, gaussian_blur, mask, transform, BuiltinRegistry, EffectDescriptor,
-    EffectLocality, EffectRegistry, ParamSchema, ParamType,
+    chroma_key, color_correction, crop, gaussian_blur, mask, transform, BuiltinRegistry,
+    EffectDescriptor, EffectLocality, EffectRegistry, ParamSchema, ParamType,
 };
 pub use graph::{
     ActiveClipPlan, CompiledFrameGraph, EffectPass, FrameSource, GraphCache, GraphCompiler,

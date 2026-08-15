@@ -8,3 +8,4 @@ license.workspace = true
 timeline = { workspace = true }
 media = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+rustfft = "6.4.1"

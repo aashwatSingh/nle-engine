@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use timeline::{
     ClipInstance, ClipInstanceId, ClipSource, EffectInstanceId, ParamValue, Project, Sequence,
-    SequenceId, TimeTick, TrackId, TrackKind,
+    SequenceId, TimeTick, TrackId, TrackKind, TransitionKind,
 };
 
 /// A resolved 2D transform, folded from a clip's `transform` effect
@@ -82,6 +82,13 @@ impl EffectPass {
             _ => None,
         }
     }
+
+    pub fn color(&self, name: &str) -> Option<[f32; 4]> {
+        match self.resolved_params.get(name) {
+            Some(ParamValue::Color(v)) => Some(*v),
+            _ => None,
+        }
+    }
 }
 
 /// A resolved mask shape, folded from a clip's `mask` effect instance (at
@@ -125,6 +132,14 @@ pub enum FrameSource {
     /// compositor renders this to an intermediate texture and then treats
     /// it as this clip's source.
     Nested(Box<CompiledFrameGraph>),
+    /// A text title, rasterised by the compositor at sequence resolution.
+    ///
+    /// The spec travels in the graph by value rather than as a reference into
+    /// the project because a `CompiledFrameGraph` outlives the borrow it was
+    /// compiled from — the playback thread holds one while the UI thread is
+    /// free to keep editing. Titles are small; cloning one per frame is not
+    /// the cost worth optimising here.
+    Title(timeline::TitleSpec),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,12 +165,35 @@ pub struct ActiveClipPlan {
     pub mask: MaskShape,
 }
 
+/// A transition in progress on a track at the compiled tick.
+///
+/// The compositor draws `outgoing` first at full opacity, then the track's
+/// `active_clip` at `progress` opacity over it. That ordering is what makes a
+/// cross dissolve come out right with no dedicated shader: alpha-over gives
+/// `B*p + A*(1-p)` with alpha 1. Drawing *both* layers at partial opacity —
+/// the obvious-looking alternative — yields `B*p + A*(1-p)^2` and visibly dips
+/// in the middle of every dissolve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransitionRender {
+    pub kind: TransitionKind,
+    /// 0.0 = entirely `outgoing`, 1.0 = entirely `active_clip`.
+    pub progress: f32,
+    /// The clip being transitioned away from, sampled past its own out point
+    /// (into its handles). `None` when the cut has nothing before it, which
+    /// makes the transition a fade in.
+    pub outgoing: Option<ActiveClipPlan>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackRenderPlan {
     pub track: TrackId,
-    /// `None` when no clip on this track covers the requested tick — the
-    /// track contributes nothing and the compositor skips it.
+    /// The incoming/primary layer. `None` when no clip on this track covers the
+    /// requested tick — the track contributes nothing and the compositor skips
+    /// it. During a transition's first half this is the clip *after* the cut,
+    /// sampled before its own in point.
     pub active_clip: Option<ActiveClipPlan>,
+    /// Set only while a transition covers this tick.
+    pub transition: Option<TransitionRender>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +209,63 @@ pub struct CompiledFrameGraph {
     /// project uses effects this build doesn't have" instead of rendering
     /// subtly wrong output and saying nothing.
     pub unknown_effects: usize,
+}
+
+/// One decoded frame a graph needs before it can be composited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaRequest {
+    pub asset: media::MediaAssetId,
+    pub source_pts_ticks: i64,
+    /// Which clip wants it.
+    ///
+    /// Carried because two clips can reference the **same asset at different
+    /// source times** — a dissolve between two moments of one interview, say.
+    /// A decoder cache keyed only by asset would then be yanked back and forth
+    /// between the two positions on every single frame, turning a cheap
+    /// forward walk into two seeks per frame. Keying by clip gives each layer
+    /// its own decoder, which is the whole reason `SourceReader` is fast.
+    pub clip: ClipInstanceId,
+}
+
+impl CompiledFrameGraph {
+    /// Every frame this graph needs decoded, including transitions' outgoing
+    /// layers, recursing into nested sequences.
+    ///
+    /// Exists so the three places that feed the compositor — the editor's
+    /// scrub path, the playback decode thread, and export — can't disagree
+    /// about what a frame requires. Each of them previously walked
+    /// `track_plans` and read `active_clip` directly, which meant adding the
+    /// transition layer would have silently rendered a dissolve with a missing
+    /// input in whichever call site was overlooked.
+    pub fn media_requests(&self) -> Vec<MediaRequest> {
+        let mut out = Vec::new();
+        self.collect_media_requests(&mut out);
+        out
+    }
+
+    fn collect_media_requests(&self, out: &mut Vec<MediaRequest>) {
+        for plan in &self.track_plans {
+            let layers = plan
+                .active_clip
+                .iter()
+                .chain(plan.transition.as_ref().and_then(|t| t.outgoing.as_ref()));
+            for layer in layers {
+                match &layer.source {
+                    FrameSource::Media { asset, source_pts_ticks } => out.push(MediaRequest {
+                        asset: *asset,
+                        source_pts_ticks: *source_pts_ticks,
+                        clip: layer.clip,
+                    }),
+                    FrameSource::Nested(inner) => inner.collect_media_requests(out),
+                    // Titles need no decode — the compositor rasterises them
+                    // from the spec already in the graph — so they contribute
+                    // no request. A title is therefore never counted as a
+                    // missing source, which is the point: it isn't missing.
+                    FrameSource::Title(_) => {}
+                }
+            }
+        }
+    }
 }
 
 /// Guard against a sequence that (directly or transitively) nests itself.
@@ -205,6 +300,58 @@ impl<R: EffectRegistry> GraphCompiler<R> {
         self.compile_inner(project, sequence, at, &mut ancestors)
     }
 
+    /// Plans one clip as it would look at sequence tick `at`.
+    ///
+    /// `at` is deliberately **not** required to fall inside the clip: a
+    /// transition samples both of its clips outside their own trim points, so
+    /// `source_pts` can land before `source_in` or after `source_out`. Both are
+    /// legitimate reads into the clip's handles, and the decoder clamps to the
+    /// file's real extent if the handles aren't there.
+    fn plan_clip(
+        &self,
+        project: &Project,
+        clip: &ClipInstance,
+        at: TimeTick,
+        ancestors: &mut Vec<SequenceId>,
+        unknown_effects: &mut usize,
+    ) -> Option<ActiveClipPlan> {
+        let into_clip = at.0 - clip.timeline_in.0;
+        let source = match &clip.source {
+            &ClipSource::Media(asset) => {
+                let source_pts = clip.source_in.0 + clip.speed.source_delta(into_clip);
+                Some(FrameSource::Media { asset, source_pts_ticks: source_pts })
+            }
+            // A title has no source media and no time axis of its own — it
+            // looks the same at every tick of the clip — so `into_clip` and
+            // the speed curve simply don't apply to it. Animating a title is
+            // what keyframed effects on the clip are for.
+            ClipSource::Title(spec) => Some(FrameSource::Title(spec.clone())),
+            &ClipSource::NestedSequence(inner_id) => {
+                if ancestors.contains(&inner_id) || ancestors.len() >= MAX_NEST_DEPTH {
+                    // A sequence nesting itself: skip rather than recurse
+                    // forever. The timeline model doesn't currently prevent
+                    // constructing this, so the renderer has to survive it.
+                    None
+                } else {
+                    let inner_tick =
+                        TimeTick(clip.source_in.0 + clip.speed.source_delta(into_clip));
+                    ancestors.push(inner_id);
+                    let nested = self
+                        .compile_inner(project, inner_id, inner_tick, ancestors)
+                        .map(|g| FrameSource::Nested(Box::new(g)));
+                    ancestors.pop();
+                    nested
+                }
+            }
+        };
+
+        source.map(|source| {
+            let (transform, mask, passes, unknown) = self.resolve_effects(clip, at);
+            *unknown_effects += unknown;
+            ActiveClipPlan { clip: clip.id, source, transform, effect_passes: passes, mask }
+        })
+    }
+
     fn compile_inner(
         &self,
         project: &Project,
@@ -223,60 +370,41 @@ impl<R: EffectRegistry> GraphCompiler<R> {
         for track in seq.tracks.iter().filter(|t| t.kind == TrackKind::Video) {
             let audible = if any_solo { track.solo } else { !track.muted };
             if !audible {
-                track_plans.push(TrackRenderPlan { track: track.id, active_clip: None });
+                track_plans.push(TrackRenderPlan { track: track.id, active_clip: None, transition: None });
                 continue;
             }
 
-            let active = track
-                .clips
-                .iter()
-                .find(|c| c.timeline_in <= at && at < c.timeline_out);
-
-            let plan = match active {
-                None => None,
-                Some(clip) => {
-                    let source = match clip.source {
-                        ClipSource::Media(asset) => {
-                            let into_clip = at.0 - clip.timeline_in.0;
-                            let source_pts = clip.source_in.0 + clip.speed.source_delta(into_clip);
-                            Some(FrameSource::Media { asset, source_pts_ticks: source_pts })
-                        }
-                        ClipSource::NestedSequence(inner_id) => {
-                            if ancestors.contains(&inner_id) || ancestors.len() >= MAX_NEST_DEPTH {
-                                // A sequence nesting itself: skip rather
-                                // than recurse forever. The timeline model
-                                // doesn't currently prevent constructing
-                                // this, so the renderer has to survive it.
-                                None
-                            } else {
-                                let into_clip = at.0 - clip.timeline_in.0;
-                                let inner_tick = TimeTick(
-                                    clip.source_in.0 + clip.speed.source_delta(into_clip),
-                                );
-                                ancestors.push(inner_id);
-                                let nested = self
-                                    .compile_inner(project, inner_id, inner_tick, ancestors)
-                                    .map(|g| FrameSource::Nested(Box::new(g)));
-                                ancestors.pop();
-                                nested
-                            }
-                        }
-                    };
-
-                    source.map(|source| {
-                        let (transform, mask, passes, unknown) = self.resolve_effects(clip, at);
-                        unknown_effects += unknown;
-                        ActiveClipPlan {
-                            clip: clip.id,
-                            source,
-                            transform,
-                            effect_passes: passes,
-                            mask,
-                        }
-                    })
+            // A transition replaces the normal "one clip covers this tick"
+            // lookup with the explicit pair its cut joins. During the first
+            // half the incoming clip doesn't contain `at` at all — sampling it
+            // early, into its handles, is exactly what a transition is.
+            let (plan, transition) = match track.transition_at(at) {
+                Some(tr) => {
+                    let (left, right) = track.clips_at_cut(tr.at);
+                    let incoming = right
+                        .and_then(|c| self.plan_clip(project, c, at, ancestors, &mut unknown_effects));
+                    let outgoing = left
+                        .and_then(|c| self.plan_clip(project, c, at, ancestors, &mut unknown_effects));
+                    (
+                        incoming,
+                        Some(TransitionRender {
+                            kind: tr.kind,
+                            progress: tr.progress_at(at),
+                            outgoing,
+                        }),
+                    )
+                }
+                None => {
+                    let active = track
+                        .clips
+                        .iter()
+                        .find(|c| c.timeline_in <= at && at < c.timeline_out);
+                    let plan = active
+                        .and_then(|c| self.plan_clip(project, c, at, ancestors, &mut unknown_effects));
+                    (plan, None)
                 }
             };
-            track_plans.push(TrackRenderPlan { track: track.id, active_clip: plan });
+            track_plans.push(TrackRenderPlan { track: track.id, active_clip: plan, transition });
         }
 
         Some(CompiledFrameGraph {
@@ -444,6 +572,7 @@ mod tests {
     use media::{ColorPrimaries, MediaAssetId};
     use std::collections::BTreeMap;
     use timeline::{
+        Transition,
         EffectInstance, FrameRate, InterpolationMode, Keyframe, ParamTrack, SequenceSettings,
         SpeedCurve, Track,
     };
@@ -474,12 +603,151 @@ mod tests {
             kind: TrackKind::Video,
             name: format!("V{id}"),
             clips,
+            transitions: vec![], gain_db: timeline::unity_gain(), pan: 0.0,
             locked: false,
             sync_locked: true,
             muted: false,
             solo: false,
             height_px: 60,
         }
+    }
+
+    /// Two abutting clips cut at `cut`, with a transition of `duration`
+    /// centred on it. Both clips have handles: `source_out` extends past what
+    /// the clip uses, so the transition can read into them.
+    fn track_with_transition(kind: TransitionKind, cut: i64, duration: i64) -> Track {
+        let mut left = clip(1, 0, cut);
+        left.source_out = TimeTick(cut * 2); // plenty of tail handle
+        let mut right = clip(2, cut, cut * 2);
+        right.source_in = TimeTick(cut); // head handle available before its in point
+        right.source_out = TimeTick(cut * 2);
+        let mut track = video_track(1, vec![left, right]);
+        track.transitions = vec![Transition {
+            id: timeline::TransitionId(1),
+            kind,
+            at: TimeTick(cut),
+            duration: TimeTick(duration),
+        }];
+        track
+    }
+
+    #[test]
+    fn a_transition_makes_both_clips_active_at_once() {
+        // The defining property: outside a transition a track has one layer,
+        // inside it has two. Everything else about dissolves depends on this.
+        let track = track_with_transition(TransitionKind::CrossDissolve, 1000, 400);
+        let p = Project {
+            sequences: vec![sequence(1, vec![track])],
+            assets: vec![],
+            bins: vec![],
+        };
+
+        // Well before the transition: one layer, no transition.
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(500)).unwrap();
+        assert!(g.track_plans[0].transition.is_none());
+        assert_eq!(g.media_requests().len(), 1);
+
+        // Inside it (region is 800..1200): two layers.
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(1000)).unwrap();
+        let tr = g.track_plans[0].transition.as_ref().expect("transition should be active");
+        assert!(tr.outgoing.is_some(), "the outgoing clip must be planned too");
+        assert_eq!(
+            g.media_requests().len(),
+            2,
+            "a dissolve needs two decoded frames, not one"
+        );
+    }
+
+    #[test]
+    fn transition_progress_runs_zero_to_one_across_its_region() {
+        let track = track_with_transition(TransitionKind::CrossDissolve, 1000, 400);
+        let p = Project { sequences: vec![sequence(1, vec![track])], assets: vec![], bins: vec![] };
+        let progress_at = |t: i64| {
+            compiler()
+                .compile(&p, SequenceId(1), TimeTick(t))
+                .unwrap()
+                .track_plans[0]
+                .transition
+                .as_ref()
+                .map(|tr| tr.progress)
+        };
+        // Region 800..1200, centred on the cut at 1000.
+        assert_eq!(progress_at(800), Some(0.0), "starts fully on the outgoing clip");
+        assert_eq!(progress_at(1000), Some(0.5), "half way at the cut itself");
+        assert!(progress_at(1199).unwrap() > 0.99, "ends fully on the incoming clip");
+        assert_eq!(progress_at(1200), None, "and is over at the region's end");
+    }
+
+    #[test]
+    fn clips_are_sampled_into_their_handles_during_a_transition() {
+        // What makes a transition possible at all: the outgoing clip is read
+        // *past* its out point and the incoming one *before* its in point. If
+        // the compiler clamped either to the clip's own bounds, both layers
+        // would show a frozen frame for half the transition.
+        let track = track_with_transition(TransitionKind::CrossDissolve, 1000, 400);
+        let p = Project { sequences: vec![sequence(1, vec![track])], assets: vec![], bins: vec![] };
+
+        // At tick 900: 100 before the cut, so the incoming clip (in at 1000,
+        // source_in 1000) must be read at source 900 — before its in point.
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(900)).unwrap();
+        let plan = &g.track_plans[0];
+        let incoming = plan.active_clip.as_ref().unwrap();
+        assert_eq!(
+            incoming.source,
+            FrameSource::Media { asset: MediaAssetId(7), source_pts_ticks: 900 },
+            "incoming clip should be read 100 ticks before its in point"
+        );
+
+        // At tick 1100: 100 past the cut, so the outgoing clip (out at 1000)
+        // must be read at source 1100 — past its out point.
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(1100)).unwrap();
+        let outgoing = g.track_plans[0].transition.as_ref().unwrap().outgoing.as_ref().unwrap();
+        assert_eq!(
+            outgoing.source,
+            FrameSource::Media { asset: MediaAssetId(7), source_pts_ticks: 1100 },
+            "outgoing clip should be read 100 ticks past its out point"
+        );
+    }
+
+    #[test]
+    fn media_requests_distinguish_two_clips_sharing_one_asset() {
+        // Two clips off one file, taken from moments far apart — the ordinary
+        // "dissolve between two takes in the same interview" case. The requests
+        // must carry their clip ids, or a decoder cache keyed by asset alone
+        // would be yanked between the two positions every frame.
+        let mut track = track_with_transition(TransitionKind::CrossDissolve, 1000, 400);
+        track.clips[1].source_in = TimeTick(50_000);
+        track.clips[1].source_out = TimeTick(51_000);
+        let p = Project { sequences: vec![sequence(1, vec![track])], assets: vec![], bins: vec![] };
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(900)).unwrap();
+
+        let reqs = g.media_requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.iter().all(|r| r.asset == MediaAssetId(7)));
+        assert_ne!(reqs[0].clip, reqs[1].clip, "requests must be distinguishable by clip");
+        assert_ne!(
+            reqs[0].source_pts_ticks, reqs[1].source_pts_ticks,
+            "the two layers are at different source times — that's the whole point"
+        );
+    }
+
+    #[test]
+    fn a_transition_at_a_clips_head_has_no_outgoing_layer() {
+        // A dissolve on the very first cut of a sequence is a fade in. It must
+        // compile, with nothing to dissolve *from*, rather than being rejected.
+        let mut track = video_track(1, vec![clip(1, 0, 1000)]);
+        track.transitions = vec![Transition {
+            id: timeline::TransitionId(1),
+            kind: TransitionKind::CrossDissolve,
+            at: TimeTick(0),
+            duration: TimeTick(200),
+        }];
+        let p = Project { sequences: vec![sequence(1, vec![track])], assets: vec![], bins: vec![] };
+
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
+        let tr = g.track_plans[0].transition.as_ref().unwrap();
+        assert!(tr.outgoing.is_none(), "nothing precedes the sequence start");
+        assert!(g.track_plans[0].active_clip.is_some(), "but the incoming clip is there");
     }
 
     fn sequence(id: u64, tracks: Vec<Track>) -> Sequence {
@@ -522,7 +790,7 @@ mod tests {
 
     #[test]
     fn clip_with_no_mask_effect_has_mask_disabled() {
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 100)])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 100)])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         assert!(!g.track_plans[0].active_clip.as_ref().unwrap().mask.enabled);
     }
@@ -541,7 +809,7 @@ mod tests {
                 (mask::INVERT, ParamTrack::constant(ParamValue::Bool(true))),
             ],
         )];
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         let m = g.track_plans[0].active_clip.as_ref().unwrap().mask;
         assert!(m.enabled);
@@ -560,7 +828,7 @@ mod tests {
             transform_effect(vec![(transform::OPACITY, ParamTrack::constant(ParamValue::Number(0.4)))]),
             generic_effect(mask::TYPE_ID, vec![(mask::IS_RECTANGLE, ParamTrack::constant(ParamValue::Bool(true)))]),
         ];
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         let active = g.track_plans[0].active_clip.as_ref().unwrap();
         assert_eq!(active.transform.opacity, 0.4, "transform folding must be unaffected by a mask being present");
@@ -571,7 +839,7 @@ mod tests {
 
     #[test]
     fn empty_track_yields_no_active_clip() {
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(0)).unwrap();
         assert_eq!(g.track_plans.len(), 1);
         assert!(g.track_plans[0].active_clip.is_none());
@@ -581,7 +849,7 @@ mod tests {
     fn picks_the_clip_covering_the_tick_and_maps_source_pts() {
         let mut c = clip(1, 100, 200);
         c.source_in = TimeTick(1000);
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(150)).unwrap();
         let active = g.track_plans[0].active_clip.as_ref().unwrap();
         assert_eq!(
@@ -596,6 +864,7 @@ mod tests {
         let p = Project {
             sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 100), clip(2, 100, 200)])])],
             assets: vec![],
+            bins: vec![],
         };
         let c = compiler();
         let at_99 = c.compile(&p, SequenceId(1), TimeTick(99)).unwrap();
@@ -608,7 +877,7 @@ mod tests {
     fn speed_scales_the_source_pts_mapping() {
         let mut c = clip(1, 0, 100);
         c.speed = SpeedCurve::Constant { numerator: 2, denominator: 1 }; // 2x
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         match g.track_plans[0].active_clip.as_ref().unwrap().source {
             FrameSource::Media { source_pts_ticks, .. } => {
@@ -626,6 +895,7 @@ mod tests {
                 vec![video_track(1, vec![clip(1, 0, 100)]), video_track(2, vec![clip(2, 0, 100)])],
             )],
             assets: vec![],
+            bins: vec![],
         };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         assert_eq!(g.track_plans[0].track, TrackId(1), "tracks[0] is the bottom layer");
@@ -639,6 +909,7 @@ mod tests {
         let p = Project {
             sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 100)]), audio])],
             assets: vec![],
+            bins: vec![],
         };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         assert_eq!(g.track_plans.len(), 1);
@@ -649,7 +920,7 @@ mod tests {
     fn muted_track_contributes_nothing() {
         let mut t = video_track(1, vec![clip(1, 0, 100)]);
         t.muted = true;
-        let p = Project { sequences: vec![sequence(1, vec![t])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![t])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         assert!(g.track_plans[0].active_clip.is_none());
     }
@@ -660,7 +931,7 @@ mod tests {
         let mut top = video_track(2, vec![clip(2, 0, 100)]);
         top.solo = true;
         bottom.solo = false;
-        let p = Project { sequences: vec![sequence(1, vec![bottom, top])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![bottom, top])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         assert!(g.track_plans[0].active_clip.is_none(), "non-soloed track suppressed");
         assert!(g.track_plans[1].active_clip.is_some(), "soloed track renders");
@@ -668,7 +939,7 @@ mod tests {
 
     #[test]
     fn transform_defaults_when_the_clip_has_no_effects() {
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 100)])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 100)])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         let t = g.track_plans[0].active_clip.as_ref().unwrap().transform;
         assert_eq!(t, Transform2D::default());
@@ -683,7 +954,7 @@ mod tests {
             (transform::ROTATION, ParamTrack::constant(ParamValue::Number(45.0))),
             (transform::OPACITY, ParamTrack::constant(ParamValue::Number(0.5))),
         ])];
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         let t = g.track_plans[0].active_clip.as_ref().unwrap().transform;
         assert_eq!(t.position, (10.0, -20.0));
@@ -698,7 +969,7 @@ mod tests {
         let mut fx = transform_effect(vec![(transform::OPACITY, ParamTrack::constant(ParamValue::Number(0.0)))]);
         fx.enabled = false;
         c.effects = vec![fx];
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         let active = g.track_plans[0].active_clip.as_ref().unwrap();
         assert_eq!(active.transform.opacity, 1.0);
@@ -714,7 +985,7 @@ mod tests {
             enabled: true,
             params: BTreeMap::new(),
         }];
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![c])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         assert_eq!(g.unknown_effects, 1);
         assert!(g.track_plans[0].active_clip.as_ref().unwrap().effect_passes.is_empty());
@@ -733,14 +1004,14 @@ mod tests {
 
         let mut at_origin = clip(1, 0, 100);
         at_origin.effects = vec![transform_effect(vec![(transform::OPACITY, ramp.clone())])];
-        let p1 = Project { sequences: vec![sequence(1, vec![video_track(1, vec![at_origin])])], assets: vec![] };
+        let p1 = Project { sequences: vec![sequence(1, vec![video_track(1, vec![at_origin])])], assets: vec![], bins: vec![] };
         let g1 = compiler().compile(&p1, SequenceId(1), TimeTick(50)).unwrap();
         let mid_at_origin = g1.track_plans[0].active_clip.as_ref().unwrap().transform.opacity;
 
         // Same clip, same animation, moved 1000 ticks later.
         let mut moved = clip(1, 1000, 1100);
         moved.effects = vec![transform_effect(vec![(transform::OPACITY, ramp)])];
-        let p2 = Project { sequences: vec![sequence(1, vec![video_track(1, vec![moved])])], assets: vec![] };
+        let p2 = Project { sequences: vec![sequence(1, vec![video_track(1, vec![moved])])], assets: vec![], bins: vec![] };
         let g2 = compiler().compile(&p2, SequenceId(1), TimeTick(1050)).unwrap();
         let mid_after_move = g2.track_plans[0].active_clip.as_ref().unwrap().transform.opacity;
 
@@ -757,7 +1028,7 @@ mod tests {
         let mut host_clip = clip(1, 0, 100);
         host_clip.source = ClipSource::NestedSequence(SequenceId(2));
         let host = sequence(1, vec![video_track(1, vec![host_clip])]);
-        let p = Project { sequences: vec![host, inner], assets: vec![] };
+        let p = Project { sequences: vec![host, inner], assets: vec![], bins: vec![] };
 
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         match &g.track_plans[0].active_clip.as_ref().unwrap().source {
@@ -779,7 +1050,7 @@ mod tests {
         // must survive it rather than blowing the stack.
         let mut looping = clip(1, 0, 100);
         looping.source = ClipSource::NestedSequence(SequenceId(1));
-        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![looping])])], assets: vec![] };
+        let p = Project { sequences: vec![sequence(1, vec![video_track(1, vec![looping])])], assets: vec![], bins: vec![] };
         let g = compiler().compile(&p, SequenceId(1), TimeTick(50)).unwrap();
         assert!(
             g.track_plans[0].active_clip.is_none(),
@@ -789,7 +1060,7 @@ mod tests {
 
     #[test]
     fn missing_sequence_returns_none() {
-        let p = Project { sequences: vec![], assets: vec![] };
+        let p = Project { sequences: vec![], assets: vec![], bins: vec![] };
         assert!(compiler().compile(&p, SequenceId(42), TimeTick(0)).is_none());
     }
 
@@ -798,6 +1069,7 @@ mod tests {
         let p = Arc::new(Project {
             sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 100)])])],
             assets: vec![],
+            bins: vec![],
         });
         let c = compiler();
         let mut cache = GraphCache::default();
@@ -823,6 +1095,7 @@ mod tests {
         let p = Arc::new(Project {
             sequences: vec![sequence(1, vec![video_track(1, vec![clip(1, 0, 10_000)])])],
             assets: vec![],
+            bins: vec![],
         });
         let c = compiler();
         let mut cache = GraphCache::new(4);

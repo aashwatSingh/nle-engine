@@ -1,0 +1,18 @@
+[package]
+name = "audio_source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The decoder-backed `audio::SampleSource`. Its own crate because two
+# unrelated consumers need it — `export` (offline mixing) and `playback`
+# (real-time mixing) — and neither should depend on the other: pulling
+# `playback` into `export` would drag a system audio library (cpal) into a
+# render-only build, and the reverse would drag the video encoder into the
+# editor's audio path. `audio` itself deliberately stays free of
+# `media_ffmpeg` so the mixing maths remains testable with synthetic input.
+[dependencies]
+audio = { workspace = true }
+media = { workspace = true }
+media_ffmpeg = { path = "../media_ffmpeg" }
+timeline = { workspace = true }

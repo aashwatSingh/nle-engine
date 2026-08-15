@@ -12,8 +12,8 @@
 use media::{ColorMetadata, ColorPrimaries, MatrixCoefficients, MediaAssetId, TransferFunction};
 use render::wgpu;
 use render::{
-    color_correction, crop, gaussian_blur, headless_context, mask, transform, BuiltinRegistry,
-    Compositor, DeliverySpace, GraphCompiler, SourceFrames,
+    chroma_key, color_correction, crop, gaussian_blur, headless_context, mask, transform,
+    BuiltinRegistry, Compositor, DeliverySpace, GraphCompiler, SourceFrames,
 };
 use std::collections::BTreeMap;
 use timeline::{
@@ -111,6 +111,7 @@ fn video_track(id: u64, clips: Vec<ClipInstance>) -> Track {
         kind: TrackKind::Video,
         name: format!("V{id}"),
         clips,
+        transitions: vec![], gain_db: timeline::unity_gain(), pan: 0.0,
         locked: false,
         sync_locked: true,
         muted: false,
@@ -136,6 +137,7 @@ fn project_with(tracks: Vec<Track>) -> Project {
             markers: vec![],
         }],
         assets: vec![],
+        bins: vec![],
     }
 }
 
@@ -707,6 +709,126 @@ fn crop_makes_edges_transparent_and_preserves_the_centre() {
     assert_channel_near(frame.pixel(SEQ_W / 2, SEQ_H / 2)[0], 200, 2, "centre colour preserved");
 }
 
+// --- Chroma key ---
+
+fn chroma_key_fx(key: [f32; 4], similarity: f64, smoothness: f64, spill: f64) -> EffectInstance {
+    effect_fx(
+        4,
+        chroma_key::TYPE_ID,
+        vec![
+            (chroma_key::KEY_COLOR, ParamValue::Color(key)),
+            (chroma_key::SIMILARITY, ParamValue::Number(similarity)),
+            (chroma_key::SMOOTHNESS, ParamValue::Number(smoothness)),
+            (chroma_key::SPILL_SUPPRESSION, ParamValue::Number(spill)),
+        ],
+    )
+}
+
+const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+
+#[test]
+fn a_pixel_matching_the_key_colour_becomes_transparent() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [0, 255, 0, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![chroma_key_fx(GREEN, 0.4, 0.1, 0.0)];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let px = render(&comp, &p, &sources).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert_eq!(px[3], 0, "pure key-colour green should key out to fully transparent, got alpha {}", px[3]);
+}
+
+#[test]
+fn a_pixel_far_from_the_key_colour_stays_fully_opaque() {
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    // Solid red — as far from key green as a fully saturated colour gets.
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 0, 0, 255]), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![chroma_key_fx(GREEN, 0.4, 0.1, 0.0)];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let px = render(&comp, &p, &sources).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert_eq!(px[3], 255, "a colour far from the key should stay fully opaque, got alpha {}", px[3]);
+}
+
+#[test]
+fn alpha_ramps_monotonically_with_distance_from_the_key_colour() {
+    // A left-to-right gradient from pure key-green to pure red sweeps chroma
+    // distance from 0 up. Alpha must never decrease along it — a dip would be
+    // a visible ring artefact around the edge of anything keyed.
+    let comp = compositor();
+    let w = 64u32;
+    let mut ramp = Vec::with_capacity((w * SEQ_H * 4) as usize);
+    for _ in 0..SEQ_H {
+        for x in 0..w {
+            let t = x as f32 / (w - 1) as f32;
+            let r = (t * 255.0).round() as u8;
+            let g = ((1.0 - t) * 255.0).round() as u8;
+            ramp.extend_from_slice(&[r, g, 0, 255]);
+        }
+    }
+    // Sequence sized to the ramp so every source column maps to one output
+    // column (no resampling to reason about).
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&ramp, w, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    c.effects = vec![chroma_key_fx(GREEN, 0.15, 0.35, 0.0)];
+    let tracks = vec![video_track(1, vec![c])];
+    let p = Project {
+        sequences: vec![timeline::Sequence {
+            id: SequenceId(1),
+            name: "S".into(),
+            settings: timeline::SequenceSettings {
+                frame_rate: FrameRate::Fps30,
+                width: w,
+                height: SEQ_H,
+                sample_rate: 48_000,
+                working_color_primaries: ColorPrimaries::Rec709,
+                drop_frame_timecode: false,
+            },
+            tracks,
+            markers: vec![],
+        }],
+        assets: vec![],
+        bins: vec![],
+    };
+    let (frame, _) = render(&comp, &p, &sources);
+
+    let alphas: Vec<u8> = (0..w).map(|x| frame.pixel(x, SEQ_H / 2)[3]).collect();
+    assert_eq!(alphas[0], 0, "the key-green end must be fully transparent");
+    assert_eq!(*alphas.last().unwrap(), 255, "the red end must be fully opaque");
+    assert!(
+        alphas.windows(2).all(|p| p[1] >= p[0]),
+        "alpha must never decrease moving away from the key colour: {alphas:?}"
+    );
+}
+
+#[test]
+fn spill_suppression_pulls_the_key_channel_down_toward_the_other_two() {
+    // A pixel with a green cast (spill from a green screen reflecting onto
+    // the subject) but far enough from the key colour overall to stay
+    // opaque. Real min/max despill only ever pulls the dominant key channel
+    // *down* to the max of the other two — it must never touch red or blue.
+    let comp = compositor();
+    let spilled = [40u8, 210, 60, 255]; // green well above both red and blue
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, spilled), SEQ_W, SEQ_H, rec709()));
+
+    let render_with_spill = |spill: f64| {
+        let mut c = clip(1, 1, 0, 100);
+        c.effects = vec![chroma_key_fx(GREEN, 0.1, 0.05, spill)];
+        let p = project_with(vec![video_track(1, vec![c])]);
+        render(&comp, &p, &sources).0.pixel(SEQ_W / 2, SEQ_H / 2)
+    };
+
+    let none = render_with_spill(0.0);
+    let full = render_with_spill(1.0);
+    assert!(full[1] < none[1], "full despill should reduce green below the untouched value: {full:?} vs {none:?}");
+    assert!(full[1] >= full[0].max(full[2]) - 3, "despill should pull green down to about max(r,b), got {full:?}");
+    assert_channel_near(full[0], none[0], 3, "red must be untouched by despill");
+    assert_channel_near(full[2], none[2], 3, "blue must be untouched by despill");
+}
+
 // --- M5: Mask ---
 
 fn mask_fx(is_rect: bool, center: (f64, f64), size: (f64, f64), feather: f64, invert: bool) -> EffectInstance {
@@ -875,4 +997,559 @@ fn read_back(comp: &Compositor, texture: &wgpu::Texture, width: u32, height: u32
     drop(mapped);
     staging.unmap();
     out
+}
+
+// ---------------------------------------------------------------------------
+// Transitions
+// ---------------------------------------------------------------------------
+
+/// Renders at an explicit tick. The transition tests need a nonzero tick
+/// (the transition region straddles a cut partway through the sequence);
+/// `SourceFrames`' nearest-at-or-before lookup still resolves the uploads made
+/// at pts 0, so this stays a compositing test rather than a pts-arithmetic one.
+fn render_at(
+    comp: &Compositor,
+    project: &Project,
+    sources: &SourceFrames,
+    tick: i64,
+) -> (render::RenderedFrame, render::CompositeStats) {
+    let compiler = GraphCompiler::new(BuiltinRegistry::default());
+    let graph = compiler
+        .compile(project, SequenceId(1), TimeTick(tick))
+        .expect("sequence exists");
+    comp.render_to_rgba(&graph, sources, DeliverySpace::Rec709)
+}
+
+/// White clip cut to a black clip at tick 100, with `kind` over `duration`
+/// centred on the cut — so the transition region is `100 +/- duration/2`.
+fn transition_project(kind: timeline::TransitionKind, duration: i64) -> Project {
+    let mut track = video_track(1, vec![clip(1, 1, 0, 100), clip(2, 2, 100, 200)]);
+    track.transitions = vec![timeline::Transition {
+        id: timeline::TransitionId(1),
+        kind,
+        at: TimeTick(100),
+        duration: TimeTick(duration),
+    }];
+    project_with(vec![track])
+}
+
+fn white_and_black_sources(comp: &Compositor) -> SourceFrames {
+    let mut sources = SourceFrames::default();
+    sources.insert(
+        MediaAssetId(1),
+        0,
+        comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 255, 255, 255]), SEQ_W, SEQ_H, rec709()),
+    );
+    sources.insert(
+        MediaAssetId(2),
+        0,
+        comp.upload_rgba(&solid(SEQ_W, SEQ_H, [0, 0, 0, 255]), SEQ_W, SEQ_H, rec709()),
+    );
+    sources
+}
+
+#[test]
+fn cross_dissolve_midpoint_is_a_true_fifty_percent_linear_mix() {
+    // The measurement that decides whether the dissolve is actually right.
+    //
+    // Correct (outgoing opaque, incoming over it at p): 0.5*white + 0.5*black
+    // = linear 0.5, which re-encodes to ~180/255.
+    //
+    // The plausible-looking bug (draw BOTH layers at partial opacity) gives
+    // white*(1-p)^2 + black*p = linear 0.25 -> ~137/255. Every dissolve would
+    // visibly sag in the middle. The two numbers are far enough apart that this
+    // test can tell them apart rather than just "looking about right".
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let p = transition_project(timeline::TransitionKind::CrossDissolve, 40);
+
+    // Region is 80..120, so tick 100 is exactly halfway.
+    let (frame, stats) = render_at(&comp, &p, &sources, 100);
+    assert_eq!(stats.layers_drawn, 2, "a dissolve must draw both of its clips");
+
+    let px = frame.pixel(SEQ_W / 2, SEQ_H / 2);
+    let correct = (render::color::linear_to_rec709(0.5) * 255.0).round() as u8;
+    let if_double_partial = (render::color::linear_to_rec709(0.25) * 255.0).round() as u8;
+    assert_channel_near(px[0], correct, 3, "dissolve midpoint");
+    assert!(
+        px[0].abs_diff(if_double_partial) > 20,
+        "midpoint {} is close to the double-partial-opacity value {} — the dissolve is \
+         compositing both layers at partial alpha and sagging in the middle",
+        px[0],
+        if_double_partial
+    );
+    assert_eq!(px[3], 255, "a dissolve between two opaque clips must stay opaque");
+}
+
+#[test]
+fn cross_dissolve_ends_match_the_clips_either_side_of_the_cut() {
+    // The transition must be continuous with its neighbours: no visible jump
+    // into or out of it. Sampled just inside each end of the region.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let p = transition_project(timeline::TransitionKind::CrossDissolve, 40);
+
+    // At the region's start, progress is 0 — entirely the outgoing clip.
+    let start = render_at(&comp, &p, &sources, 80).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert_channel_near(start[0], 255, 3, "region start should still be the outgoing white clip");
+
+    // Just *past* the region, the transition no longer applies at all, so this
+    // is the plain incoming clip. This is the honest continuity check — the
+    // last tick *inside* the region is at progress 39/40, which still carries
+    // 2.5% of the white clip, and 2.5% linear encodes to 28/255 through the
+    // Rec.709 toe rather than to near-zero. Asserting "< 20" there would be
+    // asserting the transfer curve is wrong.
+    let after = render_at(&comp, &p, &sources, 120).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert_channel_near(after[0], 0, 3, "just past the region it's the plain incoming clip");
+
+    // Before the region, likewise the plain outgoing clip.
+    let before = render_at(&comp, &p, &sources, 50).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert_channel_near(before[0], 255, 3, "before the transition");
+
+    // And the last tick inside the region matches what the mix predicts, which
+    // is a stronger statement than any hand-picked threshold.
+    let last_inside = render_at(&comp, &p, &sources, 119).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    let expected = (render::color::linear_to_rec709(1.0 - 39.0 / 40.0) * 255.0).round() as u8;
+    assert_channel_near(last_inside[0], expected, 3, "last tick inside the region");
+}
+
+#[test]
+fn cross_dissolve_is_monotonic_across_its_region() {
+    // A dissolve between white and black must darken steadily. This catches
+    // any non-monotonic artefact (a mid dip, an endpoint discontinuity) that a
+    // three-point check could step straight over.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let p = transition_project(timeline::TransitionKind::CrossDissolve, 100);
+
+    // Region 50..150. Each sample is also checked against the value the mix
+    // predicts, so this pins the actual curve rather than only its direction.
+    let mut prev = 256i32;
+    for tick in (50..150).step_by(5) {
+        let v = render_at(&comp, &p, &sources, tick).0.pixel(SEQ_W / 2, SEQ_H / 2)[0] as i32;
+        assert!(
+            v <= prev + 2, // small tolerance for 8-bit quantisation
+            "dissolve brightened at tick {tick}: {v} after {prev}"
+        );
+        let progress = (tick - 50) as f32 / 100.0;
+        let expected = (render::color::linear_to_rec709(1.0 - progress) * 255.0).round() as i32;
+        assert!(
+            (v - expected).abs() <= 3,
+            "at tick {tick} (progress {progress:.2}) expected ~{expected}, got {v}"
+        );
+        prev = v;
+    }
+    // 145 is progress 0.95, so 5% of the white clip remains — which encodes to
+    // ~48/255, not to near-zero. Comparing against the model keeps this honest.
+    let final_expected = (render::color::linear_to_rec709(0.05) * 255.0).round() as i32;
+    assert!(
+        (prev - final_expected).abs() <= 3,
+        "final sample should match the 95%-through mix (~{final_expected}), got {prev}"
+    );
+}
+
+#[test]
+fn dip_to_black_reaches_opaque_black_at_its_midpoint() {
+    // Dip-to-black dims the outgoing clip's colour to zero over the first half
+    // and brings the incoming one back up over the second, so exactly at the
+    // middle the track is opaque black. Opaque, not absent: the earlier version
+    // of this faded alpha instead, which looked identical on this single-track
+    // sequence and was wrong the moment anything sat underneath — see
+    // `dip_to_black_on_an_upper_track_hides_the_track_underneath`.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let p = transition_project(timeline::TransitionKind::DipToBlack, 40);
+
+    let (frame, stats) = render_at(&comp, &p, &sources, 100);
+    let px = frame.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert_eq!(stats.layers_drawn, 1, "the dip draws a layer — an opaque black one");
+    assert_eq!(px[3], 255, "the midpoint of a dip must be opaque");
+    assert!(px[0] < 8 && px[1] < 8 && px[2] < 8, "and black, got {px:?}");
+
+    // A quarter in, half the outgoing white clip's light is left. Checked
+    // against the transfer curve rather than a hand-picked band: dimming
+    // happens in linear light, so linear 0.5 encodes to ~180/255, not to 128.
+    // Landing on 128 here would mean the dim happened in encoded space.
+    let quarter = render_at(&comp, &p, &sources, 90).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    let expected = (render::color::linear_to_rec709(0.5) * 255.0).round() as u8;
+    assert_channel_near(quarter[0], expected, 3, "a quarter through the dip");
+    assert_eq!(quarter[3], 255, "and still opaque on the way down");
+}
+
+#[test]
+fn dip_to_black_with_no_outgoing_clip_fades_up_from_black_across_the_whole_region() {
+    // A dip at the head of the first clip has nothing to dip *from*, so there
+    // is no midpoint to meet at — it's a single fade up from black over the
+    // whole region. Ramping over the full duration (rather than sitting black
+    // for the first half and ramping over the second) is what keeps it free of
+    // a visible pop at the midpoint.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    // One clip starting at 100, with the transition centred on its head, so
+    // the region is 80..120 and only the second half has material.
+    let mut track = video_track(1, vec![clip(2, 1, 100, 200)]);
+    track.transitions = vec![timeline::Transition {
+        id: timeline::TransitionId(1),
+        kind: timeline::TransitionKind::DipToBlack,
+        at: TimeTick(100),
+        duration: TimeTick(40),
+    }];
+    let p = project_with(vec![track]);
+
+    // Monotonically brightening the whole way, with no step at the midpoint.
+    let mut prev = -1i32;
+    for tick in [80, 90, 100, 110, 119] {
+        let px = render_at(&comp, &p, &sources, tick).0.pixel(SEQ_W / 2, SEQ_H / 2);
+        let v = px[0] as i32;
+        assert_eq!(px[3], 255, "opaque throughout the fade up, at tick {tick}");
+        assert!(v >= prev, "fade up went backwards at tick {tick}: {v} after {prev}");
+        let progress = (tick - 80) as f32 / 40.0;
+        let expected = (render::color::linear_to_rec709(progress) * 255.0).round() as i32;
+        assert!(
+            (v - expected).abs() <= 3,
+            "at tick {tick} (progress {progress:.2}) expected ~{expected}, got {v}"
+        );
+        prev = v;
+    }
+}
+
+#[test]
+fn dip_to_black_on_an_upper_track_hides_the_track_underneath() {
+    // The bug this pins: a dip-to-black used to fade the track's *alpha* to
+    // zero, so at the midpoint the track vanished rather than going black. On
+    // the bottom track that reads correctly (there's nothing behind but the
+    // black backdrop), which is exactly why it went unnoticed. On an upper
+    // track it's plainly wrong — the picture underneath shows through, so a
+    // "dip to black" dips to whatever happens to be below it instead.
+    //
+    // Black means opaque black: alpha stays 1 and the *colour* goes to zero.
+    let comp = compositor();
+    let mut sources = white_and_black_sources(&comp);
+    sources.insert(
+        MediaAssetId(3),
+        0,
+        comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 0, 0, 255]), SEQ_W, SEQ_H, rec709()),
+    );
+
+    // V1 (bottom): red for the whole sequence. V2 (top): white -> black with a
+    // dip-to-black over ticks 80..120.
+    let mut top = video_track(2, vec![clip(2, 1, 0, 100), clip(3, 2, 100, 200)]);
+    top.transitions = vec![timeline::Transition {
+        id: timeline::TransitionId(1),
+        kind: timeline::TransitionKind::DipToBlack,
+        at: TimeTick(100),
+        duration: TimeTick(40),
+    }];
+    let p = project_with(vec![video_track(1, vec![clip(1, 3, 0, 200)]), top]);
+
+    let px = render_at(&comp, &p, &sources, 100).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert_eq!(px[3], 255, "the dip must stay opaque so it covers the track below");
+    assert!(
+        px[0] < 8 && px[1] < 8 && px[2] < 8,
+        "midpoint of a dip-to-black must be black, not the red track underneath — got {px:?}"
+    );
+}
+
+/// A title clip. Unlike `clip`, it references no asset at all — the spec is
+/// the source, so nothing needs uploading into `SourceFrames` for it.
+fn title_clip(id: u64, spec: timeline::TitleSpec, tin: i64, tout: i64) -> ClipInstance {
+    ClipInstance { source: ClipSource::Title(spec), ..clip(id, 0, tin, tout) }
+}
+
+fn big_title(text: &str) -> timeline::TitleSpec {
+    // Sized to the 64x64 test sequence: large enough to leave solid interior
+    // pixels to sample, small enough to stay inside the frame.
+    timeline::TitleSpec { text: text.into(), size_px: 28.0, ..Default::default() }
+}
+
+#[test]
+fn a_title_clip_composites_without_any_uploaded_source() {
+    // Titles are generated, not decoded, so the whole decode path is bypassed:
+    // nothing was inserted into `SourceFrames`, and the frame must still come
+    // out with picture on it and no missing-source report.
+    let comp = compositor();
+    let p = project_with(vec![video_track(1, vec![title_clip(1, big_title("HI"), 0, 100)])]);
+
+    let (frame, stats) = render(&comp, &p, &SourceFrames::default());
+    assert_eq!(stats.layers_missing_source, 0, "a title has no source to be missing");
+    assert_eq!(stats.layers_drawn, 1);
+
+    let lit = (0..SEQ_H)
+        .flat_map(|y| (0..SEQ_W).map(move |x| (x, y)))
+        .filter(|&(x, y)| frame.pixel(x, y)[3] > 128)
+        .count();
+    assert!(lit > 0, "the title drew nothing");
+    assert!(lit < (SEQ_W * SEQ_H) as usize / 2, "the title should be glyphs, not a filled frame");
+    assert_eq!(frame.pixel(0, 0)[3], 0, "the corner is outside the text and stays transparent");
+}
+
+#[test]
+fn title_glyphs_are_opaque_over_a_track_below_and_the_gaps_are_not() {
+    // The end-to-end statement: a title behaves like any other source with an
+    // alpha channel. Glyph pixels cover the track below; the transparent gaps
+    // between letters let it through. Getting straight-vs-premultiplied alpha
+    // wrong shows up right here as dark fringing or a black box.
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(
+        MediaAssetId(1),
+        0,
+        comp.upload_rgba(&solid(SEQ_W, SEQ_H, [255, 0, 0, 255]), SEQ_W, SEQ_H, rec709()),
+    );
+    let p = project_with(vec![
+        video_track(1, vec![clip(1, 1, 0, 100)]),
+        video_track(2, vec![title_clip(2, big_title("HI"), 0, 100)]),
+    ]);
+    let (frame, _) = render(&comp, &p, &sources);
+
+    let px: Vec<[u8; 4]> = (0..SEQ_H)
+        .flat_map(|y| (0..SEQ_W).map(move |x| (x, y)))
+        .map(|(x, y)| frame.pixel(x, y))
+        .collect();
+    // White text on red: a glyph pixel is bright in all three channels.
+    let glyph = px.iter().find(|p| p[1] > 200 && p[2] > 200);
+    assert!(glyph.is_some(), "no white glyph pixel found over the red track");
+    // And the corner, outside the text, is still the red track underneath —
+    // not black, which is what a premultiplied buffer would have left there.
+    assert_eq!(frame.pixel(0, 0), [255, 0, 0, 255], "outside the glyphs the track below shows");
+}
+
+#[test]
+fn a_title_naming_a_font_nobody_has_still_renders_in_a_fallback() {
+    // A project made on another machine will name fonts this one lacks. That
+    // must degrade to the wrong typeface, never to a blank frame — the text is
+    // the content, the font is a preference.
+    let comp = compositor();
+    let mut spec = big_title("HI");
+    spec.font_family = "No Such Font Installed Anywhere".into();
+    let p = project_with(vec![video_track(1, vec![title_clip(1, spec, 0, 100)])]);
+
+    let (frame, stats) = render(&comp, &p, &SourceFrames::default());
+    assert_eq!(stats.layers_missing_source, 0);
+    let lit = (0..SEQ_H)
+        .flat_map(|y| (0..SEQ_W).map(move |x| (x, y)))
+        .filter(|&(x, y)| frame.pixel(x, y)[3] > 128)
+        .count();
+    assert!(lit > 0, "an unknown font family should fall back, not render nothing");
+}
+
+#[test]
+fn a_title_dissolves_like_any_other_clip() {
+    // Titles go through the same transform/opacity/blend path as decoded
+    // frames, which is the entire reason `FrameSource::Title` sits alongside
+    // `Media` instead of being a special case bolted onto the track loop. A
+    // cross dissolve from a title is the cheapest proof of that.
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(
+        MediaAssetId(2),
+        0,
+        comp.upload_rgba(&solid(SEQ_W, SEQ_H, [0, 0, 0, 255]), SEQ_W, SEQ_H, rec709()),
+    );
+    let mut track = video_track(1, vec![title_clip(1, big_title("HI"), 0, 100), clip(2, 2, 100, 200)]);
+    track.transitions = vec![timeline::Transition {
+        id: timeline::TransitionId(1),
+        kind: timeline::TransitionKind::CrossDissolve,
+        at: TimeTick(100),
+        duration: TimeTick(40),
+    }];
+    let p = project_with(vec![track]);
+
+    let (_, stats) = render_at(&comp, &p, &sources, 100);
+    assert_eq!(stats.layers_drawn, 2, "both sides of the dissolve draw, title included");
+    assert_eq!(stats.layers_missing_source, 0);
+}
+
+#[test]
+fn an_unchanged_title_is_rasterised_once_and_reused() {
+    // Measured at 1080p (`title_rasterisation_cost.rs`): a two-line title
+    // costs ~3.5ms/frame, of which ~3.1ms is filling the frame-sized buffer
+    // rather than drawing glyphs. That buffer is byte-identical every frame a
+    // title holds still, which is nearly always — so re-doing it is ~10% of a
+    // 30fps frame budget spent reproducing the previous answer.
+    let comp = compositor();
+    let p = project_with(vec![video_track(1, vec![title_clip(1, big_title("HI"), 0, 100)])]);
+
+    render_at(&comp, &p, &SourceFrames::default(), 10);
+    let (hits, misses) = comp.title_cache_stats();
+    assert_eq!((hits, misses), (0, 1), "the first frame has to do the work");
+
+    // Same title, different tick — a title looks the same at every tick of
+    // its clip, so nothing needs redoing.
+    render_at(&comp, &p, &SourceFrames::default(), 20);
+    render_at(&comp, &p, &SourceFrames::default(), 30);
+    let (hits, misses) = comp.title_cache_stats();
+    assert_eq!((hits, misses), (2, 1), "later frames should reuse the raster");
+}
+
+#[test]
+fn editing_a_title_rasterises_it_again() {
+    // The other half: a cache that never invalidates would freeze the text at
+    // whatever it said when first drawn, which is worse than no cache at all.
+    let comp = compositor();
+    let a = project_with(vec![video_track(1, vec![title_clip(1, big_title("HI"), 0, 100)])]);
+    let b = project_with(vec![video_track(1, vec![title_clip(1, big_title("BYE"), 0, 100)])]);
+
+    let frame_a = render_at(&comp, &a, &SourceFrames::default(), 10).0;
+    let frame_b = render_at(&comp, &b, &SourceFrames::default(), 10).0;
+    assert_eq!(comp.title_cache_stats(), (0, 2), "different text is a different raster");
+
+    // And the pixels genuinely differ, so this isn't just a counter moving.
+    let ink = |f: &render::RenderedFrame| {
+        (0..SEQ_H)
+            .flat_map(|y| (0..SEQ_W).map(move |x| (x, y)))
+            .filter(|&(x, y)| f.pixel(x, y)[3] > 128)
+            .count()
+    };
+    assert_ne!(ink(&frame_a), ink(&frame_b), "the frame should show the new text");
+}
+
+#[test]
+fn a_resized_sequence_rasterises_the_title_again() {
+    // The raster is frame-sized, so the same spec at a different resolution is
+    // a different answer. Keying on the spec alone would stretch a 64px raster
+    // across a 1080p frame.
+    let comp = compositor();
+    let spec = big_title("HI");
+    let small = project_with(vec![video_track(1, vec![title_clip(1, spec.clone(), 0, 100)])]);
+    let mut large = small.clone();
+    large.sequences[0].settings.width = SEQ_W * 2;
+    large.sequences[0].settings.height = SEQ_H * 2;
+
+    render_at(&comp, &small, &SourceFrames::default(), 10);
+    render_at(&comp, &large, &SourceFrames::default(), 10);
+    assert_eq!(comp.title_cache_stats(), (0, 2), "a different frame size is a different raster");
+}
+
+#[test]
+fn a_wipe_shows_the_incoming_clip_on_one_side_of_a_hard_edge_and_the_outgoing_on_the_other() {
+    // The defining property of a wipe, and what separates it from a dissolve:
+    // at the midpoint neither clip is faded — each is fully itself, on its own
+    // side of the boundary. A dissolve at p=0.5 would give a uniform grey
+    // everywhere; this must give white on one side and black on the other.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let p = transition_project(timeline::TransitionKind::Wipe, 40);
+
+    // Region is 80..120, so tick 100 is exactly halfway.
+    let frame = render_at(&comp, &p, &sources, 100).0;
+    let left = frame.pixel(SEQ_W / 4, SEQ_H / 2);
+    let right = frame.pixel(SEQ_W * 3 / 4, SEQ_H / 2);
+
+    assert!(left[0] < 20, "the revealed (incoming, black) clip should be on the left, got {left:?}");
+    assert!(right[0] > 235, "the outgoing (white) clip should still hold the right, got {right:?}");
+    assert_eq!(left[3], 255, "a wipe is opaque on the revealed side");
+    assert_eq!(right[3], 255, "and on the outgoing side");
+}
+
+#[test]
+fn a_wipe_edge_advances_across_the_frame_as_it_progresses() {
+    // One sample can't tell a wipe from a hard cut at the midpoint. Tracking
+    // where the boundary actually sits over time is what proves it sweeps.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let p = transition_project(timeline::TransitionKind::Wipe, 100);
+
+    // Region 50..150. The edge x is the count of black (incoming) columns.
+    let edge_at = |tick: i64| {
+        let frame = render_at(&comp, &p, &sources, tick).0;
+        (0..SEQ_W).filter(|&x| frame.pixel(x, SEQ_H / 2)[0] < 128).count()
+    };
+
+    let quarter = edge_at(75);
+    let half = edge_at(100);
+    let three_quarters = edge_at(125);
+    assert!(
+        quarter < half && half < three_quarters,
+        "the wipe edge should sweep across: {quarter} -> {half} -> {three_quarters} columns revealed"
+    );
+    // And it should land near the predicted fraction, not merely move.
+    let expected_half = (SEQ_W / 2) as usize;
+    assert!(
+        half.abs_diff(expected_half) <= 3,
+        "at the midpoint about half the frame should be revealed (~{expected_half}), got {half}"
+    );
+}
+
+#[test]
+fn a_slide_moves_the_incoming_clip_in_from_the_edge() {
+    // A slide differs from a wipe in that the incoming clip *moves*: at the
+    // midpoint its left edge sits mid-frame, so the far right shows the
+    // incoming clip's own left half rather than its middle.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let p = transition_project(timeline::TransitionKind::Slide, 40);
+
+    let frame = render_at(&comp, &p, &sources, 100).0;
+    let left = frame.pixel(SEQ_W / 4, SEQ_H / 2);
+    let right = frame.pixel(SEQ_W * 3 / 4, SEQ_H / 2);
+
+    assert!(left[0] > 235, "the stationary outgoing clip should still hold the left, got {left:?}");
+    assert!(right[0] < 20, "the incoming clip should have slid into the right, got {right:?}");
+    assert_eq!(left[3], 255);
+    assert_eq!(right[3], 255);
+}
+
+#[test]
+fn wipe_and_slide_both_land_exactly_on_the_incoming_clip_when_finished() {
+    // Continuity at the far end: the last moment of the transition has to
+    // match the plain incoming clip, or every wipe and slide ends with a
+    // visible jump.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+
+    for kind in [timeline::TransitionKind::Wipe, timeline::TransitionKind::Slide] {
+        let p = transition_project(kind, 40);
+        // Just past the region: the transition no longer applies at all.
+        let after = render_at(&comp, &p, &sources, 130).0.pixel(SEQ_W / 2, SEQ_H / 2);
+        assert_channel_near(after[0], 0, 3, "past the region it is the plain incoming clip");
+        // And just before it starts, the plain outgoing clip.
+        let before = render_at(&comp, &p, &sources, 70).0.pixel(SEQ_W / 2, SEQ_H / 2);
+        assert_channel_near(before[0], 255, 3, "before the region it is the plain outgoing clip");
+    }
+}
+
+#[test]
+fn a_wipe_does_not_discard_the_clips_own_mask() {
+    // The wipe boundary and a clip's own mask effect are independent things
+    // that must compose. Implementing the wipe by reusing the mask uniform
+    // would have been cheaper and would silently drop the user's mask for the
+    // duration of every wipe.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let mut track = video_track(1, vec![clip(1, 1, 0, 100), clip(2, 2, 100, 200)]);
+    // Mask the incoming clip to a small centred ellipse; outside it the clip
+    // is transparent regardless of what the wipe is doing.
+    track.clips[1].effects = vec![mask_fx(false, (0.5, 0.5), (0.15, 0.15), 0.01, false)];
+    track.transitions = vec![timeline::Transition {
+        id: timeline::TransitionId(1),
+        kind: timeline::TransitionKind::Wipe,
+        at: TimeTick(100),
+        duration: TimeTick(40),
+    }];
+    let p = project_with(vec![track]);
+
+    // Near the left edge: inside the wiped-in region, but far outside the
+    // incoming clip's mask — so the outgoing clip must still show through.
+    let frame = render_at(&comp, &p, &sources, 100).0;
+    let masked_out = frame.pixel(2, SEQ_H / 2);
+    assert!(
+        masked_out[0] > 235,
+        "the incoming clip is masked away here, so the outgoing clip should show, got {masked_out:?}"
+    );
+}
+
+#[test]
+fn a_transition_longer_than_its_clips_still_renders() {
+    // Nothing stops a project file from carrying a transition wider than the
+    // material either side of it (hand-edited, or trimmed after the fact).
+    // Both clips then get sampled well outside their handles, which the decoder
+    // clamps — the renderer must not panic or drop the frame.
+    let comp = compositor();
+    let sources = white_and_black_sources(&comp);
+    let p = transition_project(timeline::TransitionKind::CrossDissolve, 10_000);
+
+    let (frame, stats) = render_at(&comp, &p, &sources, 100);
+    assert_eq!(stats.layers_drawn, 2);
+    assert_eq!(frame.pixel(SEQ_W / 2, SEQ_H / 2)[3], 255);
 }

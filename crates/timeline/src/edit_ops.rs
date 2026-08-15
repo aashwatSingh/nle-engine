@@ -707,9 +707,9 @@ fn apply_nest(
     let max_out = extracted.iter().map(|(_, c)| c.timeline_out.0).max().unwrap();
 
     let mut video_track =
-        Track { id: new_video_track_id, kind: TrackKind::Video, name: "V1".into(), clips: vec![], locked: false, sync_locked: true, muted: false, solo: false, height_px: 60 };
+        Track { id: new_video_track_id, kind: TrackKind::Video, name: "V1".into(), clips: vec![], transitions: vec![], gain_db: crate::model::unity_gain(), pan: 0.0, locked: false, sync_locked: true, muted: false, solo: false, height_px: 60 };
     let mut audio_track =
-        Track { id: new_audio_track_id, kind: TrackKind::Audio, name: "A1".into(), clips: vec![], locked: false, sync_locked: true, muted: false, solo: false, height_px: 60 };
+        Track { id: new_audio_track_id, kind: TrackKind::Audio, name: "A1".into(), clips: vec![], transitions: vec![], gain_db: crate::model::unity_gain(), pan: 0.0, locked: false, sync_locked: true, muted: false, solo: false, height_px: 60 };
     for (kind, mut clip) in extracted {
         clip.timeline_in = TimeTick(clip.timeline_in.0 - min_in);
         clip.timeline_out = TimeTick(clip.timeline_out.0 - min_in);
@@ -772,7 +772,7 @@ mod tests {
     }
 
     fn track(id: u64, kind: TrackKind, clips: Vec<ClipInstance>) -> Track {
-        Track { id: TrackId(id), kind, name: format!("T{id}"), clips, locked: false, sync_locked: true, muted: false, solo: false, height_px: 60 }
+        Track { id: TrackId(id), kind, name: format!("T{id}"), clips, transitions: vec![], gain_db: crate::model::unity_gain(), pan: 0.0, locked: false, sync_locked: true, muted: false, solo: false, height_px: 60 }
     }
 
     fn project_with(tracks: Vec<Track>) -> Project {
@@ -792,6 +792,7 @@ mod tests {
                 markers: vec![],
             }],
             assets: vec![],
+            bins: vec![],
         }
     }
 

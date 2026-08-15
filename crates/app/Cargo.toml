@@ -11,7 +11,27 @@ path = "src/main.rs"
 [dependencies]
 timeline = { workspace = true }
 media = { workspace = true }
+media_ffmpeg = { path = "../media_ffmpeg" }
 render = { workspace = true }
 audio = { workspace = true }
+audio_source = { workspace = true }
+speech = { workspace = true }
 project = { workspace = true }
 command = { workspace = true }
+export = { path = "../export" }
+playback = { workspace = true }
+winit = "=0.29.15"
+pollster = "0.3"
+rfd = "0.14"
+egui = "0.28"
+egui-wgpu = "0.28"
+egui-winit = "0.28"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+# GNU-toolchain compatible: drives `windres` (from the mingw64 toolchain
+# already required for FFmpeg linking) rather than assuming MSVC's `rc.exe`,
+# which is what the older, more commonly-suggested `winres` crate requires.
+embed-resource = "2"

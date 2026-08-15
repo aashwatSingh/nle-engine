@@ -12,3 +12,9 @@ media = { workspace = true }
 wgpu = "=0.20.1"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
+# Glyph outlines + rasterisation for titles. Already in the lockfile via
+# egui/epaint, so this pulls in nothing new. Deliberately a rasteriser and not
+# a text-shaping engine: see `text.rs` on what that costs us.
+ab_glyph = "0.2"
+rustybuzz = "0.20.1"
+ttf-parser = "0.25.1"

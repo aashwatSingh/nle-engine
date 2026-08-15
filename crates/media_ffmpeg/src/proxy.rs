@@ -55,7 +55,24 @@ pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> R
         .ok_or(ProbeError::NoDecodableStreams)?;
 
     let in_stream = input.stream(in_stream_index).unwrap();
-    let in_time_base = in_stream.time_base();
+    // The proxy is written with sequential frame-numbered PTS (0, 1, 2, ...),
+    // so its timebase must be 1/framerate, NOT the source's stream timebase.
+    // Using the source's (typically 1/15360 for mp4) with frame-numbered PTS
+    // produced a file that claimed to be ~15000x too short — a 1s source
+    // became a 0.002s proxy, unplayable and useless for scrubbing. Caught by
+    // the duration assertion in this module's test, which originally only
+    // checked dimensions and keyframe count and so missed it entirely.
+    let avg_rate = in_stream.avg_frame_rate();
+    let frame_rate = if avg_rate.numerator() > 0 && avg_rate.denominator() > 0 {
+        avg_rate
+    } else {
+        // A source with no usable average rate (some VFR/streamed inputs):
+        // 30fps is a defensible fallback, and better than a zero timebase
+        // that would make every PTS meaningless.
+        ffmpeg_next::Rational::new(30, 1)
+    };
+    let encoder_time_base =
+        ffmpeg_next::Rational::new(frame_rate.denominator(), frame_rate.numerator());
     let mut decoder = ffmpeg_next::codec::context::Context::from_parameters(in_stream.parameters())?
         .decoder()
         .video()?;
@@ -71,7 +88,7 @@ pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> R
     encoder.set_width(out_w);
     encoder.set_height(out_h);
     encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
-    encoder.set_time_base(in_time_base);
+    encoder.set_time_base(encoder_time_base);
     encoder.set_gop(1); // all-intra: every frame a keyframe
     encoder.set_max_b_frames(0);
 
@@ -80,7 +97,7 @@ pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> R
     dict.set("crf", "28");
     let mut opened_encoder = encoder.open_with(dict)?;
     ost.set_parameters(&opened_encoder);
-    ost.set_time_base(in_time_base);
+    ost.set_time_base(encoder_time_base);
 
     let mut scaler = ffmpeg_next::software::scaling::Context::get(
         decoder.format(),
@@ -93,11 +110,29 @@ pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> R
     )?;
 
     octx.write_header()?;
+    // The muxer rewrites the stream timebase during `write_header` (mp4 uses
+    // its own tick rate), so every packet has to be rescaled from the
+    // encoder's timebase into whatever it picked. Without this, the two
+    // timebases disagree and the container reports a wildly wrong duration —
+    // see the comment on `encoder_time_base` above.
+    let stream_time_base = octx.stream(0).expect("stream 0 was just added").time_base();
 
     let mut decoded = ffmpeg_next::frame::Video::empty();
     let mut scaled = ffmpeg_next::frame::Video::empty();
     let mut encoded_packet = ffmpeg_next::Packet::empty();
     let mut next_pts: i64 = 0;
+
+    // One closure for the drain, so the rescale can't be applied at two of
+    // the three sites and forgotten at the third.
+    macro_rules! drain {
+        () => {
+            while opened_encoder.receive_packet(&mut encoded_packet).is_ok() {
+                encoded_packet.set_stream(0);
+                encoded_packet.rescale_ts(encoder_time_base, stream_time_base);
+                encoded_packet.write_interleaved(&mut octx)?;
+            }
+        };
+    }
 
     while let Some(packet) = crate::read_next_packet_for_stream(&mut input, in_stream_index) {
         decoder.send_packet(&packet)?;
@@ -106,10 +141,7 @@ pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> R
             scaled.set_pts(Some(next_pts));
             next_pts += 1;
             opened_encoder.send_frame(&scaled)?;
-            while opened_encoder.receive_packet(&mut encoded_packet).is_ok() {
-                encoded_packet.set_stream(0);
-                encoded_packet.write_interleaved(&mut octx)?;
-            }
+            drain!();
         }
     }
     decoder.send_eof()?;
@@ -118,16 +150,10 @@ pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> R
         scaled.set_pts(Some(next_pts));
         next_pts += 1;
         opened_encoder.send_frame(&scaled)?;
-        while opened_encoder.receive_packet(&mut encoded_packet).is_ok() {
-            encoded_packet.set_stream(0);
-            encoded_packet.write_interleaved(&mut octx)?;
-        }
+        drain!();
     }
     opened_encoder.send_eof()?;
-    while opened_encoder.receive_packet(&mut encoded_packet).is_ok() {
-        encoded_packet.set_stream(0);
-        encoded_packet.write_interleaved(&mut octx)?;
-    }
+    drain!();
     octx.write_trailer()?;
 
     Ok(())
@@ -164,5 +190,28 @@ mod tests {
         // All-intra: keyframe count should equal (or nearly equal) total
         // frame count, unlike the long-GOP source it came from.
         assert!(video.keyframe_index.len() >= 25, "expected ~30 keyframes for a 1s@30fps all-intra proxy, got {}", video.keyframe_index.len());
+    }
+
+    #[test]
+    fn proxy_duration_matches_the_source() {
+        // Regression test for a real shipped bug: the encoder was given the
+        // *source stream's* timebase (1/15360 for mp4) while writing
+        // frame-numbered PTS, so a 1s source produced a 0.0019s proxy —
+        // unplayable, and useless for the smooth-scrubbing job a proxy
+        // exists to do. The original test above passed throughout, because
+        // dimensions and keyframe count are both unaffected by the timebase.
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("proxy.mp4");
+        let source = fixture("test_4k.mp4");
+
+        generate_proxy(&source, &ProxyOptions::default(), &output).unwrap();
+
+        let src_secs = probe(&source).unwrap().duration_ticks as f64 / crate::timeline_timebase() as f64;
+        let proxy_secs = probe(&output).unwrap().duration_ticks as f64 / crate::timeline_timebase() as f64;
+        assert!(
+            (src_secs - proxy_secs).abs() < 0.15,
+            "proxy duration {proxy_secs:.4}s should match source {src_secs:.4}s"
+        );
     }
 }

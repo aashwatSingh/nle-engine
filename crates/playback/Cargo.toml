@@ -7,5 +7,13 @@ license.workspace = true
 [dependencies]
 timeline = { workspace = true }
 media_ffmpeg = { path = "../media_ffmpeg" }
+media = { workspace = true }
+# For `GraphCompiler`: "which clips are visible at tick T, and at what source
+# time" must have exactly one definition, shared with preview and export, or
+# playback will eventually disagree with what gets exported. Pure CPU code —
+# no GPU device is touched on the decode thread.
+render = { workspace = true }
+audio = { workspace = true }
+audio_source = { workspace = true }
 cpal = "0.15"
 ringbuf = "0.4"

@@ -423,3 +423,476 @@ for pure immediate-mode redraw of a dense custom widget. A bespoke
 renderer for just the Timeline keeps the risk contained to the one place
 that needs it, while everything else gets egui's much faster time-to-build.
 Not yet spiked — revisit if the M0 wgpu spike surfaces a reason not to.
+
+## 2026-08-09 — Undo-history persistence implemented; its on-disk cost measured
+
+**Context:** the 2026-08-07 decision above ("Undo history is persisted from
+v1.0, bounded") declared `ProjectDocument.undo_history` in schema v1 but was
+never wired up. `undo_history` was written as `[]` on every save and ignored on
+every load, so reopening a project silently discarded the ability to undo the
+work in it. Now implemented as declared: `(label, before, after)` snapshots,
+capped by `UndoStack::max_history`.
+
+**Measured cost, because the original rationale was a size argument:** on a
+3-clip project, the bare document is 2,718 bytes and each history entry adds
+~2,352 bytes — so at the default cap of 100 entries a project file is roughly
+**200x the size of the project it contains**. For this toy project that's
+~235KB (fine). Extrapolated to a realistic 200-clip project with effects and
+keyframes, it's several megabytes per save.
+
+**The part of the original rationale that turns out to be wrong:** "the
+versions already exist, storing N of them is not new engineering." That is true
+*in memory* — history entries hold `Arc<Project>`, so the states are shared and
+cost almost nothing. It is false *on disk*: CBOR has no way to express sharing,
+so every `Arc` clone becomes a full independent copy. The design is cheap in RAM
+and expensive in bytes, and those were conflated.
+
+**Known redundancy, deliberately left in place:** `entry[i].after` is always
+`entry[i+1].before`, and `history.last().after` is always the current project —
+guaranteed by every mutator in `UndoStack`. So the `(before, after)` shape
+stores every intermediate state exactly twice, and dropping `after` would halve
+the cost with no information loss. Not done here because it changes a format
+this log explicitly specified, which is a decision to take deliberately rather
+than as a side effect of implementing it. `history_costs_roughly_two_project_
+snapshots_per_entry` measures it so the number can't drift unnoticed.
+
+**Two scope choices made while implementing:**
+- **Redo is not persisted.** Redo entries describe states *ahead* of the saved
+  project — work the user undid before saving. Restoring them would let a
+  reopened file redo its way into a state the file never contained. Premiere and
+  Resolve both drop redo on reopen.
+- **Autosave writes no history at all.** Serialising N snapshots every 20
+  seconds would make the cost of a background safety net scale with session
+  length. A crash therefore loses undo history but not work.
+
+**Loaded history is validated, not trusted:** if `history.last().after` doesn't
+match the saved project, the history is discarded and the user is told. A
+mismatched pair would otherwise make the first Ctrl+Z jump to an unrelated
+state, which is worse than having no history.
+
+## 2026-08-12 — GPU-resident decode shipped, then honestly reported as not helping
+
+`playback::SequenceVideoPlayback::start` now takes `Option<GpuContext>`
+(`Arc<wgpu::Device>`/`Arc<wgpu::Queue>`) and, when given one, uploads each
+decoded frame straight to a GPU texture on the decode-ahead thread
+(`SourcePixels::Gpu`) instead of handing back a CPU `Vec<u8>` for the UI
+thread to upload later. `app::main` always passes a context, so the running
+editor takes this path today. `render::upload_rgba_to_gpu` is the extracted
+free function both this and `Compositor::upload_rgba` now share.
+
+This was built to fix a specific measured problem: a real-footage smoke test
+against 2560x1588 screen-capture recorded **334 starved frames** over a 4s
+window on 2026-08-10, versus 0 on the synthetic 640x360 fixture — real
+evidence, at the time, that resolution was breaking the CPU-upload path.
+
+**It didn't work, and the original number didn't reproduce.** Re-running the
+same test (`crates/playback/tests/real_footage_smoke.rs`,
+`video_holds_frame_rate_on_real_footage` and its new `_with_gpu_upload`
+sibling) three times back to back against the identical file gave CPU
+starved counts of 13/11/8 and GPU counts of 29/12/10 out of ~120 boundaries
+per window. GPU is not clearly better — if anything slightly worse, most
+likely because `upload_rgba_to_gpu` calls `device.create_texture` fresh every
+frame with no pooling, a real per-frame allocation cost the CPU path's plain
+`Vec` clone doesn't pay. And the CPU path alone, measured clean, was never
+close to the 334 figure — that earlier run was almost certainly taken while
+a `cargo build --workspace --release` was running concurrently in the same
+session (the desktop-packaging work happened right around then), making it
+a measurement of system contention, not of the decode pipeline.
+
+**Decision: leave the GPU path in place, but stop describing it as a
+performance fix.** It isn't wrong or harmful — same test coverage, zero
+regressions, 309 tests green — and it's a more direct pipeline than routing
+every frame through the UI thread, which has its own value. But the honest
+status is "architecturally cleaner, not measurably faster," not "closes the
+resolution-scaling gap." If real degradation at high resolution is found
+again, texture pooling (reuse one texture per asset instead of allocating
+per frame) is the untried next step — this entry deliberately doesn't do it
+speculatively, since nothing currently measured justifies it. The broader
+lesson, worth repeating: a single-capture number is a hypothesis, not a
+baseline, until it's been reproduced clean.
+
+## 2026-08-12 — Dip-to-black dips colour, not alpha
+
+`layers_of` implemented dip-to-black by fading the track's **alpha** to zero at
+the midpoint. On the bottom video track that reads correctly — there is nothing
+behind but the black backdrop — which is exactly why it survived: the only test
+covering it was a single-track one asserting the frame went *transparent* and
+calling that "what black is here".
+
+It is wrong on every other track: the picture below shows through, so a dip to
+black dips to whatever happens to be underneath.
+
+Fixed by adding `ClipUniforms::rgb_scale`, which multiplies working-space
+colour and leaves alpha alone (0.0 = opaque black). Dip-to-black now keeps full
+alpha and ramps colour, so the track goes black *and* keeps covering what's
+below. The scale is applied in `fs_clip` after linearisation and after the
+effect chain, so the dim happens in linear light — dimming encoded values would
+give a washed-out grey rather than a true fade to black. `rgb_scale` occupies
+what was a padding word, so the uniform's size and every vec4 alignment are
+unchanged.
+
+Two adjacent behaviours settled at the same time. A dip with material on only
+one side has no midpoint to meet at, so it ramps across the **whole** region
+rather than sitting black for half of it and ramping over the rest — the
+half-ramp shape has a visible pop at the midpoint. And the black fills the
+clip's own placement rectangle, not the frame: identical for a full-frame clip,
+and for a scaled or offset one it dips just that clip, which is what Premiere
+does. A full-frame dip would need a solid-colour source the compositor doesn't
+have.
+
+## 2026-08-12 — Titles are a clip source, not an effect; rasterised on the CPU
+
+Spec 4.5 wants titles. Two shapes were possible: a text *effect* applied to a
+clip, or a *clip source* of its own. `ClipSource::Title(TitleSpec)` won,
+because a title in an NLE is a thing on a track with its own in and out points,
+not a modifier of something else — and because an effect would have needed
+something underneath it to modify, which a title card has by definition not
+got.
+
+Cost of that choice, paid deliberately: `ClipSource` is no longer `Copy`/`Eq`
+(a `TitleSpec` owns a `String` and `f64`s). The alternative — a title-asset
+table so the enum stays two words wide — is a whole indirection existing only
+to preserve a derive.
+
+**Rasterised on the CPU into a frame-sized straight-alpha RGBA buffer**, then
+uploaded and treated as an ordinary `Rec.709` source. That means titles get
+transforms, opacity, masks, effects, transitions and export for free rather
+than each needing a title-shaped special case; the compositor's title branch is
+~15 lines and everything downstream is unchanged. Straight alpha specifically
+(colour written everywhere, coverage in A) because `fs_clip` linearises RGB and
+multiplies alpha separately — premultiplying in an encoded space and
+linearising after would darken every antialiased edge into a grey fringe.
+
+**`ab_glyph` rasterises; nothing shapes.** Characters map to glyphs with pair
+kerning, which is right for Latin and wrong for Arabic, Devanagari, and
+ligature-substituting fonts. A real shaper (HarfBuzz/rustybuzz) is the fix and
+is not here. This is recorded rather than hidden because the failure is
+visible and specific, which is better than a subtly-wrong result everywhere.
+
+**Font families resolve by filename**, not by parsing each installed font's
+name table, with an alias table for the common mismatches ("Segoe UI" ->
+`segoeui`) and a fallback chain ending in whatever exists. An unknown family
+therefore renders in the wrong typeface rather than not at all — a project made
+on another machine must still show its text, since the text is the content and
+the font is a preference.
+
+**Caching was added second, after measuring, and the measurement was not what
+was expected.** `title_rasterisation_cost.rs` found that an *empty* title costs
+almost as much as a real one: the work is dominated by filling the 8.3MB
+frame-sized buffer, not by drawing glyphs. So the useful cache is of the whole
+raster (`compositor::TitleCache`, keyed on spec + frame size, LRU, 8 entries),
+not of glyphs. Optimising glyph rasterisation — the intuitive target — would
+have chased the smaller half of the cost. Hit/miss counters are exposed so the
+reuse is asserted in tests rather than assumed, which is the correction this
+project already had to make once (see the GPU-resident decode entry above).
+
+**Typing coalesces via a new `UndoStack::push_or_amend`, not via
+`begin/end_coalescing`.** A drag brackets itself with mouse-down and mouse-up;
+typing has no reliable "done" event, and an open coalescing group that nothing
+closes makes Ctrl+Z silently do nothing until focus happens to change.
+`push_or_amend` amends the last entry when the label matches, so the history is
+consistent after *every* keystroke — undo works mid-word — while a run still
+collapses to one step. The label carries the clip id so two different titles
+don't fold into one entry that undoes both.
+
+**"Add Title" never overwrites.** `EditOp::Overwrite` does what it says, so
+dropping a title onto an occupied track would eat a second of footage —
+invisible until the user scrubs back to it. `add_title_at_playhead` uses the
+top video track only when it is free at that range, and otherwise creates a new
+track above, both halves as a single undo step.
+
+## 2026-08-12 — Titles get real shaping and real font-name resolution, both measured
+
+Two of the three documented title limitations closed in the same pass, both
+using pure-Rust crates already resolvable offline (`rustybuzz` 0.20.1 —
+HarfBuzz's algorithm reimplemented in Rust, no C toolchain link — and
+`ttf-parser` 0.25.1, already in the dependency tree transitively via egui).
+
+**Shaping.** `render::text::shape_line` now runs each line through
+`rustybuzz::shape` before handing glyph ids and positions to
+`ab_glyph::Font::outline_glyph`. `rustybuzz::Face<'a>` borrows its data rather
+than owning it, so `FontFace` now carries the font bytes twice — once inside
+the `ab_glyph::FontVec` used for rasterisation, once as `Arc<Vec<u8>>` a fresh
+`rustybuzz::Face` is built from per shape call. The walk-forward-add-advances
+loop needs no direction branch for right-to-left text: HarfBuzz-family shapers
+reverse the glyph array internally for RTL specifically so a simple forward
+walk already draws it correctly — that reversal is part of what shaping does,
+not a caller's responsibility. Falls back to the old naive per-character path
+if `rustybuzz::Face::from_slice` can't parse a font `ab_glyph` accepted (belt
+and braces; not expected to fire on a real font).
+
+Proven with a real font, not a synthetic case: Windows ships `Nirmala.ttc`
+(the default Devanagari UI font since Windows 8), and shaping KA+VIRAMA+SSA+
+VOWEL-SIGN-I — four codepoints, ordinary Devanagari, not a stress test —
+correctly merges into two glyphs (the KSSA conjunct plus the vowel sign). A
+naive one-glyph-per-character mapping can only ever produce four; it has no
+mechanism to merge or reorder.
+
+**First version of this test was worthless and mutation testing caught it.**
+`shaped_glyph_count` originally called `rustybuzz::shape` independently of
+`shape_line` — a second, parallel implementation of the same idea. Forcing
+`shape_line` to always fall back to the naive path left the test's own
+private shaping call untouched, so it kept passing. Fixed by making
+`shaped_glyph_count` call `shape_line` and read its length — now it is
+provably testing what `rasterize` actually draws, and the same mutation
+correctly fails it. Recorded because it's a specific, repeatable trap: a test
+written to *check* a code path is not the same as a test that *exercises*
+that code path, and the two look identical until you mutate the thing you
+meant to be testing.
+
+**Font resolution.** `FontLibrary` now resolves a requested family against the
+font's own `name` table (`family_name_from_table`, preferring the
+typographic-family id 16 over the legacy id 1) instead of only matching
+filenames. The obvious implementation — parse every installed font's name
+table at `FontLibrary::system()` construction — was measured before being
+built: ~3 seconds for ~350 fonts on this machine, almost entirely
+`std::fs::read` I/O rather than parse time. That is a real, visible stall on
+every `Compositor::new` (preview, export, and playback each build their own),
+so it was rejected on evidence, not assumed away. Built instead as an
+incremental, memoized scan: a lookup that misses the filename-stem/alias fast
+path scans unindexed font files one at a time, caching *every* family it
+discovers along the way — not just a match for the current query — so a later,
+different unusual lookup is cheaper than the first, and the full directory is
+never scanned twice. `available_families()` (a font-picker UI's use case, not
+a per-frame one) forces the scan to completion and is the one place the full
+cost is ever paid, on demand rather than at startup.
+
+Verified against a real, deliberately unhelpful case: `SNAP____.TTF`, whose
+declared family ("Snap ITC") shares no substring with its file stem — no
+plausible alias-table entry could cover it by guesswork, so resolving it
+correctly is proof the name table is what's actually being read.
+
+## 2026-08-12 — Wipe and slide: two transitions, two very different amounts of machinery
+
+Both were asked for by the same checklist line, and they cost wildly different
+things, which is worth recording because the cheap one is the surprising one.
+
+**Slide needed no rendering code at all.** `Transform2D::position` already
+places a clip anywhere in the frame, so a slide is one number: offset the
+incoming clip by `(1 - progress) * frame_width` and let the existing draw path
+do the rest. `TrackLayer::position_offset` is the entire feature.
+
+**Wipe needed a shader change, and deliberately not the cheap one.** The
+obvious implementation reuses the existing `MaskUniforms` — a rectangle mask
+from `uv.x = 0` to `progress` is exactly a left-to-right wipe, and it would
+have cost zero new uniform fields. Rejected: a clip's own mask effect and the
+transition's wipe boundary are independent things that must compose, and
+sharing the uniform means every wipe silently discards the user's mask for its
+duration. `ClipUniforms` grew `wipe_progress` + `wipe_enabled` instead (both
+fitting in words that were already padding, so the struct's size and vec4
+alignments are unchanged), and `a_wipe_does_not_discard_the_clips_own_mask`
+pins the composition.
+
+`wipe_enabled` is a tri-state (0 off / 1 reveal / 2 hide) rather than a bool,
+because a wipe at the *tail* of a track has no incoming clip to reveal and has
+to take the outgoing one away instead — the same shape as a cross dissolve
+degenerating into a fade-out when there's nothing after it. The edge is
+softened over ~0.003 UV rather than being a bare `step`: a hard vertical
+boundary moving sub-pixel amounts per frame crawls visibly.
+
+Both are **one direction only** (wipe left-to-right, slide in from the right).
+Other directions each need a direction field on `Transition`, which is a schema
+change rather than a rendering one, and guessing at eight variants nobody asked
+for is how a feature list gets long and shallow.
+
+**The UI menu is now generated from `TransitionKind::ALL`** rather than
+hand-written per kind. Adding `Wipe` and `Slide` to the model would otherwise
+have left them implemented in the renderer and unreachable in the editor — the
+compiler catches a missing `match` arm in `label()`, and the menu picks up
+whatever `ALL` contains, so the two can't drift.
+
+## 2026-08-12 — True-peak and EBU R128 loudness implemented for real, against the standard's own numbers
+
+These were the longest-standing "types only" entry in the architecture doc, kept
+that way on the explicit ground that *a plausible-looking approximation of a
+compliance number is worse than an absent one*. That reasoning is what shaped
+how they were finally built: `audio::loudness` implements the actual specified
+algorithm — BS.1770-4 K-weighting (both biquad stages, with the standard's
+constants **derived from the sample rate** rather than the 48 kHz coefficient
+table transcribed, so a 44.1 or 96 kHz programme measures right instead of
+silently mis-weighted), 400 ms blocks at 75% overlap, the -70 LUFS absolute and
+-10 LU relative gates applied in the power domain, EBU Tech 3342 loudness range
+with its own wider 3 s blocks and -20 LU gate, and a 4x-oversampled polyphase
+true peak.
+
+**Every test is anchored to a value the standard fixes or to algebra**, never
+to what this code happened to output: a 1 kHz sine at -23 dBFS reads -23.0
+LUFS (the calibration point the -0.691 dB offset exists to make true); halving
+amplitude is exactly 6.02 LU; the same signal in stereo is 3.01 LU above mono
+(the property that breaks if channels are averaged rather than summed — a
+natural-seeming slip that would make every stereo deliverable measure 3 dB
+quiet); a sine at fs/4 offset an eighth of a cycle sits every sample at
+-3.01 dBFS while truly peaking at 0 dBFS.
+
+**Three of the eleven tests failed on first run, and all three were bugs in the
+tests, not the implementation** — worth writing down because two of them were
+tests that looked obviously correct:
+- The inter-sample-peak signal was built from `PI * i as f32 / 2.0`, which
+  loses enough precision by i≈100k that the samples drift off ±0.7071 and
+  broke the test's own precondition. Rewritten from `i % 4`.
+- The "true peak must not exceed sample peak on a signal with no inter-sample
+  content" test used held DC. A constant starting abruptly at sample zero is a
+  *step*, which genuinely does contain inter-sample content — a correct
+  true-peak meter overshoots on one, so the test was asserting the
+  reconstruction filter should be wrong. Replaced with a 100 Hz sine (480
+  samples/cycle).
+- The loudness-range test alternated levels every 2 s while LRA analyses 3 s
+  blocks, so every block straddled a change and averaged the range away. It
+  measured 3 LU on a signal spanning 20 dB — a fact about the block length, not
+  the audio. Segments lengthened past the block.
+
+All five algorithm stages were then mutation-tested (bypass the K-weighting
+shelf, disable the relative gate, average channels instead of summing, skip
+oversampling, zero the offset) and each was caught by exactly the test written
+for it.
+
+**Wired into export, not left as a library.** `ExportStats::loudness` measures
+the samples actually handed to the encoder — clip gain, pan, track faders and
+the master bus all sit between the source clips and the file, so measuring
+anything earlier would describe a different signal. It's `Option`, and `None`
+for a video-only export rather than a silence reading: `Some(-120 LUFS)` would
+make a delivery check flag a silent-audio failure on a file that correctly has
+no audio. The editor prints the figures on the export result line and warns
+above -1 dBTP, since the number means nothing to someone who hasn't memorised
+the delivery spec.
+
+## 2026-08-12 — Clip-speed audio retiming: constant speeds only, varispeed, reverse refused
+
+`audio::timeline_mix` now resamples a clip whose `SpeedCurve` is a constant
+non-1x ratio, closing the longest-standing A/V mismatch in the project (video
+honoured speed, audio didn't). The read position comes from
+`SpeedCurve::source_delta` — the same function the video graph uses — so
+picture and sound advance through a retimed clip identically by construction
+rather than by two implementations agreeing.
+
+**Deliberately still unsupported, and reported rather than approximated:**
+a *keyframed* speed curve (integrating a rate curve is time remapping, which
+`source_delta` explicitly refuses to fake), and a *reverse* speed. Reverse is
+the interesting one: the audio side could read a backward span without much
+trouble, but the video pipeline only walks forward, so reversing just the audio
+would produce a file where sound runs backwards over forwards picture. Refusing
+consistently with video is better than each half being individually defensible.
+
+**Varispeed, not time-stretch.** Pitch rises and falls with speed, like a tape
+machine and like Premiere with "Maintain Audio Pitch" off. Linear interpolation
+between source frames, plus a box average across the span each output frame
+covers when speeding up — decimation aliases, and folding out-of-band content
+back as tones that were never in the recording is the artefact that actually
+matters here. A windowed-sinc interpolator would be measurably sharper and
+inaudibly different; a phase vocoder would sound different but solves a
+different problem.
+
+**One mutation escaped the first test pass and is worth recording.** Replacing
+`clip.speed.source_delta(into_clip_ticks)` with plain `into_clip_ticks` — i.e.
+ignoring speed when computing *where* to start reading — broke nothing. Every
+retiming test mixed from tick 0, where "how far into the clip" is zero and
+scaling it changes nothing. Playback and export request blocks from the middle
+of clips constantly, so the bug would have shown up the instant anyone scrubbed
+into a retimed clip rather than playing it from the top.
+`a_block_starting_partway_into_a_retimed_clip_reads_the_scaled_source_position`
+now covers it. The general lesson: a test suite that only ever starts at the
+origin cannot see an error that scales with offset.
+
+## 2026-08-12 — Fader automation, and a migration that couldn't live in the migration chain
+
+`Track::gain_db` became a `ParamTrack` (schema v6). The mixer evaluates it
+**per output frame** when it's animated — a block-rate fader steps at every
+block boundary, which is audible as zipper noise — and **in sequence time**,
+not block time, so a block mixed from the middle of the timeline reads the
+middle of the curve instead of restarting it. When the track isn't animated the
+value is hoisted out of the loop, so an ordinary fader costs exactly what the
+plain `f64` did.
+
+**The compat had to go in the deserializer, not `persist::migrate`.** This
+project's rule is that every format change gets a real migration step, and this
+one appears to break it. It doesn't: migration runs on an already-decoded
+`ProjectDocument`, and a v5 file's bare CBOR float fails to decode into a
+`ParamTrack` before `migrate` is ever called. So a `deserialize_with` that
+accepts either shape is not a shortcut around the rule — it is the only place
+the rule's actual purpose (old files still open) can be honoured for a field
+whose *type* changed rather than whose presence did. The v6 step still exists
+so the stamp moves and a v5 build refuses a v6 file rather than opening it with
+its automation silently flattened.
+`a_v5_project_whose_fader_was_a_bare_number_still_opens_at_the_same_level`
+builds the old shape as raw CBOR rather than round-tripping today's types —
+a test that writes with the current serialiser can never prove yesterday's
+files load — and mutation-testing confirms removing the compat deserializer
+fails it.
+
+**Dragging an automated fader writes a keyframe; dragging a static one replaces
+the value.** Both behaviours are what the user means in context: on a static
+track a fader move is just a fader move and shouldn't silently start
+automating, and on an automated track a fader move that wiped out the whole
+curve would be destructive. The mixer strip's fader also *reads* at the
+playhead, so an automated fader visibly follows its own curve as the playhead
+moves rather than sitting wherever it was last dragged.
+
+## 2026-08-13 — CapCut/Premiere-inspired batch: chroma key, scene-cut, silence, beats, loudness-match, stabilizer
+
+User asked "what more can we add — take inspiration from CapCut and Adobe
+Premiere Pro, we need to build something that can compete with that." Landed
+a DSP/CV batch chosen deliberately for what's tractable *without* a new ML
+dependency (a separate transcript/captions feature, needing a local Whisper
+model, is the agreed-on next push, not part of this one):
+
+- **Chroma key** (`chroma_key` effect) — Rec.709 chroma-distance keying
+  (mirrors `render::scopes`'s vectorscope matrix), real min/max spill
+  despill. First `ParamType::Color` effect param in the project, which
+  exposed that `effects_panel.rs`'s generic param renderer had never actually
+  handled `Color` (fell through to a "type mismatch" label) — fixed as part
+  of landing this, not a pre-existing UI bug nobody noticed because nothing
+  had used the type yet.
+- **Scene-cut detection** (`render::scene_cut`) — 1D Earth Mover's Distance
+  between per-frame luma histograms (plain bin-overlap can't tell "close" from
+  "far apart" for two non-overlapping histograms), adaptive mean+k·stddev
+  threshold so one clip's own jitter doesn't drown out its own real cuts.
+- **Silence-based auto-cut** (`audio::silence`) — windowed RMS vs. a dBFS
+  threshold, debounced by a minimum duration, padded inward before removal so
+  cuts don't clip adjacent speech. Ripple-delete composes from existing
+  `Razor`+`Razor`+`Extract` — no new `EditOp` needed.
+- **Beat-sync** (`audio::beat`) — real spectral flux (STFT via `rustfft`,
+  half-wave-rectified magnitude increase, periodic not symmetric Hann window
+  — the symmetric form gives a bin-aligned tone spurious flux, caught by a
+  test using a synthetic tone chosen to land exactly on an FFT bin).
+  Needed an absolute flux floor on top of the relative adaptive threshold —
+  a signal with *no* real onsets has flux at FFT floating-point-noise scale
+  throughout, and a relative threshold computed from that same noise has no
+  power to reject it. Beats become sequence markers, not edits — the
+  timeline's `snap_tick` already treats every marker as a snap candidate, so
+  this makes beats magnetic for free.
+- **Per-clip loudness auto-match** (`audio::loudness::gain_to_reach_target`)
+  — direct extension of the EBU R128 work already in the project; ±24dB
+  clamp specifically to stop a near-silent measurement from computing a
+  gain in the hundreds of dB.
+- **Warp Stabilizer** (`render::stabilize`) — scoped honestly: block-matching
+  translation estimation (bounded-window SAD search on a downsampled
+  greyscale frame, not phase correlation or optical flow) plus moving-average
+  path smoothing, written as `Transform::POSITION` keyframes — no new effect
+  needed, since counter-animating position is exactly what Transform already
+  does. Translation only: no rotation/scale/perspective correction, no
+  border crop/fill, stated in the module doc rather than silently absent.
+
+**Real bug found by the silence real-footage test, not by a synthetic one**:
+`detect_scene_cuts` and `detect_silence_and_ripple_delete` both called
+`apply_ops` and reported success without checking its boolean return —
+`apply_ops` is all-or-nothing, so a failed batch left the project completely
+untouched while the code still claimed "found and split at 8 cuts." Root
+cause was a *test-fixture* bug shared by both real-footage tests: the
+fixture hand-picks `ClipInstanceId(1)` without advancing `state.next_id`,
+so `next_id()` inside the method under test collided with it, creating a
+duplicate id, and a subsequent `Extract` looked up that id and got the wrong
+clip. Fixed the fixture (`state.next_id = 1000` after construction) in both
+tests, fixed the return-value bug in both methods, and added an
+id-uniqueness assertion to both tests — the original scene-cut test had the
+identical id-collision defect and never caught it, because nothing checked
+for duplicate ids until the silence test's harder failure forced a look.
+
+**Mutation testing earned its keep twice more**: the local-maximum
+requirement in beat detection's peak-picking looked redundant with the
+min-interval debounce against every test I'd written — removing it still
+passed all 8 tests, because every synthetic click was an isolated spike.
+Only after adding a sustained-swell test (a broad hump spanning longer than
+the debounce window, which debounce alone can't collapse) did the mutation
+get caught. And a warp-stabilizer sign-convention bug (`estimate_translation`
+returning the negated correct answer) was caught immediately by the
+recovers-a-known-shift test, not by staring at the algebra.

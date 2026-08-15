@@ -8,6 +8,15 @@
 use crate::ProbeError;
 use std::path::Path;
 
+/// One decoded, resampled block of interleaved samples plus where it sits in
+/// the source.
+pub struct AudioChunk {
+    /// Presentation time of the chunk's *first* sample, in TIMEBASE ticks.
+    pub pts_ticks: i64,
+    /// Interleaved f32, already at the requested rate and channel count.
+    pub samples: Vec<f32>,
+}
+
 pub struct AudioDecoderStream {
     input: ffmpeg_next::format::context::Input,
     stream_index: usize,
@@ -74,7 +83,21 @@ impl AudioDecoderStream {
 
     /// Returns the next chunk of interleaved f32 samples (already at the
     /// target rate/channel count), or `Ok(None)` at end of stream.
+    ///
+    /// Drops the chunk's timestamp. Use `next_chunk` when the caller needs
+    /// to know *where* in the source the samples came from — anything doing
+    /// sample-accurate placement (the timeline audio mixer) does.
     pub fn next_samples(&mut self) -> Result<Option<Vec<f32>>, ProbeError> {
+        Ok(self.next_chunk()?.map(|c| c.samples))
+    }
+
+    /// Same as `next_samples` but keeps the chunk's presentation time, which
+    /// the decoder computes anyway. Without it a caller can only count
+    /// samples from wherever the stream happens to be, and since `seek` is
+    /// chunk-granular (see its doc comment) that means it can't tell how far
+    /// past the requested point it actually landed — making sample-accurate
+    /// trimming impossible.
+    pub fn next_chunk(&mut self) -> Result<Option<AudioChunk>, ProbeError> {
         let mut decoded = ffmpeg_next::frame::Audio::empty();
         loop {
             if self.decoder.receive_frame(&mut decoded).is_ok() {
@@ -100,7 +123,7 @@ impl AudioDecoderStream {
                     .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect();
                 if !samples.is_empty() {
-                    return Ok(Some(samples));
+                    return Ok(Some(AudioChunk { pts_ticks, samples }));
                 }
                 continue;
             }

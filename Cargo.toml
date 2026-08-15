@@ -15,6 +15,9 @@ members = [
     "crates/playback",
     "crates/play_clip",
     "crates/play_timeline",
+    "crates/export",
+    "crates/audio_source",
+    "crates/speech",
 ]
 
 [workspace.package]
@@ -29,6 +32,9 @@ render = { path = "crates/render" }
 audio = { path = "crates/audio" }
 project = { path = "crates/project" }
 command = { path = "crates/command" }
+audio_source = { path = "crates/audio_source" }
+playback = { path = "crates/playback" }
+speech = { path = "crates/speech" }
 
 [profile.dev]
 opt-level = 1

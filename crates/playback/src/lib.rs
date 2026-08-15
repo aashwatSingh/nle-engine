@@ -1,6 +1,12 @@
 pub mod audio_engine;
+pub mod sequence_audio;
+pub mod sequence_video;
 pub mod video_playback;
 pub use audio_engine::{AudioClock, AudioEngine};
+pub use sequence_audio::{MeterSnapshot, SequenceAudioEngine, SequenceClock};
+pub use sequence_video::{
+    GpuContext, PreparedFrame, PreparedSource, SequenceVideoPlayback, SourcePixels,
+};
 pub use video_playback::{VideoFrame, VideoPlayback};
 
 #[cfg(test)]

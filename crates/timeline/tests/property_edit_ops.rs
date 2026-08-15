@@ -44,7 +44,7 @@ fn make_clip(id: u64, tin: i64, tout: i64) -> ClipInstance {
 }
 
 fn make_track(id: u64, kind: TrackKind, clips: Vec<ClipInstance>) -> Track {
-    Track { id: TrackId(id), kind, name: format!("T{id}"), clips, locked: false, sync_locked: true, muted: false, solo: false, height_px: 60 }
+    Track { id: TrackId(id), kind, name: format!("T{id}"), clips, transitions: vec![], gain_db: timeline::unity_gain(), pan: 0.0, locked: false, sync_locked: true, muted: false, solo: false, height_px: 60 }
 }
 
 fn starting_project() -> (Project, Vec<ClipInstanceId>, Vec<TrackId>) {
@@ -92,6 +92,7 @@ fn starting_project() -> (Project, Vec<ClipInstanceId>, Vec<TrackId>) {
             markers: vec![],
         }],
         assets: vec![],
+        bins: vec![],
     };
     (project, clip_pool, track_pool)
 }

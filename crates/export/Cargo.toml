@@ -1,0 +1,21 @@
+[package]
+name = "export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Renders a sequence to a real video file: the same GraphCompiler +
+# Compositor the preview uses (so what you see is what you get — M4e proved
+# those two paths produce identical pixels), driven frame by frame and fed to
+# an H.264 encoder.
+[dependencies]
+timeline = { workspace = true }
+audio = { workspace = true }
+media = { workspace = true }
+media_ffmpeg = { path = "../media_ffmpeg" }
+audio_source = { workspace = true }
+render = { workspace = true }
+ffmpeg-next = "7.1"
+
+[dev-dependencies]
+tempfile = "3"

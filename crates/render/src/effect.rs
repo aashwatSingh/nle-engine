@@ -291,6 +291,77 @@ pub mod mask {
     }
 }
 
+/// Chroma Key — green/blue-screen keying. Distance from `key_color` is
+/// measured in chroma (colour with luma discarded, the Rec.709 Cb/Cr the rest
+/// of `render` already uses for its scopes), so shadows and highlights on the
+/// screen still key out evenly rather than only the one exposure level that
+/// exactly matches `key_color`. `similarity` is the chroma-distance radius
+/// counted as "key"; `smoothness` is the width of the ramp beyond it, so the
+/// edge anti-aliases instead of hard-cutting.
+///
+/// `spill_suppression` is real min/max despill — on a kept (non-transparent)
+/// pixel, whichever channel `key_color` is dominant in gets pulled down to
+/// the larger of the other two, never boosted, never touching them — not a
+/// full desaturate, which would dull the subject's own real colour wherever
+/// it happens to be greenish. This is the same technique most simple
+/// real-time keyers use; it is not a full per-channel matte-based despill
+/// (Ultra Key-class tools), which is real follow-up work if simple
+/// min/max despill isn't clean enough on a given shoot.
+pub mod chroma_key {
+    use super::{EffectDescriptor, EffectLocality, ParamSchema, ParamType};
+    use timeline::ParamValue;
+
+    pub const TYPE_ID: &str = "chroma_key";
+    /// `Color`. The screen colour to key out — green `[0,1,0,1]` or blue
+    /// `[0,0,1,1]` for the ordinary cases, but any colour works.
+    pub const KEY_COLOR: &str = "key_color";
+    /// `Number`, 0..1. Chroma-distance radius counted as fully keyed.
+    pub const SIMILARITY: &str = "similarity";
+    /// `Number`, 0..1. Width of the transition ramp beyond `similarity`.
+    pub const SMOOTHNESS: &str = "smoothness";
+    /// `Number`, 0..1. How much min/max despill to apply to kept pixels.
+    pub const SPILL_SUPPRESSION: &str = "spill_suppression";
+
+    pub fn descriptor() -> EffectDescriptor {
+        EffectDescriptor {
+            type_id: TYPE_ID,
+            display_name: "Chroma Key",
+            locality: EffectLocality::Global,
+            shader_entry_point: "fs_chroma_key",
+            params: vec![
+                ParamSchema {
+                    name: KEY_COLOR,
+                    display_name: "Key Colour",
+                    param_type: ParamType::Color,
+                    range: None,
+                    default: ParamValue::Color([0.0, 1.0, 0.0, 1.0]),
+                },
+                ParamSchema {
+                    name: SIMILARITY,
+                    display_name: "Similarity",
+                    param_type: ParamType::Number,
+                    range: Some((0.0, 1.0)),
+                    default: ParamValue::Number(0.2),
+                },
+                ParamSchema {
+                    name: SMOOTHNESS,
+                    display_name: "Smoothness",
+                    param_type: ParamType::Number,
+                    range: Some((0.0, 1.0)),
+                    default: ParamValue::Number(0.1),
+                },
+                ParamSchema {
+                    name: SPILL_SUPPRESSION,
+                    display_name: "Spill Suppression",
+                    param_type: ParamType::Number,
+                    range: Some((0.0, 1.0)),
+                    default: ParamValue::Number(0.5),
+                },
+            ],
+        }
+    }
+}
+
 /// The effect registry M5 ships: Transform (M4) plus Gaussian Blur, Color
 /// Correction, Crop, and Mask. The rest of spec 4.5's built-in list —
 /// curves, HSL secondary, LUT loading, mirror, sharpen, transitions,
@@ -309,6 +380,7 @@ impl Default for BuiltinRegistry {
                 color_correction::descriptor(),
                 crop::descriptor(),
                 mask::descriptor(),
+                chroma_key::descriptor(),
             ],
         }
     }
@@ -317,5 +389,14 @@ impl Default for BuiltinRegistry {
 impl EffectRegistry for BuiltinRegistry {
     fn lookup(&self, type_id: &str) -> Option<&EffectDescriptor> {
         self.descriptors.iter().find(|d| d.type_id == type_id)
+    }
+}
+
+impl BuiltinRegistry {
+    /// Every built-in effect's `type_id`. Exists so a UI's own "which effects
+    /// can I offer" list can be checked against this one without hand-copying
+    /// the id list a second time — see `app::effects_panel`'s test.
+    pub fn all_type_ids(&self) -> Vec<&'static str> {
+        self.descriptors.iter().map(|d| d.type_id).collect()
     }
 }

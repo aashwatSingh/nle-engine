@@ -1,0 +1,11 @@
+// Windows resource script embedding the app icon into the .exe. Referenced
+// by build.rs via `embed-resource`, which drives `windres` from the mingw64
+// toolchain — the classic `winres` crate targets MSVC's `rc.exe` and doesn't
+// support the `-gnu` toolchain this project builds with.
+//
+// ID 1 is arbitrary but must match what `winit`'s window creation expects
+// when it goes looking for "the app icon": Windows itself uses whichever
+// icon resource has the lowest ID as the executable's default/Explorer icon,
+// so a single entry at ID 1 is sufficient without also setting it as a
+// window-class icon at runtime.
+1 ICON "icon.ico"

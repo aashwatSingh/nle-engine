@@ -1,38 +1,1187 @@
-//! M0 placeholder entry point. Not the UI (that's M3+) — this exists only to
-//! prove the workspace's crates actually link together and the core types
-//! behave, per the M0 "does the toolchain work at all" risk item.
+//! The real editor shell: a timeline you can see and edit, a media bin, a
+//! live preview, and an effects panel — built on top of the M0-M5 engine
+//! (real decode, real GPU compositing, real effects, real undo/redo) rather
+//! than a hardcoded demo. This is the "core editor UI" scope: not a
+//! Premiere Pro clone (no multicam, Lumetri color wheels, audio mixer
+//! console, motion graphics templates, or export yet) — see each module's
+//! doc comment for what's deliberately deferred.
+//!
+//! UI is `egui` (immediate mode), rendered via `egui-wgpu` sharing the same
+//! `wgpu::Device`/`Queue` as the engine's own `Compositor` — one GPU
+//! context for both, no separate render loop to keep in sync.
 
+mod autosave;
+mod effects_panel;
+mod export_job;
+mod mixer_panel;
+mod proxy_jobs;
+mod preview;
+mod project_panel;
+mod scopes_panel;
+mod state;
+mod title_panel;
+mod transcript_panel;
+mod waveform_cache;
+mod timeline_widget;
+
+use render::wgpu;
+use state::EditorState;
 use std::sync::Arc;
-use timeline::{FrameRate, Project, TimeTick, Timecode};
+use std::time::Instant;
+use timeline::{TimeTick, TIMEBASE};
+use winit::event::{ElementState, Event, WindowEvent};
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::WindowBuilder;
 
 fn main() {
-    let project = Arc::new(Project { sequences: vec![], assets: vec![] });
-    let mut undo = command::UndoStack::new(project.clone(), command::UndoStack::DEFAULT_MAX_HISTORY);
+    media_ffmpeg::init().expect("ffmpeg init failed");
 
-    let tick = TimeTick::from_frame(1500, FrameRate::Fps29_97);
-    let tc = Timecode::from_tick(tick, FrameRate::Fps29_97, true);
+    let event_loop = EventLoop::new().unwrap();
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title("nle-engine editor")
+            .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0))
+            .build(&event_loop)
+            .unwrap(),
+    );
 
-    println!("nle-engine M0 scaffold");
-    println!("1500 frames @ 29.97 drop-frame = {tc}");
-    println!("undo stack starts at {} sequences", undo.current().sequences.len());
-
-    let mut edited = (*project).clone();
-    edited.sequences.push(timeline::Sequence {
-        id: timeline::SequenceId(1),
-        name: "Sequence 01".into(),
-        settings: timeline::SequenceSettings {
-            frame_rate: FrameRate::Fps29_97,
-            width: 1920,
-            height: 1080,
-            sample_rate: 48_000,
-            working_color_primaries: media::ColorPrimaries::Rec709,
-            drop_frame_timecode: true,
-        },
-        tracks: vec![],
-        markers: vec![],
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..Default::default()
     });
-    undo.push("create sequence", Arc::new(edited));
-    println!("after edit: {} sequence(s)", undo.current().sequences.len());
-    undo.undo();
-    println!("after undo: {} sequence(s)", undo.current().sequences.len());
+    let surface = instance
+        .create_surface(window.clone())
+        .expect("create_surface");
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+    }))
+    .expect("no GPU adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("editor"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+        },
+        None,
+    ))
+    .expect("request_device");
+    let (device, queue) = (Arc::new(device), Arc::new(queue));
+
+    let caps = surface.get_capabilities(&adapter);
+    // egui's own renderer handles sRGB-correctness for its widgets as long
+    // as the surface format is reported honestly, so — unlike
+    // `play_timeline`'s own compositor output — the swapchain format is
+    // left as whatever wgpu prefers rather than forced non-sRGB here.
+    let surface_format = caps.formats[0];
+    let size = window.inner_size();
+    let mut config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: caps.alpha_modes[0],
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
+    surface.configure(&device, &config);
+
+    let egui_ctx = egui::Context::default();
+    let mut egui_winit_state = egui_winit::State::new(
+        egui_ctx.clone(),
+        egui::ViewportId::ROOT,
+        &window,
+        Some(window.scale_factor() as f32),
+        None,
+    );
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1);
+
+    let mut state = EditorState::new();
+    let mut preview = preview::Preview::new(device.clone(), queue.clone());
+    let mut export = ExportUi::default();
+    let mut project_panel_state = project_panel::ProjectPanelState::default();
+    let mut effects_panel_state = effects_panel::EffectsPanelState::default();
+    let mut scopes_panel_state = scopes_panel::ScopesPanelState::default();
+    let mut transcript_panel_state = transcript_panel::TranscriptPanelState::default();
+    let mut waveforms = waveform_cache::WaveformCache::default();
+    let mut proxies = proxy_jobs::ProxyJobs::default();
+    let mut autosaver = autosave::Autosave::default();
+    // Offered once, at startup, if the last session left a recovery file behind.
+    let mut recovery_offer = autosave::Autosave::find_recovery(None);
+    // Owns the audio device only while playing (see `Transport`).
+    let mut transport = Transport::default();
+    // Tracked here rather than read from egui: shortcuts are dispatched from
+    // the winit event branch, before egui runs for the frame, so egui's input
+    // state would be one frame stale.
+    let mut modifiers = winit::keyboard::ModifiersState::empty();
+
+    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop
+        .run(move |event, elwt| match event {
+            Event::WindowEvent { event, .. } => {
+                let response = egui_winit_state.on_window_event(&window, &event);
+                if response.consumed {
+                    if response.repaint {
+                        window.request_redraw();
+                    }
+                    // Still let resize/close through even if egui "consumed" it.
+                    if !matches!(event, WindowEvent::Resized(_) | WindowEvent::CloseRequested) {
+                        return;
+                    }
+                }
+                match event {
+                    WindowEvent::CloseRequested => {
+                        // Closing deliberately is a clean exit, so the recovery
+                        // file must go — otherwise the next launch would offer
+                        // to restore work the user chose to walk away from.
+                        autosaver.discard(state.undo.revision() as usize);
+                        elwt.exit()
+                    }
+                    WindowEvent::Resized(new_size) => {
+                        if new_size.width > 0 && new_size.height > 0 {
+                            config.width = new_size.width;
+                            config.height = new_size.height;
+                            surface.configure(&device, &config);
+                        }
+                    }
+                    WindowEvent::ModifiersChanged(new) => modifiers = new.state(),
+                    WindowEvent::KeyboardInput { event: key, .. } => {
+                        if key.state == ElementState::Pressed {
+                            handle_shortcut(
+                                &mut state,
+                                &mut transport,
+                                &proxies,
+                                &device,
+                                &queue,
+                                &key.logical_key,
+                                &modifiers,
+                                key.repeat,
+                            );
+                        }
+                    }
+                    WindowEvent::RedrawRequested => {
+                        advance_playhead(&mut state, &mut transport);
+                        // Collect any waveforms that finished on a worker
+                        // thread. Without this the results are never taken off
+                        // the channel and no waveform ever appears.
+                        waveforms.poll();
+                        // Same requirement as waveforms: without this, finished
+                        // proxies sit on the channel and are never adopted.
+                        proxies.poll();
+
+                        let raw_input = egui_winit_state.take_egui_input(&window);
+                        let full_output = egui_ctx.run(raw_input, |ctx| {
+                            build_ui(
+                                ctx,
+                                &mut state,
+                                &device,
+                                &device,
+                                &queue,
+                                &mut egui_renderer,
+                                &mut preview,
+                                &mut export,
+                                &mut project_panel_state,
+                                &mut effects_panel_state,
+                                &mut scopes_panel_state,
+                                &mut transcript_panel_state,
+                                &mut waveforms,
+                                &mut proxies,
+                                &mut autosaver,
+                                &mut recovery_offer,
+                                &mut transport,
+                            )
+                        });
+                        egui_winit_state
+                            .handle_platform_output(&window, full_output.platform_output);
+
+                        state.force_close_stale_drag(egui_ctx.input(|i| i.pointer.any_down()));
+
+                        // Reconcile the playback devices to the transport's
+                        // intent. `state.playing` is the single source of
+                        // truth, and several places clear it without knowing
+                        // the devices exist — scrubbing the ruler, for one.
+                        // Without this the picture would freeze while sound
+                        // kept playing, and the decode thread would keep
+                        // running against a clock nobody advances.
+                        if !state.playing && transport.is_running() {
+                            stop_playback(&mut state, &mut transport);
+                        }
+
+                        tick_autosave(&mut state, &mut autosaver);
+
+                        let tris =
+                            egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+                        for (id, delta) in &full_output.textures_delta.set {
+                            egui_renderer.update_texture(&device, &queue, *id, delta);
+                        }
+                        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+                            size_in_pixels: [config.width, config.height],
+                            pixels_per_point: full_output.pixels_per_point,
+                        };
+                        let mut encoder =
+                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("editor frame"),
+                            });
+                        egui_renderer.update_buffers(
+                            &device,
+                            &queue,
+                            &mut encoder,
+                            &tris,
+                            &screen_descriptor,
+                        );
+
+                        let output = match surface.get_current_texture() {
+                            Ok(t) => t,
+                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                surface.configure(&device, &config);
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!("surface error: {e:?}");
+                                return;
+                            }
+                        };
+                        let view = output
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor::default());
+                        {
+                            let mut rpass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("egui"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                                r: 0.08,
+                                                g: 0.08,
+                                                b: 0.09,
+                                                a: 1.0,
+                                            }),
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                });
+                            egui_renderer.render(&mut rpass, &tris, &screen_descriptor);
+                        }
+                        for id in &full_output.textures_delta.free {
+                            egui_renderer.free_texture(id);
+                        }
+                        queue.submit(std::iter::once(encoder.finish()));
+                        output.present();
+                    }
+                    _ => {}
+                }
+            }
+            Event::AboutToWait => window.request_redraw(),
+            _ => {}
+        })
+        .unwrap();
+}
+
+/// Owns the playback devices while playing: the audio engine, which is the
+/// master clock, and the video decode-ahead pipeline that paces against it.
+///
+/// Both are `None` when stopped. `audio` alone is `None` when no output device
+/// could be opened, in which case the wall clock stands in (see
+/// `state.play_anchor`) and video paces against that instead — so picture
+/// still plays on a machine with no working sound output.
+#[derive(Default)]
+struct Transport {
+    audio: Option<playback::SequenceAudioEngine>,
+    video: Option<playback::SequenceVideoPlayback>,
+}
+
+impl Transport {
+    fn is_running(&self) -> bool {
+        self.audio.is_some() || self.video.is_some()
+    }
+}
+
+/// Starts playback from the current playhead.
+///
+/// The audio engine is the master clock (spec 4.4), so it's created even for a
+/// sequence with no audio clips: the mix is then silence but the clock still
+/// advances correctly, which keeps one code path driving the transport instead
+/// of two that can disagree. The project is snapshotted by `Arc` here — see
+/// `playback::sequence_audio`'s note on snapshot semantics.
+fn start_playback(
+    state: &mut EditorState,
+    transport: &mut Transport,
+    proxies: &proxy_jobs::ProxyJobs,
+    device: &Arc<wgpu::Device>,
+    queue: &Arc<wgpu::Queue>,
+) {
+    state.playing = true;
+    state.shuttle_rate = 1.0;
+    let project = state.project().clone();
+    // Playback reads proxies when they're enabled and built; export never does
+    // (see `proxy_jobs`' module doc).
+    let paths = proxies.resolve(&state.asset_paths);
+
+    // Audio first: video needs a handle to whatever clock ends up authoritative.
+    let audio = match playback::SequenceAudioEngine::start(
+        project.clone(),
+        state.seq_id,
+        paths.clone(),
+        state.playhead,
+        state.master_gain_db,
+    ) {
+        Ok(engine) => {
+            state.play_anchor = None;
+            Some(engine)
+        }
+        Err(e) => {
+            // No audio device (or it's in use). Fall back to the wall clock so
+            // the editor is still usable, and say so rather than looking broken.
+            state.play_anchor = Some((Instant::now(), state.playhead));
+            state.status = format!("no audio output ({e}); playing without sound");
+            None
+        }
+    };
+
+    // The decode thread reads the clock to decide what to prepare next and
+    // when to skip. Boxed so both clock sources have one type; `Box<F: Fn>`
+    // is itself `Fn`, so it satisfies the engine's bound directly.
+    let clock: Box<dyn Fn() -> i64 + Send + 'static> = match audio.as_ref() {
+        Some(engine) => {
+            let clock = engine.clock();
+            Box::new(move || clock.current_tick())
+        }
+        None => {
+            let (anchor_at, anchor_tick) = (Instant::now(), state.playhead);
+            Box::new(move || {
+                anchor_tick + (anchor_at.elapsed().as_secs_f64() * TIMEBASE as f64) as i64
+            })
+        }
+    };
+
+    let video = playback::SequenceVideoPlayback::start(
+        project,
+        state.seq_id,
+        paths,
+        state.playhead,
+        clock,
+        // Uploads decoded frames to GPU textures on the decode thread itself
+        // instead of handing back CPU buffers for the UI thread to upload —
+        // see `playback::sequence_video`'s module doc for the real-footage
+        // measurement (334 starved frames at 2560x1588 before this) that
+        // motivated it.
+        Some((device.clone(), queue.clone())),
+    );
+
+    *transport = Transport { audio, video: Some(video) };
+}
+
+fn stop_playback(state: &mut EditorState, transport: &mut Transport) {
+    state.playing = false;
+    state.play_anchor = None;
+    state.shuttle_rate = 0.0;
+    state.playback_health.clear();
+    // Dropping the engines closes the audio stream (letting the mixer thread
+    // exit as its command channel disconnects) and joins the video decode
+    // thread, releasing the device and the per-asset decoders.
+    *transport = Transport::default();
+}
+
+fn advance_playhead(state: &mut EditorState, transport: &mut Transport) {
+    // Shuttle at anything other than 1x isn't "playing": no audio device, no
+    // decode-ahead pipeline, just the playhead moving at a multiple of wall
+    // time with the preview rendering on demand. See `set_shuttle`.
+    if !state.playing && state.shuttle_rate != 0.0 {
+        advance_shuttle(state);
+        return;
+    }
+    if !state.playing {
+        return;
+    }
+    let end = state.sequence_duration_ticks();
+
+    // Report playback health while it's happening. Dropped frames mean the
+    // decoder had to skip to keep up with the clock; starvation means the UI
+    // asked for a frame and none was ready. Either one is "this machine can't
+    // play this sequence at full rate" — the thing proxies exist to fix.
+    if let Some(video) = transport.video.as_ref() {
+        let dropped = video.dropped_frame_count();
+        let starved = video.starved_count();
+        state.playback_health = if dropped == 0 && starved == 0 {
+            String::new()
+        } else {
+            format!("dropped {dropped}, held {starved}")
+        };
+    }
+
+    if let Some(engine) = transport.audio.as_ref() {
+        // Audio-mastered: the playhead is where the hardware actually is.
+        state.playhead = engine.current_tick().min(end);
+        if engine.has_ended() || state.playhead >= end {
+            state.playhead = end;
+            stop_playback(state, transport);
+        }
+        return;
+    }
+
+    // Wall-clock fallback (no audio device).
+    let Some((anchor_instant, anchor_tick)) = state.play_anchor else {
+        return;
+    };
+    let elapsed = anchor_instant.elapsed().as_secs_f64();
+    let new_tick = anchor_tick + (elapsed * TIMEBASE as f64) as i64;
+    if new_tick >= end {
+        state.playhead = end;
+        stop_playback(state, transport);
+    } else {
+        state.playhead = new_tick;
+    }
+}
+
+/// Advances the playhead at `shuttle_rate` x wall time, in either direction,
+/// stopping at either end of the sequence.
+fn advance_shuttle(state: &mut EditorState) {
+    let Some((anchor_at, anchor_tick)) = state.play_anchor else {
+        // No anchor means nothing is actually shuttling; clear the rate so the
+        // toolbar doesn't claim otherwise.
+        state.shuttle_rate = 0.0;
+        return;
+    };
+    let elapsed = anchor_at.elapsed().as_secs_f64();
+    let target = anchor_tick + (elapsed * state.shuttle_rate * TIMEBASE as f64) as i64;
+    let end = state.sequence_duration_ticks();
+
+    if target <= 0 || target >= end {
+        state.playhead = target.clamp(0, end);
+        state.shuttle_rate = 0.0;
+        state.play_anchor = None;
+    } else {
+        state.playhead = target;
+    }
+}
+
+/// Highest shuttle multiplier J/L will step up to. Beyond 8x the on-demand
+/// decode path can't produce enough distinct frames for the motion to read as
+/// anything but noise, so more speed would be a worse tool, not a faster one.
+const MAX_SHUTTLE: f64 = 8.0;
+
+/// Sets the transport rate for JKL shuttle.
+///
+/// Only `1.0` gets real playback. Every other rate deliberately runs silent,
+/// off the wall clock and the on-demand preview path, because two engine
+/// limits make a "fast/reverse A/V playback" claim untrue: the mixer has no
+/// resampler (so it can only produce 1x audio), and the video decode pipeline
+/// only walks forward. Rather than fake it, shuttle drops to scrub-quality
+/// picture and says "silent" in the toolbar. Premiere also drops audio at
+/// extreme shuttle speeds; it pitches it at moderate ones, which is the part
+/// that needs the resampler.
+fn set_shuttle(
+    state: &mut EditorState,
+    transport: &mut Transport,
+    proxies: &proxy_jobs::ProxyJobs,
+    device: &Arc<wgpu::Device>,
+    queue: &Arc<wgpu::Queue>,
+    rate: f64,
+) {
+    if rate == 1.0 {
+        start_playback(state, transport, proxies, device, queue);
+        return;
+    }
+    // Tear down the A/V engines first — `stop_playback` also zeroes the rate,
+    // so the new one is set after.
+    stop_playback(state, transport);
+    state.shuttle_rate = rate;
+    if rate != 0.0 {
+        state.play_anchor = Some((Instant::now(), state.playhead));
+    }
+}
+
+/// Next rate for an L (forward) or J (reverse) press: engage at 1x in that
+/// direction, then double on each further press, as in Premiere/Avid.
+fn next_shuttle_rate(current: f64, forward: bool) -> f64 {
+    let want: f64 = if forward { 1.0 } else { -1.0 };
+    if current.signum() != want.signum() || current == 0.0 {
+        want
+    } else {
+        (current * 2.0).clamp(-MAX_SHUTTLE, MAX_SHUTTLE)
+    }
+}
+
+fn ticks_per_frame(state: &EditorState) -> i64 {
+    state.sequence().settings.frame_rate.ticks_per_frame().max(1)
+}
+
+/// Moves the playhead by `frames`, stopping any transport first — stepping
+/// while the audio clock is driving the playhead would just be overwritten on
+/// the next frame.
+fn step_frames(
+    state: &mut EditorState,
+    transport: &mut Transport,
+    proxies: &proxy_jobs::ProxyJobs,
+    device: &Arc<wgpu::Device>,
+    queue: &Arc<wgpu::Queue>,
+    frames: i64,
+) {
+    if state.playing || state.shuttle_rate != 0.0 {
+        set_shuttle(state, transport, proxies, device, queue, 0.0);
+    }
+    let delta = frames * ticks_per_frame(state);
+    let end = state.sequence_duration_ticks();
+    state.playhead = (state.playhead + delta).clamp(0, end);
+}
+
+/// Every clip edge in the sequence, which is what "go to previous/next edit
+/// point" navigates between.
+fn edit_points(state: &EditorState) -> Vec<i64> {
+    let mut points: Vec<i64> = vec![0];
+    for track in &state.sequence().tracks {
+        for clip in &track.clips {
+            points.push(clip.timeline_in.0);
+            points.push(clip.timeline_out.0);
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+    points
+}
+
+fn handle_shortcut(
+    state: &mut EditorState,
+    transport: &mut Transport,
+    proxies: &proxy_jobs::ProxyJobs,
+    device: &Arc<wgpu::Device>,
+    queue: &Arc<wgpu::Queue>,
+    key: &Key,
+    modifiers: &winit::keyboard::ModifiersState,
+    repeat: bool,
+) {
+    let ctrl = modifiers.control_key() || modifiers.super_key();
+    let shift = modifiers.shift_key();
+
+    // Held-key repeat is wanted for navigation (holding an arrow to walk the
+    // playhead) but not for anything that mutates the project — an autorepeated
+    // delete or paste would fire dozens of times from one keypress.
+    let navigation_only = repeat;
+
+    match key {
+        Key::Named(NamedKey::Space) if !navigation_only => {
+            if state.playing || state.shuttle_rate != 0.0 {
+                set_shuttle(state, transport, proxies, device, queue, 0.0);
+            } else {
+                set_shuttle(state, transport, proxies, device, queue, 1.0);
+            }
+        }
+
+        // --- JKL shuttle ---
+        Key::Character(c) if c.eq_ignore_ascii_case("l") && !navigation_only => {
+            let rate = next_shuttle_rate(state.shuttle_rate, true);
+            set_shuttle(state, transport, proxies, device, queue, rate);
+        }
+        Key::Character(c) if c.eq_ignore_ascii_case("j") && !navigation_only => {
+            let rate = next_shuttle_rate(state.shuttle_rate, false);
+            set_shuttle(state, transport, proxies, device, queue, rate);
+        }
+        Key::Character(c) if c.eq_ignore_ascii_case("k") && !navigation_only => {
+            set_shuttle(state, transport, proxies, device, queue, 0.0);
+        }
+
+        // --- Navigation (repeat allowed) ---
+        Key::Named(NamedKey::ArrowLeft) => {
+            step_frames(state, transport, proxies, device, queue, if shift { -5 } else { -1 })
+        }
+        Key::Named(NamedKey::ArrowRight) => {
+            step_frames(state, transport, proxies, device, queue, if shift { 5 } else { 1 })
+        }
+        Key::Named(NamedKey::Home) if !navigation_only => {
+            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            state.playhead = 0;
+        }
+        Key::Named(NamedKey::End) if !navigation_only => {
+            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            state.playhead = state.sequence_duration_ticks();
+        }
+        Key::Named(NamedKey::ArrowUp) => {
+            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            if let Some(p) = edit_points(state).into_iter().rev().find(|p| *p < state.playhead) {
+                state.playhead = p;
+            }
+        }
+        Key::Named(NamedKey::ArrowDown) => {
+            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            if let Some(p) = edit_points(state).into_iter().find(|p| *p > state.playhead) {
+                state.playhead = p;
+            }
+        }
+
+        // --- Marks ---
+        Key::Character(c) if c.eq_ignore_ascii_case("i") && !navigation_only => state.mark_in(),
+        Key::Character(c) if c.eq_ignore_ascii_case("o") && !navigation_only => state.mark_out(),
+
+        // --- Edit ---
+        // Shift+Delete is ripple delete (close the gap); plain Delete lifts
+        // (leave a gap). Premiere's convention, and the distinction matters
+        // enough that guessing one would be wrong half the time.
+        Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) if !navigation_only => {
+            if shift {
+                state.ripple_delete_selection();
+            } else {
+                state.lift_selection();
+            }
+        }
+        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("c") && !navigation_only => {
+            state.copy_selection()
+        }
+        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("x") && !navigation_only => {
+            state.copy_selection();
+            state.ripple_delete_selection();
+        }
+        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") && !navigation_only => {
+            state.paste_at_playhead()
+        }
+        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") && !navigation_only => {
+            state.selected_clips = state
+                .sequence()
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter().map(|c| c.id))
+                .collect();
+        }
+        Key::Named(NamedKey::Escape) if !navigation_only => state.clear_selection(),
+
+        // --- Undo/redo. Ctrl-qualified, so bare V/C stay available as tools.
+        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("z") && !navigation_only => {
+            if shift {
+                state.undo.redo();
+            } else {
+                state.undo.undo();
+            }
+        }
+        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("y") && !navigation_only => {
+            state.undo.redo();
+        }
+
+        // --- Tools and toggles (bare keys, so they must come after the
+        // Ctrl-qualified arms above — `c` is both Razor and Copy.
+        Key::Character(c) if c.eq_ignore_ascii_case("v") && !navigation_only => {
+            state.tool = state::Tool::Select
+        }
+        Key::Character(c) if c.eq_ignore_ascii_case("c") && !navigation_only => {
+            state.tool = state::Tool::Razor
+        }
+        Key::Character(c) if c.eq_ignore_ascii_case("s") && !navigation_only => {
+            state.snapping = !state.snapping;
+            state.status = if state.snapping { "snapping on".into() } else { "snapping off".into() };
+        }
+        _ => {}
+    }
+}
+
+const PROJECT_EXTENSION: &str = "nleproj";
+
+/// The export-related slice of UI state: at most one job at a time (a second
+/// concurrent export would contend for the same GPU and encoder throughput
+/// and just make both slower), plus the last outcome to show afterwards.
+struct ExportUi {
+    job: Option<export_job::ExportJob>,
+    last_result: Option<String>,
+    quality: export::QualityPreset,
+    /// Export only the marked in/out range. Sticky across exports, since a
+    /// range workflow tends to be several exports in a row.
+    use_range: bool,
+}
+
+impl Default for ExportUi {
+    fn default() -> Self {
+        ExportUi {
+            job: None,
+            last_result: None,
+            quality: export::QualityPreset::High,
+            use_range: false,
+        }
+    }
+}
+
+/// The delivery figures, appended to the export's result line. Empty when the
+/// export had no audio — see `ExportStats::loudness`.
+///
+/// The dBTP figure carries a warning above -1.0: most delivery specs cap true
+/// peak at -1 dBTP, and a file over it is the kind of thing that comes back
+/// rejected after the fact. Stated rather than silently included, because the
+/// number alone means nothing to someone who hasn't memorised the spec.
+fn loudness_summary(stats: &export::ExportStats) -> String {
+    let Some(l) = stats.loudness else { return String::new() };
+    let warn = if l.true_peak_dbtp > -1.0 { "  (above the usual -1 dBTP delivery limit)" } else { "" };
+    format!(
+        " — {:.1} LUFS integrated, {:.1} dBTP true peak, {:.1} LU range{warn}",
+        l.integrated_lufs, l.true_peak_dbtp, l.loudness_range_lu
+    )
+}
+
+fn start_export(state: &mut EditorState, export: &mut ExportUi, transport: &mut Transport) {
+    if export.job.is_some() {
+        return; // already exporting
+    }
+    if state.sequence_duration_ticks() <= 0 {
+        state.status = "nothing to export — the timeline is empty".into();
+        return;
+    }
+    // Only honour the range when there actually is one; "export range" with no
+    // marks set should not silently export nothing.
+    let range_ticks = if export.use_range {
+        match state.marked_range() {
+            Some(r) => Some(r),
+            None => {
+                state.status = "no in/out range marked — set I and O first, or untick range".into();
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let default_name = state
+        .project_path
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .map(|s| format!("{}.mp4", s.to_string_lossy()))
+        .unwrap_or_else(|| "export.mp4".into());
+    let Some(output) = rfd::FileDialog::new()
+        .set_title("Export video")
+        .add_filter("MP4 video", &["mp4"])
+        .set_file_name(default_name)
+        .save_file()
+    else {
+        return;
+    };
+
+    // Playback and export both drive the same decoders; stopping playback
+    // first keeps the export from competing with it for decode throughput,
+    // and frees the audio device.
+    stop_playback(state, transport);
+    export.last_result = None;
+    export.job = Some(export_job::ExportJob::start(
+        state.project().clone(),
+        state.seq_id,
+        // Deliberately NOT proxy-resolved: export delivers from the originals.
+        // See `proxy_jobs`' module doc.
+        state.asset_paths.clone(),
+        output,
+        export::ExportOptions {
+            quality: export.quality,
+            range_ticks,
+            ..Default::default()
+        },
+    ));
+}
+
+/// Progress window while an export runs, plus a one-shot result line after.
+/// Shown as a real modal-ish window rather than a status string because an
+/// export takes long enough that "did I actually start it?" is a real
+/// question, and because it needs somewhere to put Cancel.
+fn export_ui(ctx: &egui::Context, export: &mut ExportUi) {
+    let mut finished = false;
+    if let Some(job) = &export.job {
+        if let Some(result) = job.take_result() {
+            export.last_result = Some(match result {
+                Ok(stats) if stats.frames_with_missing_sources > 0 => format!(
+                    "exported {} frames to {} — {} frame(s) had missing media and rendered as gaps{}",
+                    stats.frames_written,
+                    job.output.display(),
+                    stats.frames_with_missing_sources,
+                    loudness_summary(&stats)
+                ),
+                Ok(stats) => format!(
+                    "exported {} frames ({}x{}) to {}{}",
+                    stats.frames_written,
+                    stats.width,
+                    stats.height,
+                    job.output.display(),
+                    loudness_summary(&stats)
+                ),
+                Err(e) => format!("export failed: {e}"),
+            });
+            finished = true;
+        } else {
+            egui::Window::new("Exporting")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    match job.fraction() {
+                        Some(f) => {
+                            ui.add(egui::ProgressBar::new(f).show_percentage());
+                            ui.label(format!(
+                                "frame {} / {}",
+                                job.frames_done(),
+                                job.total_frames()
+                            ));
+                        }
+                        None => {
+                            ui.spinner();
+                            ui.label("preparing…");
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        job.request_cancel();
+                    }
+                });
+            // The worker thread doesn't wake the UI, so keep repainting
+            // while it runs or the progress bar would sit frozen until the
+            // user happened to move the mouse.
+            ctx.request_repaint();
+        }
+    }
+    if finished {
+        export.job = None;
+    }
+}
+
+fn open_project(state: &mut EditorState) {
+    if let Some(path) = rfd::FileDialog::new()
+        .set_title("Open project")
+        .add_filter("nle-engine project", &[PROJECT_EXTENSION])
+        .pick_file()
+    {
+        state.open_from(&path);
+    }
+}
+
+/// `force_dialog` is Save As; plain Save reuses the known path and only
+/// prompts when there isn't one yet.
+fn save_project(
+    state: &mut EditorState,
+    autosaver: &mut autosave::Autosave,
+    force_dialog: bool,
+) {
+    let existing = state.project_path.clone();
+    let path = match (&existing, force_dialog) {
+        (Some(p), false) => Some(p.clone()),
+        _ => rfd::FileDialog::new()
+            .set_title("Save project")
+            .add_filter("nle-engine project", &[PROJECT_EXTENSION])
+            .set_file_name(
+                existing
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("untitled.{PROJECT_EXTENSION}")),
+            )
+            .save_file(),
+    };
+    if let Some(path) = path {
+        state.save_to(&path);
+        // The user's own file now holds this work, so the recovery file would
+        // only produce a spurious "restore?" prompt on the next launch.
+        autosaver.discard(state.undo.revision() as usize);
+    }
+}
+
+fn build_ui(
+    ctx: &egui::Context,
+    state: &mut EditorState,
+    device: &wgpu::Device,
+    // Arc handles, kept separate from the deref'd `device: &wgpu::Device`
+    // above (which every existing rendering call site here already expects):
+    // starting playback needs to *own* a clone of each to hand to
+    // `SequenceVideoPlayback`'s decode thread, which a plain `&wgpu::Device`
+    // can't provide.
+    device_arc: &Arc<wgpu::Device>,
+    queue_arc: &Arc<wgpu::Queue>,
+    egui_renderer: &mut egui_wgpu::Renderer,
+    preview: &mut preview::Preview,
+    export: &mut ExportUi,
+    project_panel_state: &mut project_panel::ProjectPanelState,
+    effects_panel_state: &mut effects_panel::EffectsPanelState,
+    scopes_panel_state: &mut scopes_panel::ScopesPanelState,
+    transcript_panel_state: &mut transcript_panel::TranscriptPanelState,
+    waveforms: &mut waveform_cache::WaveformCache,
+    proxies: &mut proxy_jobs::ProxyJobs,
+    autosaver: &mut autosave::Autosave,
+    recovery_offer: &mut Option<std::path::PathBuf>,
+    transport: &mut Transport,
+) {
+    recovery_prompt(ctx, state, autosaver, recovery_offer);
+    egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Open...").clicked() {
+                    ui.close_menu();
+                    open_project(state);
+                }
+                if ui.button("Save").clicked() {
+                    ui.close_menu();
+                    save_project(state, autosaver, false);
+                }
+                if ui.button("Save As...").clicked() {
+                    ui.close_menu();
+                    save_project(state, autosaver, true);
+                }
+                ui.separator();
+                ui.label("Export quality:");
+                for preset in export::QualityPreset::ALL {
+                    ui.radio_value(&mut export.quality, preset, preset.label());
+                }
+                let has_range = state.marked_range().is_some();
+                ui.add_enabled(
+                    has_range,
+                    egui::Checkbox::new(&mut export.use_range, "Only the in/out range"),
+                )
+                .on_disabled_hover_text("mark in and out on the timeline first (I and O)");
+                if !has_range {
+                    // Otherwise an unticked-but-remembered range silently
+                    // becomes "whole sequence" with no explanation.
+                    export.use_range = false;
+                }
+                if ui
+                    .add_enabled(export.job.is_none(), egui::Button::new("Export Video..."))
+                    .clicked()
+                {
+                    ui.close_menu();
+                    start_export(state, export, transport);
+                }
+            });
+            ui.separator();
+            if ui
+                .button("Add Title")
+                .on_hover_text("insert a text title at the playhead on the topmost video track")
+                .clicked()
+            {
+                state.add_title_at_playhead(TimeTick(TIMEBASE * 3));
+            }
+            ui.separator();
+            if ui.button("Undo (Z)").clicked() {
+                state.undo.undo();
+            }
+            if ui.button("Redo (Y)").clicked() {
+                state.undo.redo();
+            }
+            ui.separator();
+            if ui
+                .button(if state.playing {
+                    "Pause (Space)"
+                } else {
+                    "Play (Space)"
+                })
+                .clicked()
+            {
+                if state.playing {
+                    stop_playback(state, transport);
+                } else {
+                    start_playback(state, transport, proxies, device_arc, queue_arc);
+                }
+            }
+            ui.separator();
+            ui.label(
+                state
+                    .project_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "untitled".into()),
+            );
+            if let Some(msg) = &export.last_result {
+                ui.separator();
+                let failed = msg.starts_with("export failed");
+                ui.colored_label(
+                    if failed {
+                        egui::Color32::LIGHT_RED
+                    } else {
+                        egui::Color32::LIGHT_GREEN
+                    },
+                    msg,
+                );
+            }
+        });
+    });
+
+    export_ui(ctx, export);
+
+    egui::SidePanel::left("project_panel")
+        .resizable(true)
+        .default_width(400.0)
+        .show(ctx, |ui| {
+            project_panel::show(ui, state, project_panel_state, proxies);
+        });
+
+    egui::SidePanel::right("effects")
+        .resizable(true)
+        .default_width(300.0)
+        .show(ctx, |ui| {
+            // Mixer above effects, collapsed by default: it only matters while
+            // you're listening, and strips are wide enough to crowd out the
+            // effect controls if it were always open.
+            egui::CollapsingHeader::new("Audio Mixer")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let snapshot = transport.audio.as_ref().and_then(|a| a.meters());
+                    mixer_panel::show(ui, state, snapshot.as_ref());
+                });
+            ui.separator();
+            // Above the effect list because a title's own text is what you
+            // came to the panel for; effects applied *to* the title are the
+            // secondary concern. Draws nothing when no title is selected.
+            title_panel::show(ui, state);
+            effects_panel::show(ui, state, effects_panel_state);
+            ui.separator();
+            transcript_panel::show(ui, state, transcript_panel_state);
+            ui.separator();
+            scopes_panel::show(ui, scopes_panel_state, preview, device, queue_arc);
+        });
+
+    egui::TopBottomPanel::bottom("timeline")
+        .resizable(true)
+        .default_height(320.0)
+        .show(ctx, |ui| {
+            egui::ScrollArea::both().show(ui, |ui| {
+                timeline_widget::show(ui, state, waveforms);
+            });
+        });
+
+    // Keep painting while waveforms are still being computed, so they appear
+    // as they finish rather than waiting for the next mouse move to trigger a
+    // frame.
+    if waveforms.is_busy() {
+        ctx.request_repaint();
+    }
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.heading("Preview");
+        let project = state.project().clone();
+        let seq_id = state.seq_id;
+        let playhead = state.display_tick();
+
+        // Playing: take whatever the decode-ahead thread has ready for the
+        // current clock position. Nothing due yet means hold the frame already
+        // on screen — never block the UI waiting for a decoder (spec 4.4).
+        // Stopped or scrubbing: decode this exact tick on demand.
+        let rendered = match transport.video.as_ref().filter(|_| state.playing) {
+            Some(video) => match video.frame_for(state.playhead) {
+                Some(frame) => {
+                    preview.render_prepared(device, egui_renderer, &project, seq_id, frame)
+                }
+                None => preview.current_texture(),
+            },
+            None => preview.render(
+                device,
+                egui_renderer,
+                &project,
+                seq_id,
+                playhead,
+                // Scrubbing benefits most of all from an all-intra proxy: no
+                // decoding forward from a distant keyframe on every jump.
+                &proxies.resolve(&state.asset_paths),
+            ),
+        };
+
+        if let Some((tex_id, w, h)) = rendered {
+            let avail = ui.available_size();
+            let aspect = w as f32 / h as f32;
+            let mut size = avail;
+            if size.x / size.y > aspect {
+                size.x = size.y * aspect;
+            } else {
+                size.y = size.x / aspect;
+            }
+            ui.centered_and_justified(|ui| {
+                ui.add(egui::Image::new((tex_id, size)));
+            });
+        } else {
+            ui.label("Nothing to preview yet — import media and add it to the timeline.");
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shuttle_engages_at_1x_then_doubles_and_clamps() {
+        // L from a standstill must be plain 1x play (the only rate with audio),
+        // not an immediate jump to a fast rate.
+        assert_eq!(next_shuttle_rate(0.0, true), 1.0);
+        assert_eq!(next_shuttle_rate(1.0, true), 2.0);
+        assert_eq!(next_shuttle_rate(2.0, true), 4.0);
+        assert_eq!(next_shuttle_rate(4.0, true), 8.0);
+        assert_eq!(next_shuttle_rate(8.0, true), MAX_SHUTTLE, "must clamp, not run away");
+    }
+
+    #[test]
+    fn shuttle_reverses_direction_at_1x_rather_than_stepping_down_through_speed() {
+        // Pressing J while running forward at 4x should give -1x, not 2x. This
+        // is the behaviour editors rely on to stop and back up in one keypress
+        // instead of four.
+        assert_eq!(next_shuttle_rate(4.0, false), -1.0);
+        assert_eq!(next_shuttle_rate(-1.0, false), -2.0);
+        assert_eq!(next_shuttle_rate(-4.0, true), 1.0);
+        assert_eq!(next_shuttle_rate(-8.0, false), -MAX_SHUTTLE);
+    }
+}
+
+/// Writes a recovery snapshot when one is due. Called once per frame.
+///
+/// Errors are surfaced in the status line rather than being retried in a tight
+/// loop: a full disk should say so once, not make the editor stutter.
+fn tick_autosave(state: &mut EditorState, autosaver: &mut autosave::Autosave) {
+    let revision = state.undo.revision() as usize;
+    if !autosaver.is_due(revision) {
+        return;
+    }
+    let path = autosave::Autosave::recovery_path_for(state.project_path.as_deref());
+    match state.write_snapshot_to(&path) {
+        Ok(()) => autosaver.mark_written(path, revision),
+        Err(e) => {
+            autosaver.mark_failed(e.clone());
+            state.status = format!("autosave failed: {e}");
+        }
+    }
+}
+
+/// One-time offer to restore a recovery file left by a previous session.
+///
+/// Modal-ish and blocking the choice rather than restoring automatically: the
+/// recovered state might be *worse* than the saved file (it captures whatever
+/// was on screen when the crash happened, mid-edit), so silently adopting it
+/// could destroy good work with bad.
+fn recovery_prompt(
+    ctx: &egui::Context,
+    state: &mut EditorState,
+    autosaver: &mut autosave::Autosave,
+    offer: &mut Option<std::path::PathBuf>,
+) {
+    let Some(path) = offer.clone() else { return };
+    egui::Window::new("Recover unsaved work?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label("The last session ended without saving. A recovery file was found:");
+            ui.weak(path.display().to_string());
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Recover").clicked() {
+                    if state.open_from(&path) {
+                        // Deliberately clear `project_path`: the recovered
+                        // project is not "saved at" the recovery file, and
+                        // leaving it set would make Ctrl+S overwrite the
+                        // recovery file instead of prompting for a real
+                        // destination.
+                        state.project_path = None;
+                        state.status =
+                            "recovered unsaved work — use Save As to write it somewhere".into();
+                    }
+                    // Either way the offer is spent, and the file has served
+                    // its purpose.
+                    let _ = std::fs::remove_file(&path);
+                    autosaver.discard(state.undo.revision() as usize);
+                    *offer = None;
+                }
+                if ui.button("Discard").clicked() {
+                    let _ = std::fs::remove_file(&path);
+                    *offer = None;
+                }
+            });
+        });
 }
