@@ -291,7 +291,9 @@ fn draw_and_interact_clip(
     }
 
     let body_id = egui::Id::new(("clip_body", clip.id.0));
-    let body_resp = ui.interact(body_rect, body_id, Sense::click_and_drag());
+    let body_resp = ui
+        .interact(body_rect, body_id, Sense::click_and_drag())
+        .on_hover_text("Right-click for transition options (cross dissolve, wipe, slide...)");
     if body_resp.clicked() {
         // Ctrl/Cmd-click extends the selection; a plain click replaces it.
         // Matches every NLE, and matters because the delete/copy shortcuts now
