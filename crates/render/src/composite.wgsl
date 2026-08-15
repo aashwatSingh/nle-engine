@@ -424,7 +424,14 @@ struct ChromaKeyUniforms {
     similarity: f32,
     smoothness: f32,
     spill_suppression: f32,
-    _pad: f32,
+    // Same code `fs_prepare` used to bring this clip's source into linear
+    // working space. `key_color` is picked from the encoded preview (the
+    // eyedropper samples gamma-encoded pixels), but `src` below is already
+    // linear by the time it reaches this pass — comparing one against the
+    // other unconverted silently mis-measures chroma distance for any key
+    // color that isn't a fixed point of the transfer curve (0 or 1 per
+    // channel). See `key_color_linear` below.
+    transfer_code: u32,
 };
 
 @group(0) @binding(0) var<uniform> ck_u: ChromaKeyUniforms;
@@ -462,7 +469,12 @@ fn despill(rgb: vec3<f32>, key: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_chroma_key(in: FullscreenVertexOut) -> @location(0) vec4<f32> {
     let src = textureSample(t_ck_src, s_ck_src, in.uv);
-    let dist = distance(chroma_uv(src.rgb), chroma_uv(ck_u.key_color.rgb));
+    // `src.rgb` arrived through `fs_prepare` and is already linear;
+    // `key_color` is a raw, still gamma-encoded pixel value until converted
+    // here — comparing it unconverted against `src` would compare two
+    // different color spaces.
+    let key_color_linear = to_linear(ck_u.key_color.rgb, ck_u.transfer_code);
+    let dist = distance(chroma_uv(src.rgb), chroma_uv(key_color_linear));
 
     // 0 (fully keyed) inside the similarity radius, ramping to 1 (fully
     // opaque) over the next `smoothness` of distance beyond it.
@@ -479,7 +491,7 @@ fn fs_chroma_key(in: FullscreenVertexOut) -> @location(0) vec4<f32> {
     // actually elevated above the other two, spilled or not.
     var rgb = src.rgb;
     if (ck_u.spill_suppression > 0.0) {
-        rgb = mix(rgb, despill(rgb, ck_u.key_color.rgb), ck_u.spill_suppression * alpha);
+        rgb = mix(rgb, despill(rgb, key_color_linear), ck_u.spill_suppression * alpha);
     }
 
     return vec4<f32>(rgb, src.a * alpha);

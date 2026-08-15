@@ -168,7 +168,10 @@ struct ChromaKeyUniforms {
     similarity: f32,
     smoothness: f32,
     spill_suppression: f32,
-    _pad: f32,
+    /// Same code passed to `fs_prepare` for this clip — `key_color` is
+    /// still gamma-encoded and needs the same conversion `src` already went
+    /// through before the two can be compared.
+    transfer_code: u32,
 }
 
 /// A decoded source frame living on the GPU.
@@ -1086,7 +1089,7 @@ impl Compositor {
                     similarity: pass.number(chroma_key::SIMILARITY).unwrap_or(0.2) as f32,
                     smoothness: pass.number(chroma_key::SMOOTHNESS).unwrap_or(0.1) as f32,
                     spill_suppression: pass.number(chroma_key::SPILL_SUPPRESSION).unwrap_or(0.5) as f32,
-                    _pad: 0.0,
+                    transfer_code: color::shader_transfer_code(color_meta.transfer),
                 };
                 self.run_single_uniform_pass(
                     &self.chroma_key_pipeline,

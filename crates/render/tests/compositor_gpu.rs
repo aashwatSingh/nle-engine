@@ -804,6 +804,38 @@ fn alpha_ramps_monotonically_with_distance_from_the_key_colour() {
 }
 
 #[test]
+fn a_key_colour_picked_from_real_footage_keys_out_the_pixel_it_was_picked_from() {
+    // `GREEN` above ([0,1,0,1]) is a fixed point of the transfer curve (0
+    // stays 0, 1 stays 1), so it can't tell a correct linear-space
+    // comparison from a buggy encoded-vs-linear one — both give the same
+    // answer. A real eyedropper pick off actual green-screen footage looks
+    // nothing like that: a genuine mid-tone value in every channel. Picking
+    // the key colour directly from a pixel and keying that same pixel must
+    // key it out completely (distance 0, by construction) regardless of
+    // which colour space the comparison happens in — if it doesn't, the two
+    // sides of the comparison are in different spaces.
+    let mid_tone_green_8bit = [51u8, 199, 61, 255];
+    let key_as_float = [
+        mid_tone_green_8bit[0] as f32 / 255.0,
+        mid_tone_green_8bit[1] as f32 / 255.0,
+        mid_tone_green_8bit[2] as f32 / 255.0,
+        1.0,
+    ];
+    let comp = compositor();
+    let mut sources = SourceFrames::default();
+    sources.insert(MediaAssetId(1), 0, comp.upload_rgba(&solid(SEQ_W, SEQ_H, mid_tone_green_8bit), SEQ_W, SEQ_H, rec709()));
+    let mut c = clip(1, 1, 0, 100);
+    // Tight enough that any conversion-mismatch distance (which is large,
+    // not a rounding error — the two colour spaces disagree by a lot for a
+    // mid-tone value) shows up as visibly non-zero alpha rather than being
+    // swallowed by the smoothness ramp.
+    c.effects = vec![chroma_key_fx(key_as_float, 0.001, 0.0001, 0.0)];
+    let p = project_with(vec![video_track(1, vec![c])]);
+    let px = render(&comp, &p, &sources).0.pixel(SEQ_W / 2, SEQ_H / 2);
+    assert_eq!(px[3], 0, "a pixel keyed against its own exact colour must key out fully, got alpha {}", px[3]);
+}
+
+#[test]
 fn spill_suppression_pulls_the_key_channel_down_toward_the_other_two() {
     // A pixel with a green cast (spill from a green screen reflecting onto
     // the subject) but far enough from the key colour overall to stay

@@ -218,6 +218,11 @@ fn ripple_shift(seq: &mut Sequence, source_track: TrackId, at_or_after: TimeTick
         return Ok(());
     }
     let sync_lock_active = find_track(seq, source_track).map(|t| t.sync_locked).unwrap_or(false);
+    for track in seq.tracks.iter() {
+        if (track.id == source_track || (sync_lock_active && track.sync_locked)) && track.locked {
+            return Err(EditError::TrackLocked(track.id));
+        }
+    }
     for track in seq.tracks.iter_mut() {
         if track.id == source_track || (sync_lock_active && track.sync_locked) {
             if delta < 0 {
@@ -832,6 +837,35 @@ mod tests {
         // other tracks — documented, not a bug.
         assert_eq!(p2.sequences[0].tracks[1].clips[0].timeline_in.0, 0);
         assert_no_overlaps(&p2);
+    }
+
+    #[test]
+    fn insert_refuses_to_ripple_a_locked_sync_locked_sibling_track() {
+        let p = project_with(vec![
+            track(1, TrackKind::Video, vec![clip(1, 0, 50)]),
+            Track {
+                id: TrackId(2),
+                kind: TrackKind::Audio,
+                name: "A1".into(),
+                clips: vec![clip(2, 60, 160)],
+                transitions: vec![],
+                gain_db: crate::model::unity_gain(),
+                pan: 0.0,
+                locked: true,
+                sync_locked: true,
+                muted: false,
+                solo: false,
+                height_px: 60,
+            },
+        ]);
+        // Track 1 (the insert's own target) is unlocked, so this isn't
+        // caught by the ordinary "is the target track locked" check every
+        // other op already has. Track 2 is sync-locked (so its clip at
+        // [60,160) would ordinarily ripple to [80,180)) but is *also*
+        // individually locked — locking it must mean its clips genuinely
+        // don't move, not just that direct edits to it are refused.
+        let result = apply(&p, &EditOp::Insert { track: TrackId(1), at: TimeTick(50), clip: clip(3, 0, 20), split_clip_id: None });
+        assert_eq!(result, Err(EditError::TrackLocked(TrackId(2))));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! kind of edit; the rest is real, separate follow-up work.
 
 use crate::state::EditorState;
-use timeline::ClipSource;
+use timeline::{ClipInstanceId, ClipSource};
 
 pub struct TranscriptPanelState {
     /// The word index a click or drag-select started from. `None` means
@@ -20,11 +20,28 @@ pub struct TranscriptPanelState {
     /// doesn't matter between them, `show` sorts on each use.
     anchor: Option<usize>,
     end: Option<usize>,
+    /// Which clip `anchor`/`end` are indices into. Word indices only mean
+    /// something relative to one clip's own transcript — without tracking
+    /// this, selecting a range here then clicking a *different* clip would
+    /// silently keep the stale indices, and "Delete" would act on the new
+    /// clip using the old clip's selection.
+    selected_clip: Option<ClipInstanceId>,
 }
 
 impl Default for TranscriptPanelState {
     fn default() -> Self {
-        TranscriptPanelState { anchor: None, end: None }
+        TranscriptPanelState { anchor: None, end: None, selected_clip: None }
+    }
+}
+
+/// Clears the word selection whenever the panel is about to show a
+/// different clip than the one the selection was made against. Kept free
+/// of `egui::Ui` so it's testable without a GUI harness.
+fn sync_selected_clip(panel: &mut TranscriptPanelState, clip_id: ClipInstanceId) {
+    if panel.selected_clip != Some(clip_id) {
+        panel.anchor = None;
+        panel.end = None;
+        panel.selected_clip = Some(clip_id);
     }
 }
 
@@ -42,6 +59,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut TranscriptPa
         // actions are gated the same way.
         return;
     }
+    sync_selected_clip(panel, clip_id);
 
     ui.horizontal(|ui| {
         if ui
@@ -121,5 +139,36 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut TranscriptPa
                 panel.end = None;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_selected_clip_keeps_the_selection_for_the_same_clip() {
+        let mut panel = TranscriptPanelState { anchor: Some(2), end: Some(5), selected_clip: Some(ClipInstanceId(1)) };
+        sync_selected_clip(&mut panel, ClipInstanceId(1));
+        assert_eq!(panel.anchor, Some(2));
+        assert_eq!(panel.end, Some(5));
+    }
+
+    #[test]
+    fn sync_selected_clip_clears_the_selection_when_the_clip_changes() {
+        let mut panel = TranscriptPanelState { anchor: Some(2), end: Some(5), selected_clip: Some(ClipInstanceId(1)) };
+        sync_selected_clip(&mut panel, ClipInstanceId(2));
+        assert_eq!(panel.anchor, None, "a selection made on clip 1 must not carry over to clip 2");
+        assert_eq!(panel.end, None);
+        assert_eq!(panel.selected_clip, Some(ClipInstanceId(2)));
+    }
+
+    #[test]
+    fn sync_selected_clip_leaves_no_selection_alone_on_first_use() {
+        let mut panel = TranscriptPanelState::default();
+        sync_selected_clip(&mut panel, ClipInstanceId(1));
+        assert_eq!(panel.anchor, None);
+        assert_eq!(panel.end, None);
+        assert_eq!(panel.selected_clip, Some(ClipInstanceId(1)));
     }
 }

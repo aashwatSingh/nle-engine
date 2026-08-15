@@ -1288,6 +1288,14 @@ impl EditorState {
     /// were placed.
     pub fn generate_captions(&mut self, clip_id: ClipInstanceId) -> usize {
         let Some((_, clip)) = self.find_clip(clip_id) else { return 0 };
+        // Checked before transcribing (not just before placing captions):
+        // this method also caches the transcript into `self.transcripts`
+        // for the transcript panel, and doing that ahead of this guard used
+        // to let a refused (keyframed-speed) attempt silently overwrite a
+        // real, previously-stored transcript for the same clip with an
+        // empty one — see
+        // `generate_captions_on_a_keyframed_clip_does_not_clobber_an_existing_transcript`.
+        let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return 0 };
         let Some((mono, sample_rate)) = self.decode_clip_mono_audio(&clip) else { return 0 };
 
         let transcript = match speech::transcribe(&mono, 1, sample_rate, &speech::WhisperConfig::default()) {
@@ -1313,7 +1321,6 @@ impl EditorState {
         // together on one track, not scattered across several.
         let source_span_start = transcript.segments[0].start_ms as f64 / 1000.0;
         let source_span_end = transcript.segments.last().unwrap().end_ms as f64 / 1000.0;
-        let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return 0 };
         let to_timeline_tick = |source_seconds: f64| -> i64 {
             let source_offset = (source_seconds * TIMEBASE as f64).round() as i64;
             clip.timeline_in.0 + source_offset * denominator / numerator
@@ -2243,6 +2250,11 @@ impl EditorState {
         let base_dir = path.parent();
         let mut missing = 0;
         self.asset_paths.clear();
+        // A freshly loaded project's clip ids restart from a low number
+        // (see `next_id` below), so a transcript cached against the
+        // previous project's clip ids could otherwise silently attach
+        // itself to an unrelated clip that happens to reuse the same id.
+        self.transcripts.clear();
         for r in &doc.media_references {
             let candidate = base_dir
                 .map(|d| d.join(&r.relative_path))
@@ -2872,6 +2884,29 @@ mod tests {
         let mut fresh = EditorState::new();
         assert!(fresh.open_from(&path));
         assert_eq!(**fresh.project(), before);
+    }
+
+    #[test]
+    fn open_from_clears_stale_transcripts_from_the_previous_project() {
+        // A freshly loaded project's clip ids restart from a low number
+        // (see `loading_advances_next_id_past_every_existing_id`'s sibling
+        // guarantee below), so they can easily collide with ids left over
+        // from whatever project was open before. A leftover transcript
+        // entry surviving that switch would silently attach itself to an
+        // unrelated clip in the new project — wrong words shown, and
+        // `delete_word_range` ripple-deleting footage based on stale ticks.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.nleproj");
+        state_with_high_ids().save_to(&path);
+
+        let mut fresh = EditorState::new();
+        fresh.transcripts.insert(
+            ClipInstanceId(900),
+            vec![TimelineWord { text: "stale".into(), start_tick: 0, end_tick: TIMEBASE }],
+        );
+        assert!(fresh.open_from(&path));
+
+        assert!(fresh.transcripts.is_empty(), "transcripts from the previous project must not survive open_from");
     }
 
     #[test]
@@ -3826,6 +3861,82 @@ mod tests {
         for w in sorted.windows(2) {
             assert!(w[0].1 <= w[1].0, "captions must not overlap: {sorted:?}");
         }
+    }
+
+    /// Regression guard for a real bug: `generate_captions` used to write
+    /// into `self.transcripts` *before* checking the clip's speed curve.
+    /// Run it on a keyframed-speed clip that already had a real transcript
+    /// (from an earlier `transcribe_clip` call via the transcript panel),
+    /// and the correct refusal (0 captions, keyframed speed isn't
+    /// supported) had the side effect of overwriting that real transcript
+    /// with an empty one — silent data loss while reporting nothing
+    /// happened. Real footage + real Whisper, so the bug is only reachable
+    /// once transcription actually succeeds and reaches the speed check.
+    #[test]
+    #[ignore]
+    fn generate_captions_on_a_keyframed_clip_does_not_clobber_an_existing_transcript() {
+        let path = match std::env::var("NLE_REAL_FOOTAGE_PATH") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => panic!(
+                "set NLE_REAL_FOOTAGE_PATH to a real video file and run with --ignored to use this test"
+            ),
+        };
+        let config = speech::WhisperConfig::default();
+        if !config.cli_path.is_file() || !config.model_path.is_file() {
+            panic!("whisper-cli or the model isn't installed — see docs/decisions-log.md's speech entry");
+        }
+        media_ffmpeg::init().unwrap();
+        let asset = media_ffmpeg::probe(&path).expect("real footage failed to probe");
+        assert!(asset.audio.is_some(), "this test needs footage with an audio track");
+        let video = asset.video.as_ref().expect("expected a video stream");
+        let duration = asset.duration_ticks.min(TIMEBASE * 15);
+
+        let mut state = EditorState::new();
+        state.asset_paths.insert(asset.id, path);
+        let mut project = (**state.project()).clone();
+        project.sequences[0].settings.width = video.width;
+        project.sequences[0].settings.height = video.height;
+        project.assets.push(asset.clone());
+        project.sequences[0].tracks.push(Track {
+            id: TrackId(1),
+            kind: TrackKind::Video,
+            name: "V1".into(),
+            clips: vec![ClipInstance {
+                id: ClipInstanceId(1),
+                source: ClipSource::Media(asset.id),
+                source_in: TimeTick(0),
+                source_out: TimeTick(duration),
+                timeline_in: TimeTick(0),
+                timeline_out: TimeTick(duration),
+                speed: SpeedCurve::Keyframed(timeline::ParamTrack::constant(ParamValue::Number(1.0))),
+                effects: vec![],
+                audio_gain_db: timeline::ParamTrack::constant(ParamValue::Number(0.0)),
+                audio_pan: timeline::ParamTrack::constant(ParamValue::Number(0.0)),
+                linked_group: None,
+            }],
+            transitions: vec![],
+            gain_db: timeline::unity_gain(),
+            pan: 0.0,
+            locked: false,
+            sync_locked: true,
+            muted: false,
+            solo: false,
+            height_px: 60,
+        });
+        state.undo = command::UndoStack::new(std::sync::Arc::new(project), command::UndoStack::DEFAULT_MAX_HISTORY);
+        state.next_id = 1000;
+
+        let real_transcript = vec![TimelineWord { text: "hello".into(), start_tick: 0, end_tick: TIMEBASE / 2 }];
+        state.transcripts.insert(ClipInstanceId(1), real_transcript.clone());
+
+        let added = state.generate_captions(ClipInstanceId(1));
+
+        assert_eq!(added, 0, "keyframed-speed clips aren't supported yet, so no captions should be created");
+        assert_eq!(
+            state.transcripts.get(&ClipInstanceId(1)),
+            Some(&real_transcript),
+            "the real transcript from the earlier transcribe_clip call must survive the refused caption attempt"
+        );
     }
 
     // ---- Transcript panel: word mapping and range deletion --------------

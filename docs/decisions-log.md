@@ -896,3 +896,87 @@ the debounce window, which debounce alone can't collapse) did the mutation
 get caught. And a warp-stabilizer sign-convention bug (`estimate_translation`
 returning the negated correct answer) was caught immediately by the
 recovers-a-known-shift test, not by staring at the algebra.
+
+## 2026-08-15 — Full codebase audit, and the first commit in a week
+
+Requested review: "check for bugs in the entire codebase and make sure its
+organized." Dispatched eight parallel reviews, one per crate group
+(`state.rs`; the UI panel layer; `render`; `audio`+`audio_source`;
+`timeline`; `media`+`media_ffmpeg`; `playback`+the spike/demo binaries;
+`project`+`command`+`export`+`speech`), cross-checked against a direct grep
+pass (zero `unsafe` anywhere in 26k lines, four total `TODO`s, no leftover
+debug prints in production code). 21 correctness bugs found, 14 organization
+items. Full findings recorded as an artifact rather than duplicated here in
+full; the four critical ones and their fixes are below.
+
+**The organization finding that mattered most wasn't a code issue**: the
+last git commit before this was 2026-08-07 — every feature built since
+(the entire desktop editor app, undo/redo, export, and the whole
+CapCut/Premiere batch from the entry above) had been sitting uncommitted for
+a week with no version history. Committed it as one checkpoint rather than
+trying to reconstruct artificial incremental history after the fact —
+`state.rs` alone depends on nearly every crate added that week at once, so
+there's no clean midpoint that both compiles and passes tests. Excluded
+`dist/` (159MB of build output, now gitignored) and a stray, non-symlinked
+`%SystemDrive%/ProgramData/...` junk directory found at the repo root
+(flagged, not investigated further — wasn't created this session).
+
+**Four critical bugs fixed, each with a test that failed against the old
+code before it failed against the new one:**
+
+- **Locking a track didn't actually protect it** (`timeline::edit_ops::
+  ripple_shift`). Every caller checked whether the *target* track of an edit
+  was locked before proceeding, but a sync-locked *sibling* track swept into
+  the same ripple was never checked — so locking a track stopped direct
+  edits to it but not edits rippling through it via a sync-locked neighbor.
+  Fixed by checking every track the ripple is about to touch, not just the
+  one it was explicitly aimed at, and refusing the whole operation
+  (`EditError::TrackLocked`) rather than silently skipping the locked
+  sibling — consistent with this function's own stated philosophy of
+  rejecting rather than producing a silently-corrupt result.
+- **The transcript cache could leak across projects** (`EditorState::
+  open_from`). Never cleared `self.transcripts`, and a freshly loaded
+  project's clip ids restart from a low number — easy to collide with ids
+  left over from whatever was open before. Now cleared alongside
+  `asset_paths` on every open.
+- **The transcript panel's word selection didn't reset on clip switch**
+  (`transcript_panel.rs`). Select a range in one clip's transcript, click a
+  different clip, and "Delete" would act on the new clip using the old
+  clip's word indices. Extracted the reset logic into a small
+  `egui`-independent function (`sync_selected_clip`) specifically so it
+  could be unit tested without a GUI harness, and added a
+  `selected_clip: Option<ClipInstanceId>` field to know when to fire it.
+- **Chroma key compared linear-light pixels against a gamma-encoded key
+  color** (`composite.wgsl`'s `fs_chroma_key`). The source pixel is
+  converted to linear light by `fs_prepare` earlier in the pipeline, but the
+  eyedropper-picked key color never went through the same conversion before
+  being compared against it. Invisible in the existing tests because pure
+  primaries (`[0,1,0,1]`) are fixed points of the transfer curve — 0 stays 0,
+  1 stays 1 either way. The regression test instead picks a genuine
+  mid-tone green, uses it as its own key color, and asserts the pixel keys
+  out completely (distance must be exactly 0 by construction) — which failed
+  outright (alpha 255 instead of 0) against the old code. Fixed by adding
+  `transfer_code` to `ChromaKeyUniforms` (reusing the struct's existing
+  padding slot, so its size is unchanged) and running the key color through
+  `to_linear` before every comparison, including inside `despill`.
+
+Also fixed **`generate_captions` clobbering an existing transcript**
+(`state.rs`): it wrote into `self.transcripts` *before* checking the clip's
+speed curve was `Constant`, so running it on a keyframed-speed clip that
+already had a real transcript from an earlier `transcribe_clip` call
+correctly refused to create captions but, as a side effect, silently
+overwrote that real transcript with an empty one. Moved the speed check to
+the top of the function, before any transcription work starts — this was
+flagged as "high confidence" rather than "critical" by the review since it
+needs a keyframed clip specifically, but it's the same shape of bug as the
+transcript-cache one above, so it's grouped with the critical fixes here.
+Verified with a real-footage `#[ignore]`d test (the bug only manifests once
+transcription actually succeeds and reaches the speed check) — ran in under
+9 seconds via `cargo test` directly, confirming the earlier live-app
+20-minute "freeze" while testing the transcript panel was unrelated decode
+slowness from the computer-use environment's own rendering overhead, not
+this bug or the analysis pipeline itself.
+
+Remaining findings (17 more correctness bugs across severity levels, 14
+organization items including splitting `state.rs`'s 5,391 lines by feature
+area) are tracked for follow-up, not fixed in this pass.
