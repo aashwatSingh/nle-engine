@@ -15,6 +15,7 @@ mod effects_panel;
 mod export_job;
 mod home_screen;
 mod icons;
+mod matting_jobs;
 mod mixer_panel;
 mod proxy_jobs;
 mod preview;
@@ -122,6 +123,7 @@ fn main() {
     let mut transcript_panel_state = transcript_panel::TranscriptPanelState::default();
     let mut waveforms = waveform_cache::WaveformCache::default();
     let mut proxies = proxy_jobs::ProxyJobs::default();
+    let mut matting_jobs = matting_jobs::MattingJobs::default();
     let mut autosaver = autosave::Autosave::default();
     // Offered once, at startup, if the last session left a recovery file behind.
     let mut recovery_offer = autosave::Autosave::find_recovery(None);
@@ -170,6 +172,7 @@ fn main() {
                                 &mut state,
                                 &mut transport,
                                 &proxies,
+                                &matting_jobs,
                                 &device,
                                 &queue,
                                 &key.logical_key,
@@ -187,6 +190,7 @@ fn main() {
                         // Same requirement as waveforms: without this, finished
                         // proxies sit on the channel and are never adopted.
                         proxies.poll();
+                        matting_jobs.poll();
 
                         let raw_input = egui_winit_state.take_egui_input(&window);
                         let full_output = egui_ctx.run(raw_input, |ctx| {
@@ -205,6 +209,7 @@ fn main() {
                                 &mut transcript_panel_state,
                                 &mut waveforms,
                                 &mut proxies,
+                                &mut matting_jobs,
                                 &mut autosaver,
                                 &mut recovery_offer,
                                 &mut transport,
@@ -333,15 +338,19 @@ fn start_playback(
     state: &mut EditorState,
     transport: &mut Transport,
     proxies: &proxy_jobs::ProxyJobs,
+    matting_jobs: &matting_jobs::MattingJobs,
     device: &Arc<wgpu::Device>,
     queue: &Arc<wgpu::Queue>,
 ) {
     state.playing = true;
     state.shuttle_rate = 1.0;
     let project = state.project().clone();
-    // Playback reads proxies when they're enabled and built; export never does
-    // (see `proxy_jobs`' module doc).
-    let paths = proxies.resolve(&state.asset_paths);
+    // Playback reads proxies when they're enabled and built; export never
+    // reads proxies (see `proxy_jobs`' module doc) but *does* read matting —
+    // background removal is a deliberate edit the user wants delivered, not
+    // a performance shortcut like a proxy. Matting is applied after proxy
+    // resolution so it wins for any asset it has ready.
+    let paths = matting_jobs.resolve(&proxies.resolve(&state.asset_paths));
 
     // Audio first: video needs a handle to whatever clock ends up authoritative.
     let audio = match playback::SequenceAudioEngine::start(
@@ -500,12 +509,13 @@ fn set_shuttle(
     state: &mut EditorState,
     transport: &mut Transport,
     proxies: &proxy_jobs::ProxyJobs,
+    matting_jobs: &matting_jobs::MattingJobs,
     device: &Arc<wgpu::Device>,
     queue: &Arc<wgpu::Queue>,
     rate: f64,
 ) {
     if rate == 1.0 {
-        start_playback(state, transport, proxies, device, queue);
+        start_playback(state, transport, proxies, matting_jobs, device, queue);
         return;
     }
     // Tear down the A/V engines first — `stop_playback` also zeroes the rate,
@@ -539,12 +549,13 @@ fn step_frames(
     state: &mut EditorState,
     transport: &mut Transport,
     proxies: &proxy_jobs::ProxyJobs,
+    matting_jobs: &matting_jobs::MattingJobs,
     device: &Arc<wgpu::Device>,
     queue: &Arc<wgpu::Queue>,
     frames: i64,
 ) {
     if state.playing || state.shuttle_rate != 0.0 {
-        set_shuttle(state, transport, proxies, device, queue, 0.0);
+        set_shuttle(state, transport, proxies, matting_jobs, device, queue, 0.0);
     }
     let delta = frames * ticks_per_frame(state);
     let end = state.sequence_duration_ticks();
@@ -570,6 +581,7 @@ fn handle_shortcut(
     state: &mut EditorState,
     transport: &mut Transport,
     proxies: &proxy_jobs::ProxyJobs,
+    matting_jobs: &matting_jobs::MattingJobs,
     device: &Arc<wgpu::Device>,
     queue: &Arc<wgpu::Queue>,
     key: &Key,
@@ -587,48 +599,48 @@ fn handle_shortcut(
     match key {
         Key::Named(NamedKey::Space) if !navigation_only => {
             if state.playing || state.shuttle_rate != 0.0 {
-                set_shuttle(state, transport, proxies, device, queue, 0.0);
+                set_shuttle(state, transport, proxies, matting_jobs, device, queue, 0.0);
             } else {
-                set_shuttle(state, transport, proxies, device, queue, 1.0);
+                set_shuttle(state, transport, proxies, matting_jobs, device, queue, 1.0);
             }
         }
 
         // --- JKL shuttle ---
         Key::Character(c) if c.eq_ignore_ascii_case("l") && !navigation_only => {
             let rate = next_shuttle_rate(state.shuttle_rate, true);
-            set_shuttle(state, transport, proxies, device, queue, rate);
+            set_shuttle(state, transport, proxies, matting_jobs, device, queue, rate);
         }
         Key::Character(c) if c.eq_ignore_ascii_case("j") && !navigation_only => {
             let rate = next_shuttle_rate(state.shuttle_rate, false);
-            set_shuttle(state, transport, proxies, device, queue, rate);
+            set_shuttle(state, transport, proxies, matting_jobs, device, queue, rate);
         }
         Key::Character(c) if c.eq_ignore_ascii_case("k") && !navigation_only => {
-            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            set_shuttle(state, transport, proxies, matting_jobs, device, queue, 0.0);
         }
 
         // --- Navigation (repeat allowed) ---
         Key::Named(NamedKey::ArrowLeft) => {
-            step_frames(state, transport, proxies, device, queue, if shift { -5 } else { -1 })
+            step_frames(state, transport, proxies, matting_jobs, device, queue, if shift { -5 } else { -1 })
         }
         Key::Named(NamedKey::ArrowRight) => {
-            step_frames(state, transport, proxies, device, queue, if shift { 5 } else { 1 })
+            step_frames(state, transport, proxies, matting_jobs, device, queue, if shift { 5 } else { 1 })
         }
         Key::Named(NamedKey::Home) if !navigation_only => {
-            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            set_shuttle(state, transport, proxies, matting_jobs, device, queue, 0.0);
             state.playhead = 0;
         }
         Key::Named(NamedKey::End) if !navigation_only => {
-            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            set_shuttle(state, transport, proxies, matting_jobs, device, queue, 0.0);
             state.playhead = state.sequence_duration_ticks();
         }
         Key::Named(NamedKey::ArrowUp) => {
-            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            set_shuttle(state, transport, proxies, matting_jobs, device, queue, 0.0);
             if let Some(p) = edit_points(state).into_iter().rev().find(|p| *p < state.playhead) {
                 state.playhead = p;
             }
         }
         Key::Named(NamedKey::ArrowDown) => {
-            set_shuttle(state, transport, proxies, device, queue, 0.0);
+            set_shuttle(state, transport, proxies, matting_jobs, device, queue, 0.0);
             if let Some(p) = edit_points(state).into_iter().find(|p| *p > state.playhead) {
                 state.playhead = p;
             }
@@ -738,7 +750,7 @@ fn loudness_summary(stats: &export::ExportStats) -> String {
     )
 }
 
-fn start_export(state: &mut EditorState, export: &mut ExportUi, transport: &mut Transport) {
+fn start_export(state: &mut EditorState, export: &mut ExportUi, transport: &mut Transport, matting_jobs: &matting_jobs::MattingJobs) {
     if export.job.is_some() {
         return; // already exporting
     }
@@ -783,8 +795,10 @@ fn start_export(state: &mut EditorState, export: &mut ExportUi, transport: &mut 
         state.project().clone(),
         state.seq_id,
         // Deliberately NOT proxy-resolved: export delivers from the originals.
-        // See `proxy_jobs`' module doc.
-        state.asset_paths.clone(),
+        // See `proxy_jobs`' module doc. Matting *is* applied here, unlike
+        // proxying — background removal is the user's actual edit, not a
+        // performance shortcut, so it belongs in the delivered file.
+        matting_jobs.resolve(&state.asset_paths),
         output,
         export::ExportOptions {
             quality: export.quality,
@@ -933,6 +947,7 @@ fn build_ui(
     transcript_panel_state: &mut transcript_panel::TranscriptPanelState,
     waveforms: &mut waveform_cache::WaveformCache,
     proxies: &mut proxy_jobs::ProxyJobs,
+    matting_jobs: &mut matting_jobs::MattingJobs,
     autosaver: &mut autosave::Autosave,
     recovery_offer: &mut Option<std::path::PathBuf>,
     transport: &mut Transport,
@@ -1005,7 +1020,7 @@ fn build_ui(
                     .clicked()
                 {
                     ui.close_menu();
-                    start_export(state, export, transport);
+                    start_export(state, export, transport, matting_jobs);
                 }
             });
             ui.separator();
@@ -1029,7 +1044,7 @@ fn build_ui(
                 if state.playing {
                     stop_playback(state, transport);
                 } else {
-                    start_playback(state, transport, proxies, device_arc, queue_arc);
+                    start_playback(state, transport, proxies, matting_jobs, device_arc, queue_arc);
                 }
             }
             ui.separator();
@@ -1083,7 +1098,7 @@ fn build_ui(
             // came to the panel for; effects applied *to* the title are the
             // secondary concern. Draws nothing when no title is selected.
             title_panel::show(ui, state);
-            effects_panel::show(ui, state, effects_panel_state);
+            effects_panel::show(ui, state, effects_panel_state, matting_jobs);
             ui.separator();
             transcript_panel::show(ui, state, transcript_panel_state);
             ui.separator();
@@ -1131,7 +1146,7 @@ fn build_ui(
                 playhead,
                 // Scrubbing benefits most of all from an all-intra proxy: no
                 // decoding forward from a distant keyframe on every jump.
-                &proxies.resolve(&state.asset_paths),
+                &matting_jobs.resolve(&proxies.resolve(&state.asset_paths)),
             ),
         };
 

@@ -1,0 +1,25 @@
+[package]
+name = "matting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# AI background removal: Robust Video Matting (RVM) run locally via ONNX
+# Runtime, chosen over a cloud API to keep the whole project's local-first
+# pattern (see the `speech` crate's own whisper.cpp choice for the same
+# reasoning). `ort` downloads a prebuilt ONNX Runtime binary at build time —
+# unlike the whisper-rs FFI detour documented in docs/decisions-log.md, this
+# is a binary fetch, not a from-source CMake build, so that specific class of
+# toolchain failure shouldn't repeat here.
+[dependencies]
+# `load-dynamic`, not the default linking behavior: `ort-sys`'s own prebuilt-
+# binary fetch has no x86_64-pc-windows-gnu build (this whole project uses
+# the GNU/MinGW toolchain, same reason FFmpeg linking needed its own
+# workarounds — see docs/decisions-log.md). `load-dynamic` instead loads
+# onnxruntime.dll at *runtime* via LoadLibrary, driven by ORT_DYLIB_PATH —
+# no build-time linking against a target-specific import lib at all, so the
+# GNU/MSVC ABI mismatch that sank whisper-rs's from-source build doesn't
+# apply here: this is a plain C-API DLL, not something being compiled.
+ort = { version = "2.0.0-rc.9", features = ["load-dynamic"] }
+
+[dev-dependencies]

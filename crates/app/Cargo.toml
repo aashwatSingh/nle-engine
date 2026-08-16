@@ -16,6 +16,7 @@ render = { workspace = true }
 audio = { workspace = true }
 audio_source = { workspace = true }
 speech = { workspace = true }
+matting = { path = "../matting" }
 project = { workspace = true }
 command = { workspace = true }
 export = { path = "../export" }

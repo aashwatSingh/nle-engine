@@ -12,11 +12,13 @@ use std::path::Path;
 
 pub mod audio_peaks;
 pub mod audio_stream;
+pub mod matte_video;
 pub mod proxy;
 pub mod source_reader;
 pub mod stream_decoder;
 pub use audio_peaks::{generate_audio_peaks, AudioPeaks};
 pub use audio_stream::{AudioChunk, AudioDecoderStream};
+pub use matte_video::{generate_matte_video, MatteVideoOptions};
 pub use proxy::{generate_proxy, ProxyOptions};
 pub use source_reader::SourceReader;
 pub use stream_decoder::VideoDecoderStream;

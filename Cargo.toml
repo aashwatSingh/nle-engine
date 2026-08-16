@@ -18,6 +18,7 @@ members = [
     "crates/export",
     "crates/audio_source",
     "crates/speech",
+    "crates/matting",
 ]
 
 [workspace.package]

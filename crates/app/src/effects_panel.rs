@@ -169,7 +169,12 @@ mod effects_panel_tests {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut EffectsPanelState) {
+pub fn show(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    panel: &mut EffectsPanelState,
+    matting_jobs: &mut crate::matting_jobs::MattingJobs,
+) {
     ui.heading("Effects");
     let Some(clip_id) = state.primary_selection() else {
         ui.label("Select a clip to edit its effects.");
@@ -274,6 +279,41 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut EffectsPanel
                 // to this generic one when it didn't.
                 state.status = "no speech found to caption".into();
             }
+        }
+
+        if let timeline::ClipSource::Media(asset_id) = clip.source {
+            ui.horizontal(|ui| {
+                use crate::matting_jobs::MattingState;
+                match matting_jobs.state_of(asset_id) {
+                    MattingState::None => {
+                        if ui
+                            .button("Remove Background")
+                            .on_hover_text("AI background removal (local model, no data leaves this machine) — runs in the background, applies to every clip using this same source file")
+                            .clicked()
+                        {
+                            if let Some(path) = state.asset_paths.get(&asset_id).cloned() {
+                                if matting_jobs.request(asset_id, path) {
+                                    state.status = "removing background in the background — this can take a while".into();
+                                }
+                            } else {
+                                state.status = "can't remove background — source file not found".into();
+                            }
+                        }
+                    }
+                    MattingState::Building => {
+                        ui.add_enabled(false, egui::Button::new("Removing Background…"));
+                    }
+                    MattingState::Ready => {
+                        ui.weak("Background removed ✓");
+                    }
+                    MattingState::Failed => {
+                        ui.colored_label(egui::Color32::LIGHT_RED, "Background removal failed");
+                        if let Some(err) = matting_jobs.error_for(asset_id) {
+                            ui.weak(err).on_hover_text(err);
+                        }
+                    }
+                }
+            });
         }
     }
 

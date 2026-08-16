@@ -980,3 +980,61 @@ this bug or the analysis pipeline itself.
 Remaining findings (17 more correctness bugs across severity levels, 14
 organization items including splitting `state.rs`'s 5,391 lines by feature
 area) are tracked for follow-up, not fixed in this pass.
+
+## 2026-08-16 — AI background removal, and a second `ort-sys` toolchain gap
+
+Requested feature: CapCut-style one-click AI background removal. Landed as
+a new `matting` crate (Robust Video Matting via ONNX Runtime) plus a
+`matting_jobs.rs` background-job manager mirroring `proxy_jobs.rs`, wired
+into the effects panel as a "Remove Background" button.
+
+**The `ort-sys` gap, and why it's a genuinely different failure from
+whisper.cpp's:** `ort-sys` (the ONNX Runtime crate's build-time-linking
+path) has no prebuilt binary for `x86_64-pc-windows-gnu` — same class of
+problem as the whisper-rs FFI saga, but the `ort` crate itself ships an
+escape hatch whisper-rs didn't: a `load-dynamic` feature that calls
+`LoadLibrary` on `onnxruntime.dll` at *runtime* instead of linking against
+`onnxruntime.lib` at *build* time. Switched to that, downloaded Microsoft's
+official prebuilt `onnxruntime-win-x64-1.29.0` release (both this and the
+14MB RVM model file were downloaded only after explicit approval, source
+URL and size shown first). Verified with a real spike test — load the real
+model, run two real recurrent frames through it — before building anything
+on top.
+
+**Architecture: a real derived video file, not new render-graph plumbing.**
+The alternative was a per-frame alpha side-channel threaded through
+`compositor.rs`/`graph.rs`. Instead, `matte_video.rs` decodes the source,
+runs each frame through RVM, bakes the resulting alpha into a real QTRLE
+`.mov` (lossless, alpha-capable — `ARGB` byte order specifically, since
+qtrle's encoder rejects `RGBA`, confirmed from its own reported
+supported-format list rather than guessed), and `MattingJobs` substitutes
+that file for the original via the exact same asset-path-resolution
+mechanism `ProxyJobs` already uses. The existing alpha-aware compositor
+needed zero changes.
+
+**Resolution order matters and is deliberate:** proxies are a
+performance-only substitution, so `start_export` never resolves them
+(export always uses originals). Matting is a deliberate edit, so
+`start_export` *does* resolve it. At playback/preview call sites, both
+apply with matting resolved last (`matting.resolve(&proxies.resolve(...))`)
+so a matted asset wins over its own proxy.
+
+**Scope limitation, stated plainly:** matting is keyed by `MediaAssetId`,
+not per-clip-instance. If the same source file appears in two clips,
+removing the background on one removes it on both — identical to the
+tradeoff `ProxyJobs` already makes, not a new one.
+
+**Verified live, not just via unit tests:** built release, redeployed, and
+ran the actual button in the actual app — imported footage, clicked
+"Remove Background," watched the button go None -> "Removing
+Background…" -> "Background removed ✓" while the UI stayed fully
+responsive (played back normally during the background job), then
+confirmed the preview genuinely composited a transparent background both
+while scrubbing (different playhead position -> different real matte
+frame, not one static bake) and during live playback. Test footage was a
+synthetic SMPTE color-bar pattern (no real people in this repo's fixtures),
+so RVM's actual person-segmentation quality is unverified — what's verified
+is that the full pipeline (inference -> alpha bake -> file substitution ->
+compositor) is real and wired correctly end to end: RVM treated the flat
+color fields as background and correctly kept the moving high-frequency
+elements (a diagonal gradient streak, scattered dots) as foreground.
