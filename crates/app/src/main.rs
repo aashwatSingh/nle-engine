@@ -13,11 +13,13 @@
 mod autosave;
 mod effects_panel;
 mod export_job;
+mod home_screen;
 mod icons;
 mod mixer_panel;
 mod proxy_jobs;
 mod preview;
 mod project_panel;
+mod recent_projects;
 mod scopes_panel;
 mod state;
 mod theme;
@@ -35,6 +37,15 @@ use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::WindowBuilder;
+
+/// Which top-level screen is showing. Starts on `Home` — landing straight in
+/// a blank untitled editor with no memory of past projects is the thing
+/// this exists to fix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Home,
+    Editor,
+}
 
 fn main() {
     media_ffmpeg::init().expect("ffmpeg init failed");
@@ -114,6 +125,8 @@ fn main() {
     let mut autosaver = autosave::Autosave::default();
     // Offered once, at startup, if the last session left a recovery file behind.
     let mut recovery_offer = autosave::Autosave::find_recovery(None);
+    let mut screen = Screen::Home;
+    let mut recent_projects = recent_projects::RecentProjects::load_default();
     // Owns the audio device only while playing (see `Transport`).
     let mut transport = Transport::default();
     // Tracked here rather than read from egui: shortcuts are dispatched from
@@ -195,6 +208,8 @@ fn main() {
                                 &mut autosaver,
                                 &mut recovery_offer,
                                 &mut transport,
+                                &mut screen,
+                                &mut recent_projects,
                             )
                         });
                         egui_winit_state
@@ -841,13 +856,28 @@ fn export_ui(ctx: &egui::Context, export: &mut ExportUi) {
     }
 }
 
-fn open_project(state: &mut EditorState) {
+fn open_project(state: &mut EditorState, recent_projects: &mut recent_projects::RecentProjects, screen: &mut Screen) {
     if let Some(path) = rfd::FileDialog::new()
         .set_title("Open project")
         .add_filter("nle-engine project", &[PROJECT_EXTENSION])
         .pick_file()
     {
-        state.open_from(&path);
+        open_project_path(state, recent_projects, screen, &path);
+    }
+}
+
+/// Shared by the File menu's dialog-driven open and the home screen's
+/// click-a-recent-project path, so both go through the same "did it
+/// actually load" check and the same recent-list bookkeeping.
+fn open_project_path(
+    state: &mut EditorState,
+    recent_projects: &mut recent_projects::RecentProjects,
+    screen: &mut Screen,
+    path: &std::path::Path,
+) {
+    if state.open_from(path) {
+        recent_projects.record(path);
+        *screen = Screen::Editor;
     }
 }
 
@@ -856,6 +886,7 @@ fn open_project(state: &mut EditorState) {
 fn save_project(
     state: &mut EditorState,
     autosaver: &mut autosave::Autosave,
+    recent_projects: &mut recent_projects::RecentProjects,
     force_dialog: bool,
 ) {
     let existing = state.project_path.clone();
@@ -875,6 +906,7 @@ fn save_project(
     };
     if let Some(path) = path {
         state.save_to(&path);
+        recent_projects.record(&path);
         // The user's own file now holds this work, so the recovery file would
         // only produce a spurious "restore?" prompt on the next launch.
         autosaver.discard(state.undo.revision() as usize);
@@ -904,22 +936,53 @@ fn build_ui(
     autosaver: &mut autosave::Autosave,
     recovery_offer: &mut Option<std::path::PathBuf>,
     transport: &mut Transport,
+    screen: &mut Screen,
+    recent_projects: &mut recent_projects::RecentProjects,
 ) {
-    recovery_prompt(ctx, state, autosaver, recovery_offer);
+    recovery_prompt(ctx, state, autosaver, recovery_offer, screen);
+
+    if *screen == Screen::Home {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            match home_screen::show(ui, recent_projects.entries()) {
+                home_screen::HomeAction::None => {}
+                home_screen::HomeAction::NewProject => {
+                    *state = EditorState::new();
+                    *screen = Screen::Editor;
+                }
+                home_screen::HomeAction::OpenDialog => {
+                    open_project(state, recent_projects, screen);
+                }
+                home_screen::HomeAction::OpenPath(path) => {
+                    open_project_path(state, recent_projects, screen, &path);
+                }
+            }
+        });
+        return;
+    }
+
     egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Open...").clicked() {
                     ui.close_menu();
-                    open_project(state);
+                    open_project(state, recent_projects, screen);
                 }
                 if ui.button("Save").clicked() {
                     ui.close_menu();
-                    save_project(state, autosaver, false);
+                    save_project(state, autosaver, recent_projects, false);
                 }
                 if ui.button("Save As...").clicked() {
                     ui.close_menu();
-                    save_project(state, autosaver, true);
+                    save_project(state, autosaver, recent_projects, true);
+                }
+                ui.separator();
+                if ui
+                    .button("Back to Home")
+                    .on_hover_text("close this project and return to the project list — unsaved work is still protected by autosave")
+                    .clicked()
+                {
+                    ui.close_menu();
+                    *screen = Screen::Home;
                 }
                 ui.separator();
                 ui.label("Export quality:");
@@ -1147,6 +1210,7 @@ fn recovery_prompt(
     state: &mut EditorState,
     autosaver: &mut autosave::Autosave,
     offer: &mut Option<std::path::PathBuf>,
+    screen: &mut Screen,
 ) {
     let Some(path) = offer.clone() else { return };
     egui::Window::new("Recover unsaved work?")
@@ -1168,6 +1232,11 @@ fn recovery_prompt(
                         state.project_path = None;
                         state.status =
                             "recovered unsaved work — use Save As to write it somewhere".into();
+                        // Recovering is exactly as much "opening a project"
+                        // as any other path into the editor — staying on the
+                        // home screen with recovered work loaded silently
+                        // behind it would be confusing.
+                        *screen = Screen::Editor;
                     }
                     // Either way the offer is spent, and the file has served
                     // its purpose.
