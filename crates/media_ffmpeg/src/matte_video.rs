@@ -65,6 +65,16 @@ pub fn generate_matte_video(
         .best(ffmpeg_next::media::Type::Video)
         .map(|s| s.index())
         .ok_or(ProbeError::NoDecodableStreams)?;
+    // Captured now, before any packets are read: this file substitutes for
+    // the original at every use site (playback, export), including audio
+    // decode — see `matting_jobs`' resolve doc. Without carrying the audio
+    // through, background removal would silently mute the clip everywhere
+    // it's used, which is a correctness bug, not a scope limitation.
+    let audio_in_index = input.streams().best(ffmpeg_next::media::Type::Audio).map(|s| s.index());
+    let audio_in_params_and_time_base = audio_in_index.map(|idx| {
+        let s = input.stream(idx).unwrap();
+        (s.parameters(), s.time_base())
+    });
 
     let in_stream = input.stream(in_stream_index).unwrap();
     let avg_rate = in_stream.avg_frame_rate();
@@ -100,6 +110,21 @@ pub fn generate_matte_video(
     ost.set_parameters(&opened_encoder);
     ost.set_time_base(encoder_time_base);
 
+    // Stream-copied, not re-decoded/re-encoded: this function's job is the
+    // alpha channel, and audio is already correct in the source.
+    // `codec::Id::None` is the standard ffmpeg remux idiom for "just make an
+    // empty stream" — `add_stream` resolves it to no encoder, and
+    // `set_parameters` below copies the real codec params over directly.
+    let audio_out_index = match &audio_in_params_and_time_base {
+        Some((params, time_base)) => {
+            let mut aost = octx.add_stream(ffmpeg_next::codec::Id::None)?;
+            aost.set_parameters(params.clone());
+            aost.set_time_base(*time_base);
+            Some(aost.index())
+        }
+        None => None,
+    };
+
     let mut scaler = ffmpeg_next::software::scaling::Context::get(
         decoder.format(),
         decoder.width(),
@@ -112,6 +137,15 @@ pub fn generate_matte_video(
 
     octx.write_header()?;
     let stream_time_base = octx.stream(0).expect("stream 0 was just added").time_base();
+    // (output index, input time_base, output time_base) for the audio
+    // passthrough stream, if the source has audio. `unwrap()` on the input
+    // time_base is safe: `audio_out_index` is `Some` exactly when
+    // `audio_in_params_and_time_base` is.
+    let audio_passthrough = audio_out_index.map(|idx| {
+        let in_tb = audio_in_params_and_time_base.as_ref().unwrap().1;
+        let out_tb = octx.stream(idx).expect("audio stream was just added").time_base();
+        (idx, in_tb, out_tb)
+    });
 
     let mut decoded = ffmpeg_next::frame::Video::empty();
     let mut scaled = ffmpeg_next::frame::Video::empty();
@@ -174,12 +208,23 @@ pub fn generate_matte_video(
         Ok(())
     };
 
-    while let Some(packet) = crate::read_next_packet_for_stream(&mut input, in_stream_index) {
-        decoder.send_packet(&packet)?;
-        while decoder.receive_frame(&mut decoded).is_ok() {
-            scaler.run(&decoded, &mut scaled)?;
-            process_frame(&mut scaled, &mut opened_encoder, &mut next_pts)?;
-            drain!();
+    // Unfiltered (unlike the video-only proxy loop this was modeled on):
+    // audio packets need to pass through too, so every packet in the file is
+    // inspected and routed to whichever branch owns its stream index.
+    while let Some(mut packet) = crate::read_next_packet(&mut input) {
+        if packet.stream() == in_stream_index {
+            decoder.send_packet(&packet)?;
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                scaler.run(&decoded, &mut scaled)?;
+                process_frame(&mut scaled, &mut opened_encoder, &mut next_pts)?;
+                drain!();
+            }
+        } else if Some(packet.stream()) == audio_in_index {
+            let (a_out, in_tb, out_tb) = audio_passthrough
+                .expect("audio output stream exists whenever an audio input stream was found");
+            packet.rescale_ts(in_tb, out_tb);
+            packet.set_stream(a_out);
+            packet.write_interleaved(&mut octx)?;
         }
     }
     decoder.send_eof()?;
@@ -241,6 +286,58 @@ mod tests {
         let video = asset.video.expect("matte output has a video stream");
         assert!(video.width > 0 && video.height > 0);
         assert!(asset.duration_ticks > 0, "output must not be a zero-length file");
+    }
+
+    #[test]
+    fn the_sources_audio_is_carried_through_untouched() {
+        // `matting_jobs::resolve` substitutes this output for the original
+        // asset path everywhere, including audio decode — if the matte file
+        // has no audio stream, background removal silently mutes the clip
+        // in both playback and export. `test_h264.mp4` has a real AAC track
+        // (confirmed via ffprobe), so this is a real regression check, not
+        // a container-metadata formality.
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("matte.mov");
+
+        generate_matte_video(
+            &fixture("test_h264.mp4"),
+            &MatteVideoOptions { max_dimension: 64 },
+            |_rgb, w, h| vec![1.0; w * h],
+            &output,
+        )
+        .unwrap();
+
+        let asset = probe(&output).unwrap();
+        assert!(asset.video.is_some(), "matte output lost its video stream");
+        assert!(
+            asset.audio.is_some(),
+            "matte output has no audio stream — background removal would silently mute this clip"
+        );
+    }
+
+    #[test]
+    fn a_video_only_source_produces_a_video_only_matte_with_no_error() {
+        // The other direction: a source with no audio at all must not make
+        // `audio_in_index`/`audio_passthrough`'s `Some`-together invariant
+        // panic, and must not fail trying to mux a nonexistent stream.
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("matte.mov");
+
+        // test_vertical.mp4 is one of this crate's plain synthetic video
+        // fixtures with no audio track.
+        generate_matte_video(
+            &fixture("test_vertical.mp4"),
+            &MatteVideoOptions { max_dimension: 64 },
+            |_rgb, w, h| vec![1.0; w * h],
+            &output,
+        )
+        .unwrap();
+
+        let asset = probe(&output).unwrap();
+        assert!(asset.video.is_some());
+        assert!(asset.audio.is_none());
     }
 
     #[test]

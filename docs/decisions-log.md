@@ -1038,3 +1038,46 @@ is that the full pipeline (inference -> alpha bake -> file substitution ->
 compositor) is real and wired correctly end to end: RVM treated the flat
 color fields as background and correctly kept the moving high-frequency
 elements (a diagonal gradient streak, scattered dots) as foreground.
+
+**Same day, caught on a follow-up recheck — background removal silently
+muted the clip's audio.** `generate_matte_video` only ever touched the video
+stream; the output `.mov` had no audio track at all. `MattingJobs::resolve`
+substitutes that file for the original asset path unconditionally (no
+opt-in gate the way `ProxyJobs::enabled` has), and the *same* resolved-path
+map feeds both video decode and `audio_source::DecodedSampleSource` at
+every call site (`start_playback`, `start_export`, the scrub-preview line).
+`AudioDecoderStream::open` on a stream with no audio returns
+`NoDecodableStreams`, which `DecodedSampleSource` treats as "permanently
+silent for this asset" — so removing a clip's background silently killed
+its audio in both live playback and the exported file, directly
+contradicting this feature's own stated intent that matting "belongs in
+the delivered file." Confirmed two ways before touching anything: traced
+the code path, then `ffprobe`'d the actual matte file generated during the
+live-app test above — one `qtrle` video stream, nothing else, against a
+source that `ffprobe` confirmed has `h264` + `aac`.
+
+Fixed by muxing the source's original audio through as a plain stream copy
+(no re-decode/re-encode — `generate_matte_video`'s job is the alpha
+channel, audio is already correct) using ffmpeg's standard remux idiom:
+`add_stream(codec::Id::None)` to get an unencoded stream, then
+`set_parameters`/`set_time_base` copied straight from the input audio
+stream, with packets routed by `packet.stream()` and `rescale_ts` +
+`write_interleaved` alongside the existing video encode loop. Kept the fix
+local to `media_ffmpeg` rather than touching `playback`/`export`'s
+signatures — the substituted file is now a true drop-in replacement, which
+matches the "just works like a proxy substitution" architecture the whole
+feature is built on. Two new tests: one with a real AAC-bearing fixture
+asserting the matte's `probe()` result has `audio.is_some()` (would have
+failed outright against the pre-fix code — confirmed by the actual
+zero-audio-stream file already sitting on disk from the live test), and
+one with a video-only fixture confirming the no-audio case doesn't panic
+or error. Full workspace suite (529 tests) passes with zero regressions;
+release rebuilt and redeployed.
+
+**Related, lower-confidence finding, not fixed here:** `ProxyJobs` has the
+identical single-map-feeds-both-audio-and-video structure, and
+`generate_proxy` is also explicitly video-only by design. It's gated
+behind the "Use proxies" checkbox (off by default) so it's less likely to
+have been exercised with real audio-bearing footage, and wasn't
+independently reconfirmed live this pass — worth checking if proxies ever
+get exercised with real A/V footage with the checkbox on.
