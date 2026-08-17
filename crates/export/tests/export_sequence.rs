@@ -4,7 +4,7 @@
 //! "what you see in the preview is what lands in the file" is verified
 //! rather than assumed.
 
-use export::{export_sequence, ExportError, ExportOptions, QualityPreset};
+use export::{export_sequence, ExportError, ExportOptions, OutputScale, QualityPreset};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use timeline::{
@@ -172,6 +172,34 @@ fn exports_a_real_playable_video_with_the_sequence_dimensions_and_length() {
         (probed_seconds - seconds as f64).abs() < 0.2,
         "expected ~{seconds}s of output, probe reported {probed_seconds:.3}s"
     );
+}
+
+#[test]
+fn exporting_at_half_scale_produces_a_half_sized_file() {
+    let duration = timeline::TIMEBASE; // 1 second
+    let (project, paths) = setup(duration);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.mp4");
+
+    let stats = export_sequence(
+        &project,
+        SEQ,
+        &paths,
+        &out,
+        &ExportOptions {
+            quality: QualityPreset::Draft,
+            output_scale: OutputScale::Percent(50),
+            ..Default::default()
+        },
+        |_, _| true,
+    )
+    .expect("export should succeed");
+
+    // The sequence in `setup` is 640x360; 50% is exactly 320x180, already even.
+    assert_eq!((stats.width, stats.height), (320, 180));
+    let probed = media_ffmpeg::probe(&out).expect("output must be a probe-able video");
+    let video = probed.video.expect("output must have a video stream");
+    assert_eq!((video.width, video.height), (320, 180), "the real file, not just the stats, must be half-sized");
 }
 
 #[test]

@@ -130,6 +130,8 @@ pub struct ExportOptions {
     /// standalone file, not a clip that begins several seconds in with nothing
     /// on screen.
     pub range_ticks: Option<(i64, i64)>,
+    /// Output resolution relative to the sequence's native size.
+    pub output_scale: OutputScale,
 }
 
 impl Default for ExportOptions {
@@ -139,6 +141,7 @@ impl Default for ExportOptions {
             sample_rate: 48_000,
             master_gain_db: 0.0,
             range_ticks: None,
+            output_scale: OutputScale::Native,
         }
     }
 }
@@ -283,6 +286,11 @@ pub fn export_sequence(
     // with a much less obvious error.
     let width = sequence.settings.width + (sequence.settings.width % 2);
     let height = sequence.settings.height + (sequence.settings.height % 2);
+    // The compositor still renders at the sequence's native size (below) —
+    // only the encoder's output size changes. This is what keeps
+    // export/preview pixel-identical at `OutputScale::Native` and avoids
+    // any risk of effects behaving differently at a scaled render target.
+    let (out_width, out_height) = options.output_scale.scaled_dimensions(width, height);
 
     let (device, queue) = render::headless_context().ok_or(ExportError::NoGpu)?;
     let compositor = Compositor::new(device, queue);
@@ -300,6 +308,8 @@ pub fn export_sequence(
         output,
         width,
         height,
+        out_width,
+        out_height,
         sequence.settings.frame_rate,
         options,
         has_audio,
@@ -340,8 +350,8 @@ pub fn export_sequence(
     };
     let mut stats = ExportStats {
         frames_written: 0,
-        width,
-        height,
+        width: out_width,
+        height: out_height,
         frames_with_missing_sources: 0,
         audio_written: has_audio,
         loudness: None,
@@ -482,8 +492,10 @@ struct Encoder {
 impl Encoder {
     fn open(
         output: &Path,
-        width: u32,
-        height: u32,
+        in_width: u32,
+        in_height: u32,
+        out_width: u32,
+        out_height: u32,
         rate: timeline::FrameRate,
         options: &ExportOptions,
         with_audio: bool,
@@ -499,8 +511,8 @@ impl Encoder {
         let mut ost = octx.add_stream(codec)?;
         let mut encoder =
             ffmpeg_next::codec::context::Context::new_with_codec(codec).encoder().video()?;
-        encoder.set_width(width);
-        encoder.set_height(height);
+        encoder.set_width(out_width);
+        encoder.set_height(out_height);
         encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
         encoder.set_time_base(time_base);
         encoder.set_frame_rate(Some(ffmpeg_next::Rational::new(num as i32, den as i32)));
@@ -513,13 +525,19 @@ impl Encoder {
         ost.set_parameters(&encoder);
         ost.set_time_base(time_base);
 
+        // Source dims match what the compositor actually rendered
+        // (`in_width`/`in_height`, always the sequence's native size);
+        // destination dims are the (possibly scaled) encoder output. This
+        // scaler already existed purely for RGBA->YUV420P pixel-format
+        // conversion — giving it different src/dst sizes makes it do the
+        // resize in the same pass, so no second scaling step is needed.
         let scaler = ffmpeg_next::software::scaling::Context::get(
             ffmpeg_next::format::Pixel::RGBA,
-            width,
-            height,
+            in_width,
+            in_height,
             ffmpeg_next::format::Pixel::YUV420P,
-            width,
-            height,
+            out_width,
+            out_height,
             ffmpeg_next::software::scaling::Flags::BILINEAR,
         )?;
 
@@ -542,8 +560,8 @@ impl Encoder {
             octx,
             encoder,
             scaler,
-            width,
-            height,
+            width: in_width,
+            height: in_height,
             encoder_time_base: time_base,
             stream_time_base,
             audio,
