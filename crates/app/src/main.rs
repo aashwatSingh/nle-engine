@@ -721,6 +721,12 @@ struct ExportUi {
     /// Export only the marked in/out range. Sticky across exports, since a
     /// range workflow tends to be several exports in a row.
     use_range: bool,
+    output_scale: export::OutputScale,
+    /// Whether the pre-export options window (resolution/quality/range)
+    /// is open. Set by the File menu's "Export..." item; cleared either
+    /// by the window's own close button or by successfully starting a
+    /// job in `export_dialog_ui`.
+    show_dialog: bool,
 }
 
 impl Default for ExportUi {
@@ -730,6 +736,8 @@ impl Default for ExportUi {
             last_result: None,
             quality: export::QualityPreset::High,
             use_range: false,
+            output_scale: export::OutputScale::Native,
+            show_dialog: false,
         }
     }
 }
@@ -803,9 +811,61 @@ fn start_export(state: &mut EditorState, export: &mut ExportUi, transport: &mut 
         export::ExportOptions {
             quality: export.quality,
             range_ticks,
+            output_scale: export.output_scale,
             ..Default::default()
         },
     ));
+}
+
+/// The pre-export options window: resolution, quality, range. Opened
+/// from File > "Export...". Confirming it closes the dialog and hands
+/// off to `start_export`, which owns the actual save-file dialog and job
+/// creation — unchanged from before this task existed.
+fn export_dialog_ui(
+    ctx: &egui::Context,
+    state: &mut EditorState,
+    export: &mut ExportUi,
+    transport: &mut Transport,
+    matting_jobs: &matting_jobs::MattingJobs,
+) {
+    if !export.show_dialog {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Export")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label("Resolution:");
+            for scale in export::OutputScale::ALL {
+                ui.radio_value(&mut export.output_scale, scale, scale.label());
+            }
+            ui.separator();
+            ui.label("Quality:");
+            for preset in export::QualityPreset::ALL {
+                ui.radio_value(&mut export.quality, preset, preset.label());
+            }
+            ui.separator();
+            let has_range = state.marked_range().is_some();
+            ui.add_enabled(
+                has_range,
+                egui::Checkbox::new(&mut export.use_range, "Only the in/out range"),
+            )
+            .on_disabled_hover_text("mark in and out on the timeline first (I and O)");
+            if !has_range {
+                export.use_range = false;
+            }
+            ui.separator();
+            if ui.button("Export...").clicked() {
+                export.show_dialog = false;
+                start_export(state, export, transport, matting_jobs);
+            }
+        });
+    if !open {
+        export.show_dialog = false;
+    }
 }
 
 /// Progress window while an export runs, plus a one-shot result line after.
@@ -1000,27 +1060,12 @@ fn build_ui(
                     *screen = Screen::Home;
                 }
                 ui.separator();
-                ui.label("Export quality:");
-                for preset in export::QualityPreset::ALL {
-                    ui.radio_value(&mut export.quality, preset, preset.label());
-                }
-                let has_range = state.marked_range().is_some();
-                ui.add_enabled(
-                    has_range,
-                    egui::Checkbox::new(&mut export.use_range, "Only the in/out range"),
-                )
-                .on_disabled_hover_text("mark in and out on the timeline first (I and O)");
-                if !has_range {
-                    // Otherwise an unticked-but-remembered range silently
-                    // becomes "whole sequence" with no explanation.
-                    export.use_range = false;
-                }
                 if ui
-                    .add_enabled(export.job.is_none(), egui::Button::new("Export Video..."))
+                    .add_enabled(export.job.is_none(), egui::Button::new("Export..."))
                     .clicked()
                 {
                     ui.close_menu();
-                    start_export(state, export, transport, matting_jobs);
+                    export.show_dialog = true;
                 }
             });
             ui.separator();
@@ -1071,6 +1116,7 @@ fn build_ui(
         });
     });
 
+    export_dialog_ui(ctx, state, export, transport, matting_jobs);
     export_ui(ctx, export);
 
     egui::SidePanel::left("project_panel")
