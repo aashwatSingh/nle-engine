@@ -75,6 +75,48 @@ impl QualityPreset {
     }
 }
 
+/// Export resolution relative to the sequence's native size. A closed
+/// enum rather than a raw percentage or explicit width/height, for the
+/// same reason `QualityPreset` is a closed enum rather than a raw CRF
+/// number: a caller can't construct a nonsense value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputScale {
+    /// The sequence's own resolution — the default, and the only value
+    /// that must produce byte-identical behavior to code that predates
+    /// this enum.
+    Native,
+    Percent(u32),
+}
+
+impl OutputScale {
+    pub const ALL: [OutputScale; 4] =
+        [OutputScale::Native, OutputScale::Percent(75), OutputScale::Percent(50), OutputScale::Percent(25)];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OutputScale::Native => "Native",
+            OutputScale::Percent(75) => "75%",
+            OutputScale::Percent(50) => "50%",
+            OutputScale::Percent(25) => "25%",
+            OutputScale::Percent(_) => "Custom",
+        }
+    }
+
+    /// Applies this scale to `(width, height)`, rounding up to even
+    /// dimensions — required for yuv420p 4:2:0 chroma subsampling, same
+    /// convention `export_sequence` already applies to the native size.
+    pub fn scaled_dimensions(self, width: u32, height: u32) -> (u32, u32) {
+        let pct = match self {
+            OutputScale::Native => return (width, height),
+            OutputScale::Percent(p) => p,
+        };
+        let even = |n: u32| if n % 2 == 0 { n.max(2) } else { n + 1 };
+        let scaled_w = (width as u64 * pct as u64 / 100) as u32;
+        let scaled_h = (height as u64 * pct as u64 / 100) as u32;
+        (even(scaled_w), even(scaled_h))
+    }
+}
+
 #[derive(Debug)]
 pub struct ExportOptions {
     pub quality: QualityPreset,
@@ -580,5 +622,14 @@ mod tests {
         // Half a frame past 10 must still produce an 11th frame, not drop it.
         assert_eq!(frame_count(tpf * 10 + tpf / 2, tpf), 11);
         assert_eq!(frame_count(0, tpf), 0);
+    }
+
+    #[test]
+    fn scaled_dimensions_are_even_and_proportional() {
+        assert_eq!(OutputScale::Native.scaled_dimensions(1920, 1080), (1920, 1080));
+        assert_eq!(OutputScale::Percent(50).scaled_dimensions(1920, 1080), (960, 540));
+        assert_eq!(OutputScale::Percent(75).scaled_dimensions(1920, 1080), (1440, 810));
+        // 103*50/100 truncates to 51 (odd) -> must round up to 52.
+        assert_eq!(OutputScale::Percent(50).scaled_dimensions(103, 100), (52, 50));
     }
 }
