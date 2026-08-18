@@ -48,6 +48,27 @@ enum Screen {
     Editor,
 }
 
+/// Which panel is showing in the right-side dock. Previously all four
+/// were stacked vertically, which meant scrolling past Effects and
+/// Transcript to reach Scopes; this makes only one visible at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightPanelTab {
+    Effects,
+    Transcript,
+    Scopes,
+    Mixer,
+}
+
+struct RightPanelState {
+    tab: RightPanelTab,
+}
+
+impl Default for RightPanelState {
+    fn default() -> Self {
+        RightPanelState { tab: RightPanelTab::Effects }
+    }
+}
+
 fn main() {
     media_ffmpeg::init().expect("ffmpeg init failed");
 
@@ -120,6 +141,7 @@ fn main() {
     let mut project_panel_state = project_panel::ProjectPanelState::default();
     let mut effects_panel_state = effects_panel::EffectsPanelState::default();
     let mut scopes_panel_state = scopes_panel::ScopesPanelState::default();
+    let mut right_panel_state = RightPanelState::default();
     let mut transcript_panel_state = transcript_panel::TranscriptPanelState::default();
     let mut waveforms = waveform_cache::WaveformCache::default();
     let mut proxies = proxy_jobs::ProxyJobs::default();
@@ -206,6 +228,7 @@ fn main() {
                                 &mut project_panel_state,
                                 &mut effects_panel_state,
                                 &mut scopes_panel_state,
+                                &mut right_panel_state,
                                 &mut transcript_panel_state,
                                 &mut waveforms,
                                 &mut proxies,
@@ -1004,6 +1027,7 @@ fn build_ui(
     project_panel_state: &mut project_panel::ProjectPanelState,
     effects_panel_state: &mut effects_panel::EffectsPanelState,
     scopes_panel_state: &mut scopes_panel::ScopesPanelState,
+    right_panel_state: &mut RightPanelState,
     transcript_panel_state: &mut transcript_panel::TranscriptPanelState,
     waveforms: &mut waveform_cache::WaveformCache,
     proxies: &mut proxy_jobs::ProxyJobs,
@@ -1130,25 +1154,33 @@ fn build_ui(
         .resizable(true)
         .default_width(300.0)
         .show(ctx, |ui| {
-            // Mixer above effects, collapsed by default: it only matters while
-            // you're listening, and strips are wide enough to crowd out the
-            // effect controls if it were always open.
-            egui::CollapsingHeader::new("Audio Mixer")
-                .default_open(false)
-                .show(ui, |ui| {
-                    let snapshot = transport.audio.as_ref().and_then(|a| a.meters());
-                    mixer_panel::show(ui, state, snapshot.as_ref());
-                });
-            ui.separator();
-            // Above the effect list because a title's own text is what you
-            // came to the panel for; effects applied *to* the title are the
+            // Above the tabs because a title's own text is what you came
+            // to the panel for; effects applied *to* the title are the
             // secondary concern. Draws nothing when no title is selected.
             title_panel::show(ui, state);
-            effects_panel::show(ui, state, effects_panel_state, matting_jobs);
             ui.separator();
-            transcript_panel::show(ui, state, transcript_panel_state);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut right_panel_state.tab, RightPanelTab::Effects, "Effects");
+                ui.selectable_value(&mut right_panel_state.tab, RightPanelTab::Transcript, "Transcript");
+                ui.selectable_value(&mut right_panel_state.tab, RightPanelTab::Scopes, "Scopes");
+                ui.selectable_value(&mut right_panel_state.tab, RightPanelTab::Mixer, "Mixer");
+            });
             ui.separator();
-            scopes_panel::show(ui, scopes_panel_state, preview, device, queue_arc);
+            match right_panel_state.tab {
+                RightPanelTab::Effects => {
+                    effects_panel::show(ui, state, effects_panel_state, matting_jobs);
+                }
+                RightPanelTab::Transcript => {
+                    transcript_panel::show(ui, state, transcript_panel_state);
+                }
+                RightPanelTab::Scopes => {
+                    scopes_panel::show(ui, scopes_panel_state, preview, device, queue_arc);
+                }
+                RightPanelTab::Mixer => {
+                    let snapshot = transport.audio.as_ref().and_then(|a| a.meters());
+                    mixer_panel::show(ui, state, snapshot.as_ref());
+                }
+            }
         });
 
     egui::TopBottomPanel::bottom("timeline")
