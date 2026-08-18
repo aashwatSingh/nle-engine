@@ -157,6 +157,10 @@ fn main() {
     // the winit event branch, before egui runs for the frame, so egui's input
     // state would be one frame stale.
     let mut modifiers = winit::keyboard::ModifiersState::empty();
+    // Set by WindowEvent::HoveredFile, cleared by HoveredFileCancelled or
+    // DroppedFile — drives a border overlay in build_ui so dropping a
+    // file has some visual feedback before it lands.
+    let mut dragging_file = false;
 
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
@@ -188,6 +192,20 @@ fn main() {
                         }
                     }
                     WindowEvent::ModifiersChanged(new) => modifiers = new.state(),
+                    WindowEvent::HoveredFile(_) => {
+                        dragging_file = true;
+                    }
+                    WindowEvent::HoveredFileCancelled => {
+                        dragging_file = false;
+                    }
+                    WindowEvent::DroppedFile(path) => {
+                        dragging_file = false;
+                        // No project is open on the Home screen, so there's
+                        // nothing to import into.
+                        if screen == Screen::Editor {
+                            state.import_assets(vec![path]);
+                        }
+                    }
                     WindowEvent::KeyboardInput { event: key, .. } => {
                         if key.state == ElementState::Pressed {
                             handle_shortcut(
@@ -238,6 +256,7 @@ fn main() {
                                 &mut transport,
                                 &mut screen,
                                 &mut recent_projects,
+                                dragging_file,
                             )
                         });
                         egui_winit_state
@@ -1037,6 +1056,7 @@ fn build_ui(
     transport: &mut Transport,
     screen: &mut Screen,
     recent_projects: &mut recent_projects::RecentProjects,
+    dragging_file: bool,
 ) {
     recovery_prompt(ctx, state, autosaver, recovery_offer, screen);
 
@@ -1057,6 +1077,16 @@ fn build_ui(
             }
         });
         return;
+    }
+
+    if dragging_file {
+        let screen_rect = ctx.screen_rect();
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drag_overlay")))
+            .rect_stroke(
+                screen_rect.shrink(3.0),
+                0.0,
+                egui::Stroke::new(4.0, egui::Color32::from_rgb(230, 200, 120)),
+            );
     }
 
     egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
