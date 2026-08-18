@@ -1189,7 +1189,11 @@ fn build_ui(
             // secondary concern. Draws nothing when no title is selected.
             title_panel::show(ui, state);
             ui.separator();
-            ui.horizontal(|ui| {
+            // Wrapping rather than plain horizontal because the panel is
+            // resizable down to ~96px and SidePanel clips overflow -- a
+            // clipped tab would be both invisible and unclickable, and
+            // these tabs are the only route to their panels.
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut right_panel_state.tab, RightPanelTab::Effects, "Effects");
                 ui.selectable_value(&mut right_panel_state.tab, RightPanelTab::Transcript, "Transcript");
                 ui.selectable_value(&mut right_panel_state.tab, RightPanelTab::Scopes, "Scopes");
@@ -1204,6 +1208,12 @@ fn build_ui(
                     transcript_panel::show(ui, state, transcript_panel_state);
                 }
                 RightPanelTab::Scopes => {
+                    // Selecting the tab is now the intent signal that this
+                    // checkbox used to carry, back when the panel was
+                    // always-present in a vertical stack. Force it open so
+                    // the tab doesn't land on a blank panel with an
+                    // unticked checkbox.
+                    scopes_panel_state.open = true;
                     scopes_panel::show(ui, scopes_panel_state, preview, device, queue_arc);
                 }
                 RightPanelTab::Mixer => {

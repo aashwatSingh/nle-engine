@@ -1081,3 +1081,72 @@ behind the "Use proxies" checkbox (off by default) so it's less likely to
 have been exercised with real audio-bearing footage, and wasn't
 independently reconfirmed live this pass — worth checking if proxies ever
 get exercised with real A/V footage with the checkbox on.
+
+## 2026-08-17 — Right-panel tabs, export dialog with resolution scaling, drag-and-drop import
+
+**Right-panel tabs.** The four right-side panels (Effects, Transcript,
+Scopes, Mixer) used to be a vertical stack — reaching Scopes meant
+scrolling past Effects and Transcript first. They're now a tab strip that
+shows one panel at a time. The title panel stays pinned above the tabs
+rather than becoming a fifth tab, because it only draws anything when a
+title clip is selected — folding it into the tab set would mean an extra
+click to reach it in the one situation (editing a title) where you want it
+immediately. One detail worth flagging on its own: the tab strip uses
+`ui.horizontal_wrapped` rather than a plain `ui.horizontal`. The panel is
+`.resizable(true)` down to egui's default 96px minimum, the four tab
+labels run close to 268px, and `SidePanel` clips its contents and
+hit-tests against the clipped rect — so on a plain horizontal row, a tab
+pushed past the panel edge by a narrow width would become both invisible
+and unclickable, with no scrollbar to recover it. Since the tab strip is
+now the *only* route to three of the four panels, that's not a cosmetic
+bug, it's a reachability one. Wrapping to a second row costs nothing in
+the common case and avoids it entirely.
+
+**Export dialog + resolution scaling.** The File menu's inline quality
+radios and range checkbox are gone, replaced by a real "Export..." dialog.
+It adds resolution scaling — Native / 75% / 50% / 25% — alongside the
+existing quality and range controls. The implementation subtlety worth
+recording: no new scaling pass was added. The encoder already ran an
+RGBA→YUV420P scaler purely for pixel-format conversion (yuv420p's 4:2:0
+chroma subsampling requires even dimensions regardless of scale), so
+giving that same scaler a different destination size than its source size
+makes it do the resize for free in the same pass. The compositor still
+renders at the sequence's native resolution — scaling happens only in that
+final conversion step — which is what keeps preview and export
+pixel-identical and avoids any risk of an effect behaving differently when
+rendered at a scaled target instead of native. `OutputScale::Native`
+returns `(width, height)` unchanged before any of the percent arithmetic
+runs, so the default (and previously only) path takes no new branch at
+all.
+
+**Drag-and-drop import.** Dropping a file anywhere on the window imports
+it into the project bin, via `state.import_assets` — unchanged, just a new
+caller. It deliberately does *not* also place the clip on the timeline
+(that's a separate, deliberate action elsewhere in the app), and it's a
+no-op on the Home screen, where there's no open project for an asset to
+land in.
+
+**Verification status, stated plainly.** The export dialog and resolution
+scaling were verified live end-to-end, including `ffprobe` cross-checks
+against the actual output files: 50% on a 640x360 sequence produced
+320x180, Native produced 640x360. The full workspace suite is 531 passing
+/ 0 failing. Live tab-switching and drag-and-drop, however, were **not**
+verifiable in this session — the test environment was intermittently
+dropping mouse-button events application-wide (hover states rendered
+correctly, clicks didn't land, including on unrelated controls that had
+worked minutes earlier), and automated drag-from-Explorer was additionally
+blocked by tool policy on top of that. What *was* confirmed: the tab strip
+renders correctly, verified via screenshot. The drag-and-drop code was
+instead validated by reading winit 0.29.15's actual Windows
+`IDropTarget` implementation and checking the handler's event contract
+against what the code assumes, event-for-event. One point of indirect
+evidence worth naming: `RegisterDragDrop` is a hard assert at window
+creation in winit's Windows backend, so the app launching and running at
+all is itself evidence the drop-target plumbing registered successfully.
+
+**Known follow-up, not fixed.** A multi-file drop calls `import_assets`
+once per file, because winit delivers one `DroppedFile` event per file in
+the drop — so dropping 10 files at once produces 10 separate project
+clones and 10 separate undo steps instead of one. Fixing it needs a
+"collect drops until the next redraw, then import as a batch" buffer.
+Noted here, not built.
