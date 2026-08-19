@@ -1150,3 +1150,29 @@ the drop — so dropping 10 files at once produces 10 separate project
 clones and 10 separate undo steps instead of one. Fixing it needs a
 "collect drops until the next redraw, then import as a batch" buffer.
 Noted here, not built.
+
+## 2026-08-18 — Multi-file drops are one undo step
+
+Follow-up to the drag-and-drop work: winit fires a separate `DroppedFile`
+event per file, so the original implementation (which called
+`import_assets(vec![path])` as each arrived) turned a 10-file drop into 10
+separate undo entries. The Import button never had this problem — it hands
+its entire selection to `import_assets` in one call, and that function
+already loops internally and pushes exactly one undo entry.
+
+Fixed by accumulating dropped paths in the event loop and flushing them
+together in the per-frame poll block, next to the existing waveform and
+proxy pollers. The screen check stays at drop time rather than flush time:
+the drop happened against whatever was on screen when the user released, and
+deferring that check would let a screen change between the release and the
+next frame silently redirect the import.
+
+The regression test added here pins the invariant the batching depends on —
+one `import_assets` call is one undo step regardless of file count — rather
+than the accumulation itself, which lives in `main()`'s event loop and has
+no test harness in this codebase (the same reason the tab strip and drop
+wiring were verified live rather than unit tested).
+
+This is a deliberate deviation from the approved plan, which specified the
+per-event call; the whole-branch review flagged it as the one deferred minor
+with real user-visible cost.
