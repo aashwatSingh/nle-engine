@@ -161,6 +161,12 @@ fn main() {
     // DroppedFile — drives a border overlay in build_ui so dropping a
     // file has some visual feedback before it lands.
     let mut dragging_file = false;
+    // Files dropped this frame, flushed together below. winit delivers one
+    // DroppedFile event per file, so importing each as it arrives would make
+    // a 10-file drop 10 separate undo steps; the Import button passes its
+    // whole selection to `import_assets` at once and gets one. Batching here
+    // makes the two paths behave the same.
+    let mut pending_drops: Vec<std::path::PathBuf> = Vec::new();
 
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
@@ -200,10 +206,12 @@ fn main() {
                     }
                     WindowEvent::DroppedFile(path) => {
                         dragging_file = false;
-                        // No project is open on the Home screen, so there's
-                        // nothing to import into.
+                        // Screen is checked here, not at flush time: the drop
+                        // happened against whatever was on screen when the user
+                        // released. No project is open on the Home screen, so
+                        // there's nothing to import into.
                         if screen == Screen::Editor {
-                            state.import_assets(vec![path]);
+                            pending_drops.push(path);
                         }
                     }
                     WindowEvent::KeyboardInput { event: key, .. } => {
@@ -231,6 +239,10 @@ fn main() {
                         // proxies sit on the channel and are never adopted.
                         proxies.poll();
                         matting_jobs.poll();
+                        // One import, one undo step, however many files landed.
+                        if !pending_drops.is_empty() {
+                            state.import_assets(std::mem::take(&mut pending_drops));
+                        }
 
                         let raw_input = egui_winit_state.take_egui_input(&window);
                         let full_output = egui_ctx.run(raw_input, |ctx| {

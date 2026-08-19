@@ -2631,6 +2631,34 @@ mod tests {
     /// that matters: before the sequence adopted the first clip's format,
     /// both halves were individually correct and still produced a 640x360
     /// picture stranded inside a 1920x1080 black frame.
+    /// Guards the invariant the drag-and-drop batching in `main.rs` relies
+    /// on: one call, one undo step, however many files came in. winit fires a
+    /// separate `DroppedFile` event per file, so the event loop accumulates
+    /// them and flushes once — if this ever became one undo entry per asset,
+    /// a 10-file drop would silently need 10 undos to back out.
+    #[test]
+    fn importing_several_files_at_once_is_a_single_undo_step() {
+        media_ffmpeg::init().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("test_fixtures");
+        let mut state = EditorState::new();
+        let before = state.undo.history().len();
+
+        state.import_assets(vec![
+            fixtures.join("test_playback_demo.mp4"),
+            fixtures.join("test_h264.mp4"),
+        ]);
+
+        assert_eq!(state.project().assets.len(), 2, "both files should import");
+        assert_eq!(
+            state.undo.history().len() - before,
+            1,
+            "a multi-file import must be one undoable action, not one per file"
+        );
+    }
+
     #[test]
     fn import_add_export_fills_the_frame_at_native_resolution() {
         media_ffmpeg::init().unwrap();
