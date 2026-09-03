@@ -85,6 +85,17 @@ pub enum OutputScale {
     /// that must produce byte-identical behavior to code that predates
     /// this enum.
     Native,
+    /// A percentage of the sequence's native size. Only the values in
+    /// `ALL` (25/50/75) are reachable today — nothing constructs an
+    /// arbitrary percentage, and custom resolution entry is deliberately
+    /// out of scope.
+    ///
+    /// `scaled_dimensions` truncates through `as u32`, which is only
+    /// lossy above roughly a 223-million-percent scale, so it is not
+    /// guarded here. **If custom entry is ever added, bound the input at
+    /// the UI** rather than relying on that: values far below the
+    /// truncation point (a few thousand percent) already produce
+    /// resolutions no encoder will accept.
     Percent(u32),
 }
 

@@ -1097,7 +1097,7 @@ fn build_ui(
             .rect_stroke(
                 screen_rect.shrink(3.0),
                 0.0,
-                egui::Stroke::new(4.0_f32, egui::Color32::from_rgb(230, 200, 120)),
+                egui::Stroke::new(4.0f32, egui::Color32::from_rgb(230, 200, 120)),
             );
     }
 
