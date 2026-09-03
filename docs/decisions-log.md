@@ -1176,3 +1176,26 @@ wiring were verified live rather than unit tested).
 This is a deliberate deviation from the approved plan, which specified the
 per-event call; the whole-branch review flagged it as the one deferred minor
 with real user-visible cost.
+
+## 2026-08-19 — drag-and-drop confirmed by hand, closing the last gap
+
+The drag-and-drop import shipped with a real verification gap: File Explorer
+is granted at a computer-use tier that disallows automated drags, so nothing
+in this project could exercise the actual drop path end to end. It was backed
+only by indirect evidence — the reviewer checking winit 0.29.15's Windows
+`IDropTarget` implementation event-for-event, and a live confirmation that
+`RegisterDragDrop` had succeeded on the running window.
+
+The user dragged files onto the running editor by hand and confirmed it
+works. That closes the gap: every feature in this batch (right-panel tabs,
+the Export dialog with resolution scaling, drag-and-drop import, and the
+multi-file drop batching) is now confirmed working in the real app rather
+than correct-by-construction.
+
+Worth keeping from the episode: the same session twice concluded "the
+environment drops mouse-button events" when the real cause was that the
+screenshot tool hides the Claude window while that window still intercepts
+clicks. Instrumenting the winit/egui seam settled it in one run — a working
+click logged `MouseInput ... consumed=true`, a failing one logged no
+`MouseInput` at all. Measure the boundary; don't reason backward from the
+symptom.
