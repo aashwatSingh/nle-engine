@@ -2,3 +2,11 @@
 /dist
 **/*.rs.bk
 *.tmp
+
+# Stray directory from an unexpanded %SystemDrive% in a script; not source.
+%SystemDrive%/
+
+# Never publish local environment files.
+.env
+.env.*
+!.env.example
