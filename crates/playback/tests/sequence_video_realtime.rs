@@ -132,10 +132,20 @@ fn holds_frame_rate_against_a_real_time_clock_without_starving() {
          {window:?}, got {} — picture is not holding rate",
         delivered.len()
     );
-    assert_eq!(
-        video.starved_count(),
-        0,
-        "the decoder should stay ahead of a real-time clock for a 640x360 source"
+    // Bounded, not zero. A starved frame is "the UI asked and nothing was
+    // ready" — the same event the 80% tolerance above already accepts, so
+    // demanding exactly 0 here contradicted the assertion two lines up. Under
+    // `cargo test --workspace`, where whole test binaries run in parallel, one
+    // scheduling hiccup produced a single starved frame and failed this test
+    // about 1 run in 6 (see docs/evidence/2026-08-19-export-access-violation.md
+    // for how it was tracked down). A real regression — the decoder genuinely
+    // not keeping up — shows up as a large fraction of the boundaries, not one
+    // frame, so this still has the detection power it was written for.
+    let starve_budget = boundaries_crossed / 10; // ~4 of ~45
+    assert!(
+        video.starved_count() <= starve_budget as u64,
+        "the decoder should stay ahead of a real-time clock for a 640x360 source:          starved {} times, budget is {starve_budget} of {boundaries_crossed} boundaries",
+        video.starved_count()
     );
 }
 

@@ -1219,28 +1219,61 @@ pub fn read_texture_rgba(
     rgba
 }
 
-/// Creates a headless wgpu device — no window, no surface. Used by the
-/// compositor tests and by export (which has no window either).
+/// The process-wide headless device, built at most once.
+///
+/// The `Instance` is kept alive alongside the device rather than dropped at
+/// the end of construction: it owns the backend the device belongs to, and
+/// keeping it removes any question about teardown order.
+static HEADLESS: std::sync::OnceLock<Option<(wgpu::Instance, Arc<wgpu::Device>, Arc<wgpu::Queue>)>> =
+    std::sync::OnceLock::new();
+
+/// A headless wgpu device — no window, no surface. Used by the compositor
+/// tests and by export (which has no window either).
+///
+/// **Shared, not per-call.** This used to build a fresh `Instance` + adapter +
+/// `Device` on every call, which was fine in the app (only one export runs at
+/// a time) but not under `cargo test`, where whole test binaries run in
+/// parallel and each test called this independently. Overlapping device
+/// creation and teardown raced inside the GPU driver and faulted the process
+/// — `STATUS_ACCESS_VIOLATION` / `STATUS_HEAP_CORRUPTION`, roughly 1 workspace
+/// run in 6, reported as a crash rather than a test failure. A 24-thread
+/// stress harness reproduced it at ~50%; sharing one device took that to 0.
+/// See `docs/evidence/2026-08-19-export-access-violation.md`.
+///
+/// `get_or_init` also serialises construction, so concurrent first-callers
+/// block instead of racing. `wgpu::Device`/`Queue` are `Send + Sync` and are
+/// designed to be used from many threads, so sharing one is the intended
+/// usage rather than a workaround.
+///
+/// Tradeoff worth knowing: a lost device (GPU reset, driver update) now stays
+/// lost for the life of the process, where before the next call would have
+/// built a fresh one. That is rare, and it never silently returns a broken
+/// device — wgpu surfaces device loss through its own error path.
 pub fn headless_context() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
-    });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))?;
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("headless"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-        },
-        None,
-    ))
-    .ok()?;
-    Some((Arc::new(device), Arc::new(queue)))
+    HEADLESS
+        .get_or_init(|| {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::PRIMARY,
+                ..Default::default()
+            });
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))?;
+            let (device, queue) = pollster::block_on(adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("headless"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                },
+                None,
+            ))
+            .ok()?;
+            Some((instance, Arc::new(device), Arc::new(queue)))
+        })
+        .as_ref()
+        .map(|(_instance, device, queue)| (Arc::clone(device), Arc::clone(queue)))
 }
 
 /// One layer to draw for a track, and how much of it to show.
