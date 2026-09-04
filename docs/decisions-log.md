@@ -1199,3 +1199,42 @@ clicks. Instrumenting the winit/egui seam settled it in one run — a working
 click logged `MouseInput ... consumed=true`, a failing one logged no
 `MouseInput` at all. Measure the boundary; don't reason backward from the
 symptom.
+
+## 2026-08-19 — the "flaky test" is a real GPU-driver crash, not a timing flake
+
+An earlier full-workspace run reported one failure that never reproduced. I
+guessed out loud that it was "probably the audio-device-dependent playback
+tests" and moved on. That guess was wrong, and worth recording as wrong.
+
+Investigating properly: six full-workspace runs, complete logs kept. One run
+died with `STATUS_ACCESS_VIOLATION` (0xc0000005) in
+`export --test export_sequence` — a native memory fault, not an assertion
+failure (the summary read `failed=0`, because nothing failed; the process
+crashed). Twelve isolated runs of that same binary crashed zero times, so it
+needs the load of a full workspace run to surface. Evidence kept in
+`docs/evidence/2026-08-19-export-access-violation.md`.
+
+**Root cause:** `render::headless_context()` builds a brand-new
+`wgpu::Instance`, adapter and `Device` on every call — nothing is cached or
+shared. `export_sequence` has 18 tests that each run a real export, and Rust
+runs them in parallel, so a workspace run has many simultaneous GPU device
+creations and teardowns across four crates' test binaries. That is a known
+way to trip Windows GPU drivers.
+
+**Not caused by the export-scaling work.** At `OutputScale::Native` —
+which every crashing test uses — `scaled_dimensions` early-returns, so
+`out_width == width` and `Encoder::open` receives values identical to the
+pre-change code. The scaler configuration is unchanged. The one test added
+in that batch passed before the crash, visible in the log.
+
+**Production is not affected.** `start_export` refuses to begin a second
+export while one is running, so the app only ever holds one headless device
+at a time. This is a test-parallelism problem.
+
+**Deliberately not fixed here.** The obvious fix — cache the device in a
+`OnceLock` so the suite shares one — touches shared `render` infrastructure
+used by four crates plus two production call sites, and the crash cannot be
+reproduced on demand (1 in 6 under load, 0 in 12 isolated), so a fix could
+not be honestly verified as working. Flagged for a deliberate change rather
+than a drive-by one.
+
