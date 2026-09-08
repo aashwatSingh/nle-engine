@@ -62,6 +62,10 @@ const STRIP_HEIGHT: f32 = 14.0;
 /// Half-width of a keyframe diamond, and its click tolerance.
 const DIAMOND_R: f32 = 4.5;
 
+/// One row of the keyframe strip: when it sits, how it interpolates, and
+/// its bezier handles when it has explicit ones.
+type KeyframeRow = (TimeTick, InterpolationMode, Option<((f64, f64), (f64, f64))>);
+
 /// Which keyframe is mid-drag, if any. Keyed by everything needed to find it
 /// again next frame, because the strip is rebuilt from scratch each repaint.
 #[derive(Clone)]
@@ -137,36 +141,6 @@ fn available_effects() -> Vec<render::EffectDescriptor> {
         mask::descriptor(),
         chroma_key::descriptor(),
     ]
-}
-
-#[cfg(test)]
-mod effects_panel_tests {
-    use super::available_effects;
-    use render::{BuiltinRegistry, EffectRegistry};
-
-    #[test]
-    fn add_effect_menu_matches_the_effect_registry() {
-        let registry = BuiltinRegistry::default();
-        for desc in available_effects() {
-            assert!(
-                registry.lookup(desc.type_id).is_some(),
-                "\"{}\" is offered in the Add Effect menu but isn't in BuiltinRegistry — \
-                 adding it would create an effect instance the compositor doesn't recognise",
-                desc.display_name
-            );
-        }
-        // And the reverse: every registered effect should be reachable from
-        // the menu, or it's built but nobody can ever add one to a clip.
-        // Drawn from the registry itself, not a hand-copied id list, so this
-        // check can't independently drift the same way the thing it's
-        // guarding against can.
-        for type_id in registry.all_type_ids() {
-            assert!(
-                available_effects().iter().any(|d| d.type_id == type_id),
-                "\"{type_id}\" is in BuiltinRegistry but missing from the Add Effect menu"
-            );
-        }
-    }
 }
 
 pub fn show(
@@ -463,7 +437,7 @@ fn keyframe_strip(
     }
     let clip_in = clip.timeline_in.0;
     let clip_len = (clip.timeline_out.0 - clip_in).max(1);
-    let keyframes: Vec<(TimeTick, InterpolationMode, Option<((f64, f64), (f64, f64))>)> = track
+    let keyframes: Vec<KeyframeRow> = track
         .keyframes
         .iter()
         .map(|k| (k.at, k.interpolation, k.tangents))
@@ -887,4 +861,34 @@ fn add_effect(state: &mut EditorState, clip_id: ClipInstanceId, desc: &render::E
         params,
     };
     state.add_effect(clip_id, effect);
+}
+
+#[cfg(test)]
+mod effects_panel_tests {
+    use super::available_effects;
+    use render::{BuiltinRegistry, EffectRegistry};
+
+    #[test]
+    fn add_effect_menu_matches_the_effect_registry() {
+        let registry = BuiltinRegistry::default();
+        for desc in available_effects() {
+            assert!(
+                registry.lookup(desc.type_id).is_some(),
+                "\"{}\" is offered in the Add Effect menu but isn't in BuiltinRegistry — \
+                 adding it would create an effect instance the compositor doesn't recognise",
+                desc.display_name
+            );
+        }
+        // And the reverse: every registered effect should be reachable from
+        // the menu, or it's built but nobody can ever add one to a clip.
+        // Drawn from the registry itself, not a hand-copied id list, so this
+        // check can't independently drift the same way the thing it's
+        // guarding against can.
+        for type_id in registry.all_type_ids() {
+            assert!(
+                available_effects().iter().any(|d| d.type_id == type_id),
+                "\"{type_id}\" is in BuiltinRegistry but missing from the Add Effect menu"
+            );
+        }
+    }
 }

@@ -712,9 +712,7 @@ impl EditorState {
         let top_video = self
             .sequence()
             .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Video)
-            .next_back();
+            .iter().rfind(|t| t.kind == TrackKind::Video);
         let free = top_video.map(|t| {
             !t.clips.iter().any(|c| c.timeline_in.0 < end && c.timeline_out.0 > start)
         });
@@ -1016,7 +1014,7 @@ impl EditorState {
             // operation (TrimRipple), out of scope for this action.
             .filter(|&(s, e)| s > clip.timeline_in.0 && e < clip.timeline_out.0 && e > s)
             .collect();
-        ranges.sort_by(|a, b| b.0.cmp(&a.0));
+        ranges.sort_by_key(|r| std::cmp::Reverse(r.0));
 
         let mut ops = Vec::with_capacity(ranges.len() * 3);
         for (start, end) in ranges {
@@ -1328,7 +1326,7 @@ impl EditorState {
         let whole_span_start = TimeTick(to_timeline_tick(source_span_start));
         let whole_span_end = TimeTick(to_timeline_tick(source_span_end));
 
-        let top_video = self.sequence().tracks.iter().filter(|t| t.kind == TrackKind::Video).next_back();
+        let top_video = self.sequence().tracks.iter().rfind(|t| t.kind == TrackKind::Video);
         let free = top_video.map(|t| {
             !t.clips
                 .iter()
@@ -2068,15 +2066,12 @@ impl EditorState {
         for child in project.bins.iter_mut().filter(|b| b.parent == Some(id)) {
             child.parent = grandparent;
         }
-        match grandparent {
-            Some(parent_id) => {
-                if let Some(parent) = project.bins.iter_mut().find(|b| b.id == parent_id) {
-                    parent.items.extend(removed.items);
-                }
+        // A `None` grandparent means the items are at the root by
+        // definition, so dropping them from the tree is all that's needed.
+        if let Some(parent_id) = grandparent {
+            if let Some(parent) = project.bins.iter_mut().find(|b| b.id == parent_id) {
+                parent.items.extend(removed.items);
             }
-            // Items with no bin are at the root by definition, so dropping
-            // them from the tree is all that's needed.
-            None => {}
         }
         self.undo.push("delete bin", std::sync::Arc::new(project));
     }
@@ -2123,7 +2118,7 @@ impl EditorState {
         };
         if seq.settings.width == video.width
             && seq.settings.height == video.height
-            && rate.map_or(true, |r| r == seq.settings.frame_rate)
+            && rate.is_none_or(|r| r == seq.settings.frame_rate)
         {
             return; // nothing to change; don't push a no-op undo step
         }

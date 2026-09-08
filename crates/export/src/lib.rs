@@ -121,7 +121,7 @@ impl OutputScale {
             OutputScale::Native => return (width, height),
             OutputScale::Percent(p) => p,
         };
-        let even = |n: u32| if n % 2 == 0 { n.max(2) } else { n + 1 };
+        let even = |n: u32| if n.is_multiple_of(2) { n.max(2) } else { n + 1 };
         let scaled_w = (width as u64 * pct as u64 / 100) as u32;
         let scaled_h = (height as u64 * pct as u64 / 100) as u32;
         (even(scaled_w), even(scaled_h))

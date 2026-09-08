@@ -122,7 +122,7 @@ fn the_relative_gate_stops_a_long_silence_from_diluting_the_measurement() {
     // ungated mean would report roughly 10 dB lower and be useless for
     // matching programme levels.
     let mut signal = sine(1000.0, -23.0, 1.0);
-    signal.extend(std::iter::repeat(0.0).take(FS as usize * 9));
+    signal.extend(std::iter::repeat_n(0.0, FS as usize * 9));
 
     let m = measure_mono(&signal);
     assert!(

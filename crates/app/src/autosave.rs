@@ -155,9 +155,11 @@ mod tests {
         // A timer-only check would rewrite forever, keeping a stale recovery
         // file alive and making the next launch offer to restore work that is
         // already safely saved.
-        let mut a = Autosave::default();
-        a.last_write = Instant::now() - Duration::from_secs(3600);
-        a.last_saved_revision = 7;
+        let a = Autosave {
+            last_write: Instant::now() - Duration::from_secs(3600),
+            last_saved_revision: 7,
+            ..Default::default()
+        };
         assert!(!a.is_due(7), "no change means no write, no matter the elapsed time");
         assert!(a.is_due(8), "a change after the interval is due");
     }
@@ -181,8 +183,10 @@ mod tests {
 
     #[test]
     fn a_failed_write_backs_off_instead_of_retrying_every_frame() {
-        let mut a = Autosave::default();
-        a.last_write = Instant::now() - Duration::from_secs(3600);
+        let mut a = Autosave {
+            last_write: Instant::now() - Duration::from_secs(3600),
+            ..Default::default()
+        };
         assert!(a.is_due(1));
 
         a.mark_failed("disk full".into());

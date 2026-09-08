@@ -1224,8 +1224,10 @@ pub fn read_texture_rgba(
 /// The `Instance` is kept alive alongside the device rather than dropped at
 /// the end of construction: it owns the backend the device belongs to, and
 /// keeping it removes any question about teardown order.
-static HEADLESS: std::sync::OnceLock<Option<(wgpu::Instance, Arc<wgpu::Device>, Arc<wgpu::Queue>)>> =
-    std::sync::OnceLock::new();
+/// Instance + device + queue, kept together so the backend outlives them.
+type HeadlessParts = (wgpu::Instance, Arc<wgpu::Device>, Arc<wgpu::Queue>);
+
+static HEADLESS: std::sync::OnceLock<Option<HeadlessParts>> = std::sync::OnceLock::new();
 
 /// A headless wgpu device — no window, no surface. Used by the compositor
 /// tests and by export (which has no window either).

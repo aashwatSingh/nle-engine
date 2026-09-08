@@ -1298,33 +1298,6 @@ fn build_ui(
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shuttle_engages_at_1x_then_doubles_and_clamps() {
-        // L from a standstill must be plain 1x play (the only rate with audio),
-        // not an immediate jump to a fast rate.
-        assert_eq!(next_shuttle_rate(0.0, true), 1.0);
-        assert_eq!(next_shuttle_rate(1.0, true), 2.0);
-        assert_eq!(next_shuttle_rate(2.0, true), 4.0);
-        assert_eq!(next_shuttle_rate(4.0, true), 8.0);
-        assert_eq!(next_shuttle_rate(8.0, true), MAX_SHUTTLE, "must clamp, not run away");
-    }
-
-    #[test]
-    fn shuttle_reverses_direction_at_1x_rather_than_stepping_down_through_speed() {
-        // Pressing J while running forward at 4x should give -1x, not 2x. This
-        // is the behaviour editors rely on to stop and back up in one keypress
-        // instead of four.
-        assert_eq!(next_shuttle_rate(4.0, false), -1.0);
-        assert_eq!(next_shuttle_rate(-1.0, false), -2.0);
-        assert_eq!(next_shuttle_rate(-4.0, true), 1.0);
-        assert_eq!(next_shuttle_rate(-8.0, false), -MAX_SHUTTLE);
-    }
-}
-
 /// Writes a recovery snapshot when one is due. Called once per frame.
 ///
 /// Errors are surfaced in the status line rather than being retried in a tight
@@ -1395,4 +1368,31 @@ fn recovery_prompt(
                 }
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shuttle_engages_at_1x_then_doubles_and_clamps() {
+        // L from a standstill must be plain 1x play (the only rate with audio),
+        // not an immediate jump to a fast rate.
+        assert_eq!(next_shuttle_rate(0.0, true), 1.0);
+        assert_eq!(next_shuttle_rate(1.0, true), 2.0);
+        assert_eq!(next_shuttle_rate(2.0, true), 4.0);
+        assert_eq!(next_shuttle_rate(4.0, true), 8.0);
+        assert_eq!(next_shuttle_rate(8.0, true), MAX_SHUTTLE, "must clamp, not run away");
+    }
+
+    #[test]
+    fn shuttle_reverses_direction_at_1x_rather_than_stepping_down_through_speed() {
+        // Pressing J while running forward at 4x should give -1x, not 2x. This
+        // is the behaviour editors rely on to stop and back up in one keypress
+        // instead of four.
+        assert_eq!(next_shuttle_rate(4.0, false), -1.0);
+        assert_eq!(next_shuttle_rate(-1.0, false), -2.0);
+        assert_eq!(next_shuttle_rate(-4.0, true), 1.0);
+        assert_eq!(next_shuttle_rate(-8.0, false), -MAX_SHUTTLE);
+    }
 }

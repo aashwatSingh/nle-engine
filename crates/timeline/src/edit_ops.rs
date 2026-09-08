@@ -161,11 +161,11 @@ fn find_clip_seq_idx(project: &Project, clip_id: ClipInstanceId) -> Option<usize
         .position(|seq| seq.tracks.iter().any(|t| t.clips.iter().any(|c| c.id == clip_id)))
 }
 
-fn find_track<'a>(seq: &'a Sequence, track_id: TrackId) -> Option<&'a Track> {
+fn find_track(seq: &Sequence, track_id: TrackId) -> Option<&Track> {
     seq.tracks.iter().find(|t| t.id == track_id)
 }
 
-fn find_track_mut<'a>(seq: &'a mut Sequence, track_id: TrackId) -> Option<&'a mut Track> {
+fn find_track_mut(seq: &mut Sequence, track_id: TrackId) -> Option<&mut Track> {
     seq.tracks.iter_mut().find(|t| t.id == track_id)
 }
 

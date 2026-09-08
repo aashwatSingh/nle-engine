@@ -23,7 +23,7 @@ impl Default for ProxyOptions {
 }
 
 fn even(n: u32) -> u32 {
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         n
     } else {
         n + 1

@@ -97,7 +97,7 @@ fn checkerboard(w: u32, h: u32, cell: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity((w * h * 4) as usize);
     for y in 0..h {
         for x in 0..w {
-            let on = ((x / cell) + (y / cell)) % 2 == 0;
+            let on = ((x / cell) + (y / cell)).is_multiple_of(2);
             let v = if on { 255 } else { 0 };
             out.extend_from_slice(&[v, v, v, 255]);
         }

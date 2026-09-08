@@ -272,9 +272,7 @@ fn layout_line_naive(font: &FontVec, scale: PxScale, line: &str) -> Vec<(Glyph, 
 /// prove shaping actually ran, and mutation-tested to confirm it (see
 /// `docs/decisions-log.md`).
 pub fn shaped_glyph_count(font: &FontFace, text: &str, size_px: f32) -> Option<usize> {
-    if rustybuzz::Face::from_slice(&font.bytes, 0).is_none() {
-        return None;
-    }
+    rustybuzz::Face::from_slice(&font.bytes, 0)?;
     Some(shape_line(font, PxScale::from(size_px), text).len())
 }
 
@@ -392,7 +390,7 @@ impl FontLibrary {
                 return Some(path.clone());
             }
             let idx = self.scan.borrow().next_unscanned;
-            let Some(path) = self.all_paths.get(idx) else { return None };
+            let path = self.all_paths.get(idx)?;
             let discovered = std::fs::read(path).ok().and_then(|data| family_name_from_table(&data, 0));
             let mut scan = self.scan.borrow_mut();
             scan.next_unscanned = idx + 1;

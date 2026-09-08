@@ -355,11 +355,10 @@ fn draw_and_interact_clip(
             }
         }
     }
-    if body_resp.drag_stopped() {
-        if matches!(&state.drag, Some(Drag::MoveClip { clip: c, .. }) if *c == clip.id) {
+    if body_resp.drag_stopped()
+        && matches!(&state.drag, Some(Drag::MoveClip { clip: c, .. }) if *c == clip.id) {
             state.end_drag_edit();
         }
-    }
 
     // Transitions live on cuts, so they're offered from the clip whose edge
     // forms the cut — no separate hit target to find, and no ambiguity about

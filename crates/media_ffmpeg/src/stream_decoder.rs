@@ -93,7 +93,7 @@ impl VideoDecoderStream {
         let mut decoded = ffmpeg_next::frame::Video::empty();
         loop {
             if self.decoder.receive_frame(&mut decoded).is_ok() {
-                return Ok(Some(self.to_rgba(&decoded)?));
+                return Ok(Some(self.convert_to_rgba(&decoded)?));
             }
             if self.eof_sent {
                 return Ok(None);
@@ -108,7 +108,7 @@ impl VideoDecoderStream {
         }
     }
 
-    fn to_rgba(&mut self, decoded: &ffmpeg_next::frame::Video) -> Result<DecodedRgbaFrame, ProbeError> {
+    fn convert_to_rgba(&mut self, decoded: &ffmpeg_next::frame::Video) -> Result<DecodedRgbaFrame, ProbeError> {
         let pts_ticks = decoded
             .pts()
             .map(|p| {

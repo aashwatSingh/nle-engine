@@ -82,8 +82,8 @@ fn histogram_image(h: &Histogram) -> egui::ColorImage {
     let mut img = egui::ColorImage::new([256, HIST_H], egui::Color32::BLACK);
     let plot = |img: &mut egui::ColorImage, bins: &[u32; 256], colour: [u8; 3]| {
         let max = *bins.iter().max().unwrap_or(&1).max(&1) as f32;
-        for x in 0..256usize {
-            let frac = (bins[x] as f32 + 1.0).ln() / (max + 1.0).ln();
+        for (x, &count) in bins.iter().enumerate() {
+            let frac = (count as f32 + 1.0).ln() / (max + 1.0).ln();
             let bar_h = (frac * HIST_H as f32).round() as usize;
             for y in (HIST_H - bar_h.min(HIST_H))..HIST_H {
                 let i = y * 256 + x;

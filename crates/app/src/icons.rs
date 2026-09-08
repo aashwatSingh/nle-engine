@@ -41,10 +41,12 @@ enum Shape {
 
 /// Every point across every shape for `icon`. Kept as one flat iterator so
 /// the bounds test below doesn't need to know each icon's shape count.
+#[cfg(test)]
 fn all_points(icon: Icon) -> Vec<(f32, f32)> {
     shapes(icon).into_iter().flat_map(shape_points).collect()
 }
 
+#[cfg(test)]
 fn shape_points(shape: Shape) -> Vec<(f32, f32)> {
     match shape {
         Shape::Polyline(pts) | Shape::FilledPolygon(pts) => pts,

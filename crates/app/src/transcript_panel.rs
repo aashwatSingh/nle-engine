@@ -14,6 +14,7 @@
 use crate::state::EditorState;
 use timeline::{ClipInstanceId, ClipSource};
 
+#[derive(Default)]
 pub struct TranscriptPanelState {
     /// The word index a click or drag-select started from. `None` means
     /// nothing selected. Combined with `end` to describe a range — order
@@ -28,11 +29,6 @@ pub struct TranscriptPanelState {
     selected_clip: Option<ClipInstanceId>,
 }
 
-impl Default for TranscriptPanelState {
-    fn default() -> Self {
-        TranscriptPanelState { anchor: None, end: None, selected_clip: None }
-    }
-}
 
 /// Clears the word selection whenever the panel is about to show a
 /// different clip than the one the selection was made against. Kept free
