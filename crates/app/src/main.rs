@@ -631,6 +631,12 @@ fn edit_points(state: &EditorState) -> Vec<i64> {
     points
 }
 
+// Six of these nine are the same transport context that `start_playback`,
+// `set_shuttle` and `step_frames` also take. Bundling them into one struct
+// is the obvious answer, but this function's ten internal calls hand that
+// context straight back to those functions, so a struct would have to be
+// reborrowed at every one — more ceremony than the parameter list costs.
+#[allow(clippy::too_many_arguments)]
 fn handle_shortcut(
     state: &mut EditorState,
     transport: &mut Transport,
@@ -1041,6 +1047,12 @@ fn save_project(
     }
 }
 
+// The immediate-mode UI root: every panel's state has to reach it somehow,
+// and it hands ten separate egui closures their own disjoint `&mut`
+// borrows. Collapsing these into one context struct would make those
+// closures borrow the whole struct instead of individual fields, which is
+// precisely the conflict the split parameters avoid.
+#[allow(clippy::too_many_arguments)]
 fn build_ui(
     ctx: &egui::Context,
     state: &mut EditorState,

@@ -317,10 +317,7 @@ pub fn export_sequence(
 
     let mut encoder = Encoder::open(
         output,
-        width,
-        height,
-        out_width,
-        out_height,
+        FrameSizes { in_width: width, in_height: height, out_width, out_height },
         sequence.settings.frame_rate,
         options,
         has_audio,
@@ -476,6 +473,17 @@ pub fn export_sequence(
     Ok(stats)
 }
 
+/// What the compositor renders (`in_*`) versus what the encoder writes
+/// (`out_*`). They differ only when `OutputScale` isn't `Native`; the scaler
+/// that already converts RGBA to YUV420P does the resize in the same pass.
+#[derive(Clone, Copy)]
+struct FrameSizes {
+    in_width: u32,
+    in_height: u32,
+    out_width: u32,
+    out_height: u32,
+}
+
 /// Thin RAII-ish wrapper over the ffmpeg output context + H.264 encoder +
 /// RGBA->YUV420P scaler. Split out so the frame loop above reads as the
 /// render pipeline it is, rather than being half muxer bookkeeping.
@@ -503,14 +511,12 @@ struct Encoder {
 impl Encoder {
     fn open(
         output: &Path,
-        in_width: u32,
-        in_height: u32,
-        out_width: u32,
-        out_height: u32,
+        sizes: FrameSizes,
         rate: timeline::FrameRate,
         options: &ExportOptions,
         with_audio: bool,
     ) -> Result<Self, ExportError> {
+        let FrameSizes { in_width, in_height, out_width, out_height } = sizes;
         let (num, den) = rate.as_rational();
         // FFmpeg time_base is seconds-per-tick, so it's the reciprocal of the
         // frame rate: 30000/1001 fps -> 1001/30000.
