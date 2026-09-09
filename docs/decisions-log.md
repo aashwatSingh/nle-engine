@@ -1238,3 +1238,33 @@ reproduced on demand (1 in 6 under load, 0 in 12 isolated), so a fix could
 not be honestly verified as working. Flagged for a deliberate change rather
 than a drive-by one.
 
+## 2026-09-08 — the proxy toggle muted audio, the same way matting did
+
+The 7 September audit turned up a confirmed bug: ticking "Use proxies" made
+every proxied clip silent for the rest of the session. Same shape as the
+background-removal audio loss fixed on 19 August, still live in the proxy
+path, which that entry had flagged as "likely, unverified" and left alone.
+
+`generate_proxy` writes a video-only file on purpose — that is the whole point
+of a proxy — but `start_playback` built one resolved path map and gave it to
+both engines. The audio engine got the proxy, `AudioDecoderStream::open`
+failed on a file with no audio stream, and `DecodedSampleSource` cached that
+failure permanently.
+
+Fixed by making the decision explicit and testable instead of implicit in the
+event loop: `playback_paths()` returns a pair — video takes the substitutions
+(proxy, then matting layered on top so a background-removed asset wins), audio
+takes the originals. Neither substitution ever changes what the audio should
+be, so the original is both the simplest and the correct answer. Export was
+never affected, because it does not resolve proxies at all.
+
+Two tests pin the policy. The first was written against the old behaviour and
+watched to fail — it resolved audio to `/cache/proxy.mp4` — so it demonstrably
+detects the real bug rather than just documenting the fix.
+
+The lasting note is in proxy.rs's own doc comment, which claimed "audio still
+comes from the source" from the beginning. That was true of the function and
+false of the pipeline around it. It now states the constraint on callers and
+names where it is enforced. A comment describing an invariant nothing checks
+is worth about as much as no comment.
+
