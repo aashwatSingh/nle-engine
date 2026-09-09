@@ -11,6 +11,7 @@
 //! context for both, no separate render loop to keep in sync.
 
 mod autosave;
+mod cache_dirs;
 mod effects_panel;
 mod export_job;
 mod home_screen;
@@ -144,6 +145,10 @@ fn main() {
     let mut right_panel_state = RightPanelState::default();
     let mut transcript_panel_state = transcript_panel::TranscriptPanelState::default();
     let mut waveforms = waveform_cache::WaveformCache::default();
+    // Reclaim scratch directories from runs that never reached a clean exit
+    // (a crash or a force-kill skips the cleanup below). Only touches
+    // day-old directories that aren't ours — see `cache_dirs::sweep`.
+    cache_dirs::sweep_temp();
     let mut proxies = proxy_jobs::ProxyJobs::default();
     let mut matting_jobs = matting_jobs::MattingJobs::default();
     let mut autosaver = autosave::Autosave::default();
@@ -188,6 +193,15 @@ fn main() {
                         // file must go — otherwise the next launch would offer
                         // to restore work the user chose to walk away from.
                         autosaver.discard(state.undo.revision() as usize);
+                        // Proxies and mattes are derived data — regenerating
+                        // them is cheap, keeping gigabytes of lossless QTRLE
+                        // around forever is not.
+                        if let Some(d) = proxies.scratch_dir() {
+                            cache_dirs::remove(d);
+                        }
+                        if let Some(d) = matting_jobs.scratch_dir() {
+                            cache_dirs::remove(d);
+                        }
                         elwt.exit()
                     }
                     WindowEvent::Resized(new_size) => {

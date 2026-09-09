@@ -140,13 +140,18 @@ impl MattingJobs {
         asset_paths.iter().map(|(id, path)| (*id, self.ready.get(id).cloned().unwrap_or_else(|| path.clone()))).collect()
     }
 
+    /// The scratch directory, if one was ever created. Used on a clean exit
+    /// to delete it — see `cache_dirs`.
+    pub fn scratch_dir(&self) -> Option<&std::path::Path> {
+        self.dir.as_deref()
+    }
+
     fn ensure_dir(&mut self) -> Option<PathBuf> {
         if let Some(d) = &self.dir {
             return Some(d.clone());
         }
-        let dir = std::env::temp_dir().join(format!("nle-mattes-{}", std::process::id()));
-        match std::fs::create_dir_all(&dir) {
-            Ok(()) => {
+        match crate::cache_dirs::create("nle-mattes-") {
+            Ok(dir) => {
                 self.dir = Some(dir.clone());
                 Some(dir)
             }

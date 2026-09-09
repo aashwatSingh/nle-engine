@@ -34,7 +34,7 @@
 //! them would break the moment it moved to another machine.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 /// Longer edge of a generated proxy. 960 keeps 1080p work comfortably real time
@@ -177,15 +177,18 @@ impl ProxyJobs {
             .collect()
     }
 
+    /// The scratch directory, if one was ever created. Used on a clean exit
+    /// to delete it — see `cache_dirs`.
+    pub fn scratch_dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
     fn ensure_dir(&mut self) -> Option<PathBuf> {
         if let Some(d) = &self.dir {
             return Some(d.clone());
         }
-        // Under the OS temp dir, with the process id so two editors running at
-        // once don't overwrite each other's proxies.
-        let dir = std::env::temp_dir().join(format!("nle-proxies-{}", std::process::id()));
-        match std::fs::create_dir_all(&dir) {
-            Ok(()) => {
+        match crate::cache_dirs::create("nle-proxies-") {
+            Ok(dir) => {
                 self.dir = Some(dir.clone());
                 Some(dir)
             }
