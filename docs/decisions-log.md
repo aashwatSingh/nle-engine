@@ -1268,3 +1268,34 @@ false of the pipeline around it. It now states the constraint on callers and
 names where it is enforced. A comment describing an invariant nothing checks
 is worth about as much as no comment.
 
+## 2026-09-08 — scratch directories now get cleaned up
+
+Second finding from the 7 September audit. `ProxyJobs` and `MattingJobs` each
+created `%TEMP%/nle-{proxies,mattes}-<pid>` and nothing ever deleted them, so
+every run left one behind permanently. Mattes are the expensive half: lossless
+QTRLE, about 4 MB per second of footage, so a few background-removal sessions
+reach gigabytes.
+
+Cleaning up on exit alone would not have fixed it, because the directories
+that actually accumulate come from runs that never reached a clean exit. So
+there are two halves: a clean exit deletes this process's directories, and
+startup sweeps what earlier runs left.
+
+The sweep deletes recursively, which makes it the risky half, so it is
+deliberately narrow — only the two prefixes it owns, never this process's own
+directories, and nothing younger than a day. The age check is what protects a
+second editor running right now: its cache is minutes old, never days. That
+also means the design accepts leaving one crashed session's directory around
+until the next launch, which is the right trade against any chance of deleting
+a live cache.
+
+The two safety tests were written against a deliberately unguarded sweep and
+watched to fail: without the prefix and own-pid guards they delete an
+unrelated application's directory and a live instance's cache. A test for a
+destructive operation is worth little until you have seen it catch the
+destructive version. Also verified in the real binary rather than only in
+tests: a backdated scratch directory was removed at startup while a backdated
+*unrelated* directory and a fresh scratch directory both survived.
+
+Incidentally removed the duplicated `ensure_dir` both job managers carried.
+
