@@ -120,6 +120,13 @@ impl MattingJobs {
         true
     }
 
+    /// A `MattingJobs` with one matte already built. Test-only, same reason
+    /// as `ProxyJobs::enabled_with_ready_for_test`.
+    #[cfg(test)]
+    pub(crate) fn with_ready_for_test(asset: media::MediaAssetId, path: PathBuf) -> Self {
+        Self { ready: HashMap::from([(asset, path)]), ..Default::default() }
+    }
+
     /// `asset_paths` with a ready matte substituted where available.
     /// Applied *after* proxy resolution by the caller (background removal
     /// is a deliberate editorial choice; a proxy is just a performance

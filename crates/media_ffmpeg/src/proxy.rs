@@ -44,7 +44,13 @@ fn proxy_dimensions(width: u32, height: u32, max_dimension: u32) -> (u32, u32) {
 
 /// Video-only (spec's proxy workflow is about smooth visual scrub; audio
 /// still comes from the source or from `generate_audio_peaks`, so it isn't
-/// duplicated into the proxy file). All-intra: every frame is a keyframe,
+/// duplicated into the proxy file).
+///
+/// That is a real constraint on callers, not just a note: because the output
+/// has no audio stream, `AudioDecoderStream::open` fails on it and the clip
+/// decodes as permanent silence. A proxy path must never reach the audio
+/// engine. The editor enforces this in `app`'s `playback_paths`, which hands
+/// proxies to video and the originals to audio. All-intra: every frame is a keyframe,
 /// so seeking within the proxy is trivial — that's the point of a proxy.
 pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> Result<(), ProbeError> {
     let mut input = ffmpeg_next::format::input(source)?;

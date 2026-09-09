@@ -388,6 +388,29 @@ impl Transport {
 /// advances correctly, which keeps one code path driving the transport instead
 /// of two that can disagree. The project is snapshotted by `Arc` here — see
 /// `playback::sequence_audio`'s note on snapshot semantics.
+/// Which file each engine should read during playback.
+///
+/// Video takes every substitution: a proxy for scrub performance, with
+/// matting layered on top so a background-removed asset wins where both exist.
+///
+/// Audio takes none of them. `media_ffmpeg::generate_proxy` writes a
+/// video-only file by design, so handing a proxy to the audio engine makes
+/// `AudioDecoderStream::open` fail and the clip decode as permanent silence
+/// for the rest of the session. Neither substitution ever changes what the
+/// audio should be, so the original is both the simplest and the correct
+/// answer.
+fn playback_paths(
+    originals: &std::collections::HashMap<media::MediaAssetId, std::path::PathBuf>,
+    proxies: &proxy_jobs::ProxyJobs,
+    matting_jobs: &matting_jobs::MattingJobs,
+) -> (
+    std::collections::HashMap<media::MediaAssetId, std::path::PathBuf>,
+    std::collections::HashMap<media::MediaAssetId, std::path::PathBuf>,
+) {
+    let video = matting_jobs.resolve(&proxies.resolve(originals));
+    (video, originals.clone())
+}
+
 fn start_playback(
     state: &mut EditorState,
     transport: &mut Transport,
@@ -399,18 +422,13 @@ fn start_playback(
     state.playing = true;
     state.shuttle_rate = 1.0;
     let project = state.project().clone();
-    // Playback reads proxies when they're enabled and built; export never
-    // reads proxies (see `proxy_jobs`' module doc) but *does* read matting —
-    // background removal is a deliberate edit the user wants delivered, not
-    // a performance shortcut like a proxy. Matting is applied after proxy
-    // resolution so it wins for any asset it has ready.
-    let paths = matting_jobs.resolve(&proxies.resolve(&state.asset_paths));
+    let (video_paths, audio_paths) = playback_paths(&state.asset_paths, proxies, matting_jobs);
 
     // Audio first: video needs a handle to whatever clock ends up authoritative.
     let audio = match playback::SequenceAudioEngine::start(
         project.clone(),
         state.seq_id,
-        paths.clone(),
+        audio_paths,
         state.playhead,
         state.master_gain_db,
     ) {
@@ -446,7 +464,7 @@ fn start_playback(
     let video = playback::SequenceVideoPlayback::start(
         project,
         state.seq_id,
-        paths,
+        video_paths,
         state.playhead,
         clock,
         // Uploads decoded frames to GPU textures on the decode thread itself
@@ -1288,6 +1306,9 @@ fn build_ui(
                 playhead,
                 // Scrubbing benefits most of all from an all-intra proxy: no
                 // decoding forward from a distant keyframe on every jump.
+                // Video-only path: this renders picture for the preview, so a
+                // proxy is exactly what's wanted. Audio never comes through
+                // here — see `playback_paths` for the split.
                 &matting_jobs.resolve(&proxies.resolve(&state.asset_paths)),
             ),
         };
@@ -1384,6 +1405,48 @@ fn recovery_prompt(
 
 #[cfg(test)]
 mod tests {
+
+    /// The "Use proxies" checkbox must not touch what the audio engine reads.
+    /// A proxy is a video-only re-encode, so a proxied asset handed to the
+    /// audio engine decodes as silence — the clip goes mute for the session.
+    #[test]
+    fn enabling_proxies_never_changes_the_audio_path() {
+        let asset = media::MediaAssetId(1);
+        let original = std::path::PathBuf::from("/media/original.mp4");
+        let proxy = std::path::PathBuf::from("/cache/proxy.mp4");
+
+        let mut originals = std::collections::HashMap::new();
+        originals.insert(asset, original.clone());
+
+        let proxies = proxy_jobs::ProxyJobs::enabled_with_ready_for_test(asset, proxy.clone());
+        let matting = matting_jobs::MattingJobs::default();
+
+        let (video, audio) = playback_paths(&originals, &proxies, &matting);
+
+        assert_eq!(video[&asset], proxy, "video should scrub from the proxy");
+        assert_eq!(audio[&asset], original, "audio must still come from the source file");
+    }
+
+    /// Matting is a real edit, so it applies to picture. Its output carries the
+    /// source audio through, but audio still reads the original either way.
+    #[test]
+    fn a_ready_matte_substitutes_for_video_only() {
+        let asset = media::MediaAssetId(7);
+        let original = std::path::PathBuf::from("/media/shot.mp4");
+        let matte = std::path::PathBuf::from("/cache/matte.mov");
+
+        let mut originals = std::collections::HashMap::new();
+        originals.insert(asset, original.clone());
+
+        let proxies = proxy_jobs::ProxyJobs::default();
+        let matting = matting_jobs::MattingJobs::with_ready_for_test(asset, matte.clone());
+
+        let (video, audio) = playback_paths(&originals, &proxies, &matting);
+
+        assert_eq!(video[&asset], matte);
+        assert_eq!(audio[&asset], original);
+    }
+
     use super::*;
 
     #[test]

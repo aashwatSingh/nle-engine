@@ -155,6 +155,13 @@ impl ProxyJobs {
     /// Assets without a proxy keep their original path, so enabling proxies
     /// mid-session degrades gracefully to "some clips are fast" rather than
     /// breaking the ones not yet built.
+    /// An enabled `ProxyJobs` with one proxy already built. Test-only: the
+    /// path-policy tests need a populated map, not a real transcode.
+    #[cfg(test)]
+    pub(crate) fn enabled_with_ready_for_test(asset: media::MediaAssetId, path: PathBuf) -> Self {
+        Self { enabled: true, ready: HashMap::from([(asset, path)]), ..Default::default() }
+    }
+
     pub fn resolve(
         &self,
         asset_paths: &HashMap<media::MediaAssetId, PathBuf>,
