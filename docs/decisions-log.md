@@ -1299,3 +1299,37 @@ tests: a backdated scratch directory was removed at startup while a backdated
 
 Incidentally removed the duplicated `ensure_dir` both job managers carried.
 
+## 2026-09-08 — state.rs split by responsibility
+
+The last item from the 7 September audit, and the one carried furthest: it was
+the top organization finding in August at 5,391 lines and had grown to 5,525.
+
+The shape mattered more than the number. Of those lines, 3,070 were the test
+module; the production half was almost entirely a single `impl EditorState`
+block of 2,195 lines holding 89 methods. So this was never "a 5,500-line file"
+in the way that number suggests — it was one enormous impl block with a large
+test suite attached.
+
+Reading the methods in source order made the seams obvious, because related
+ones had been written next to each other all along: selection and clipboard,
+per-track gain/pan/mute/solo, titles and transitions, the media-analysis batch,
+the speech features, everyday editing, parameter animation, and project I/O.
+The split follows those existing runs rather than imposing a new taxonomy —
+`mod.rs` keeps the types, the lifecycle and the undo/op plumbing everything
+else routes through, and eight sibling modules take a topic each.
+
+Two mechanical notes worth keeping. Child modules use `use super::*`, so no
+import churn: each file is a header, that line, and an `impl EditorState`
+block. And the helpers now called across module lines became `pub(super)`
+rather than `pub` — still private to `state`, just no longer private to one
+file inside it. The compiler named every one of them; there was no guessing
+about which helpers were shared.
+
+Checked as behaviour-neutral rather than assumed: 223 functions before and
+after, 116 tests before and after, 538 passing either way, clippy clean.
+
+The tests stayed in one file deliberately. They were written against
+`EditorState` as a whole and share fixture builders, so splitting them to
+mirror the production split is a separate job with its own risk, and bundling
+it here would have made a structural change impossible to review.
+
