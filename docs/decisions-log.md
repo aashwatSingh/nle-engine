@@ -244,7 +244,7 @@ invisible in code review and only found by running the real thing.
 ## 2026-08-07 — FFmpeg 7.1 (BtbN win64-gpl-shared), not 8.1; requires libclang + explicit MinGW target triple
 
 **Decision:** `media_ffmpeg` links against BtbN's `ffmpeg-n7.1-latest-win64-gpl-shared-7.1` build (extracted to
-`C:\Users\aashw\tools\ffmpeg-n7.1-latest-win64-gpl-shared-7.1`), not the newer 8.1 build also downloaded during
+`%USERPROFILE%\tools\ffmpeg-n7.1-latest-win64-gpl-shared-7.1`), not the newer 8.1 build also downloaded during
 this session. Build requires three env vars set: `FFMPEG_DIR` (pointing at that directory),
 `LIBCLANG_PATH` (pointing at a standalone libclang.dll — see below), and
 `BINDGEN_EXTRA_CLANG_ARGS=--target=x86_64-w64-mingw32 -I<mingw64>/x86_64-w64-mingw32/include -I<mingw64>/lib/gcc/x86_64-w64-mingw32/16.1.0/include`.
@@ -301,7 +301,7 @@ fuzzing results justify the sandboxing cost. `DecoderPool` being a trait
 
 **Decision:** the Rust toolchain on this machine targets
 `x86_64-pc-windows-gnu`, using a portable winlibs MinGW-w64 build (GCC
-16.1.0) extracted to `C:\Users\aashw\tools\mingw64`, not the MSVC target.
+16.1.0) extracted to `%USERPROFILE%\tools\mingw64`, not the MSVC target.
 
 **Alternatives considered:** MSVC target with the VS2022 "Desktop
 development with C++" workload (the earlier-stated default/recommended
@@ -1332,4 +1332,139 @@ The tests stayed in one file deliberately. They were written against
 `EditorState` as a whole and share fixture builders, so splitting them to
 mirror the production split is a separate job with its own risk, and bundling
 it here would have made a structural change impossible to review.
+
+## 2026-09-10 — analysis actions run in the background
+
+Scene cuts, silence removal, beats, loudness matching, stabilization, captions
+and transcription all ran inside their button's click handler. Each one decodes
+the whole clip first, so each froze the editor — no repaint, no input — for as
+long as that took: seconds on a short clip, minutes on long footage. The
+comment above the buttons had flagged it as follow-up work since August.
+
+Each action is now split in two. The measure half is a free function over plain
+data (the clip, the asset paths, the sample rate), so it runs on a worker
+thread. The apply half is the existing `EditorState` code that turns a
+measurement into edits through the undo stack. A click snapshots the inputs and
+returns at once; `poll_analysis` runs every frame beside the proxy and matting
+polls and applies whatever has finished. A running action shows a spinner where
+its button was.
+
+The real design question was what a result means once the user has kept
+editing, because cut positions, silence ranges and stabilization keyframes are
+all computed against where the clip *was*. The rule: a result applies only if
+the clip's track, source, trim, timeline position and speed are all unchanged;
+otherwise it's discarded, and the status line says why. Per-action rules would
+let some results survive a harmless move — scene cuts are source-relative — but
+one rule can't razor the wrong spot, and re-running after a nudge costs far
+less than a wrong edit. Edits that don't touch those fields (effects, gain,
+other clips) leave a result valid, which is the case that matters: nobody sits
+idle for a minute waiting.
+
+Three smaller decisions:
+
+- A keyframed-speed clip is refused at the click, not after the decode. Every
+  action except loudness would have thrown its result away there anyway.
+- Opening a project replaces the job channel. Clip ids restart per project, so
+  an old result would otherwise land on whichever new clip reused its id.
+  Workers can't be cancelled mid-decode; they finish and their result is
+  dropped.
+- A panic inside a worker is caught and reported as a failure. The export and
+  proxy jobs don't do this — the August audit's "worker panic strands jobs"
+  finding — and new code shouldn't repeat it.
+
+The blocking `detect_*` methods survive, compiled only for tests, because the
+real-footage tests drive measure and apply together through them.
+`transcribe_clip` had no other caller and is gone.
+
+Known limit: nothing caps concurrent jobs, so starting several analyses on
+several long clips runs all of them at once.
+
+Checked: 13 new tests — applying against an unchanged clip; discarding after a
+move and after a delete; still applying after an unrelated gain edit; failure
+reporting; loudness, captions and transcription results; the project-switch
+drop; the up-front keyframed refusal; one end to end through a real worker
+thread; and, at the job layer, a panicking job and a refused duplicate click.
+551 passing across the workspace.
+
+## 2026-09-10 — security check follow-up: pinned binaries, a media allowlist, build inputs
+
+The September security check found two Medium and three Low issues. All five are
+addressed here. `docs/security.md` is the standing reference; this entry records
+why each fix took the shape it did.
+
+**Medium: nothing verified the native code loaded from outside the build.**
+`onnxruntime.dll`, `whisper-cli.exe` and the DLLs beside it, both models, and
+the FFmpeg DLLs were all trusted by path alone. A new `integrity` crate pins
+SHA-256 hashes and refuses a mismatch. Two choices are worth keeping:
+
+- **Hash through a handle that shares read access but denies write, rename and
+  delete, and hold it until the load is done.** Checking and then loading by
+  path leaves a window for a swap, and share modes close it. This was measured
+  before anything was built on it: with the handle held, `whisper-cli.exe` still
+  ran and `onnxruntime.dll` still loaded, while rename, write and delete were
+  all refused.
+- **Pin every file the CLI can load, not just the ones this machine uses.**
+  `whisper-cli` picks a `ggml-cpu-*.dll` variant to match the CPU at startup.
+
+FFmpeg's DLLs are imported by `nle.exe` itself, so they load before any of the
+app's code runs. The deploy script is therefore the only place they can be
+checked. It checks them at the source, then again on the copies.
+
+Found along the way: turning the integrity error into an `ort::Error` made `ort`
+initialise its API. Before `init_from` has run, that means
+`LoadLibrary("onnxruntime.dll")` by bare name. It found an unrelated 1.17.1 copy
+on this machine's search path and panicked on the version mismatch. A missing
+runtime already took the same path before this change, so it crashed the
+matting worker instead of reporting an error. `RvmSession::load` now has its own
+error type, and it touches no `ort` API until the verified DLL is loaded.
+
+**Medium: untrusted media reaches FFmpeg unsandboxed, and the bundled build is
+ageing.** A sandbox is the real fix, and it isn't built. What changed instead:
+every open in `media_ffmpeg` goes through `open_input`, which sets
+`format_whitelist` to the demuxers import can need, plus
+`protocol_whitelist=file`. FFmpeg picks a demuxer by content, so before this a
+`.mp4` could select any of hundreds, including ones that open other files. The
+regression test is a concat script named `holiday.mp4`. Before the change,
+`probe` opened it and followed it to the file it named; now it's refused.
+
+On the "never updated" part: the installed 7.1.5 is still the newest 7.1
+release, but BtbN no longer builds 7.1 at all. Moving to 8.1 needs
+`ffmpeg-next` 8, and hasn't been done.
+
+**Low: `ort`'s default features pulled in a build-time HTTP client and native
+TLS**, to download a runtime this project never uses. It's now
+`default-features = false`, keeping only `load-dynamic` and `api-27`. `ureq`
+and `native-tls` are gone from `Cargo.lock`.
+
+**Low: the local account name appeared in eight public files.** Code and
+scripts now find tools through `integrity::tools_dir()`: `NLE_TOOLS_DIR` if
+set, otherwise `%USERPROFILE%\tools`. `.cargo/config.toml` can't expand
+environment variables, so it's now generated by `scripts/configure-machine.ps1`
+from a committed template and gitignored; a fresh clone runs that script once.
+The docs had the path replaced. Git history still contains it, and rewriting a
+published history is a decision, not a cleanup step.
+
+**Low: an unexplained prebuilt `libshlwapi.a` was committed.** Its origin is
+now proven, not just asserted: it's byte-identical to the copy in winlibs'
+MinGW-w64 build (GCC 16.1.0 r4). `build.rs` refuses to build if it changes.
+
+Checked:
+
+- Each new test failed without its fix:
+  - ONNX Runtime parsed the tampered model ("Protobuf parsing failed").
+  - Transcription tried to execute the swapped file.
+  - The concat script opened.
+- The real RVM model and the real `whisper-cli` both ran with their files held.
+- The deploy script's check accepted all eight FFmpeg DLLs, and refused a wrong
+  hash and a missing file.
+- The workspace build is clean, with the `libshlwapi.a` pin checked on every
+  build.
+- Clippy is clean, and 562 tests pass across the workspace (551 before, plus
+  the 11 new ones).
+- `Cargo.lock` no longer contains `ureq` or `native-tls`.
+- The real-model and real-`whisper-cli` tests pass again with tool paths coming
+  from `tools_dir()`.
+- The regenerated `.cargo/config.toml` holds exactly the build settings of the
+  file it replaced.
+- No tracked or unignored file contains the account name.
 
