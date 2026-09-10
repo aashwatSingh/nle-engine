@@ -23,18 +23,36 @@
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$ffmpegBin = "C:\Users\aashw\tools\ffmpeg-n7.1-latest-win64-gpl-shared-7.1\bin"
+# Hand-installed tools live under NLE_TOOLS_DIR if it's set, otherwise
+# %USERPROFILE%\tools -- the same rule as `integrity::tools_dir`.
+$toolsDir = if ($env:NLE_TOOLS_DIR) { $env:NLE_TOOLS_DIR } else { Join-Path $env:USERPROFILE "tools" }
+$ffmpegBin = Join-Path $toolsDir "ffmpeg-n7.1-latest-win64-gpl-shared-7.1\bin"
 $installDir = "$env:LOCALAPPDATA\Programs\nle-engine"
-$requiredDlls = @(
-    "avcodec-61.dll",
-    "avdevice-61.dll",
-    "avfilter-10.dll",
-    "avformat-61.dll",
-    "avutil-59.dll",
-    "postproc-58.dll",
-    "swresample-5.dll",
-    "swscale-8.dll"
-)
+# Pinned to SHA-256 as vetted: BtbN's ffmpeg-n7.1-latest-win64-gpl-shared-7.1
+# build, FFmpeg n7.1.5-12-g1fdbca85aa (2026-08-07). The installed app loads
+# these at startup, before any of its own code runs, so it can't check them
+# itself — this script is the one place they can be checked. To upgrade FFmpeg
+# deliberately, re-pin as described in docs/security.md.
+$requiredDlls = [ordered]@{
+    "avcodec-61.dll"   = "c57bec1c6c3b4df5b9f04718380e5f3923e30e7234bb4324f631c387606e5261"
+    "avdevice-61.dll"  = "c366213df35bf5f8b39594b81253f18bacff27ba8bd05fabf6445c39348ad52c"
+    "avfilter-10.dll"  = "e5eb54d9b8978fcd4338d556152da4c029f07dbcd9c816b975ab6f5971f2c2bd"
+    "avformat-61.dll"  = "36d9ea76ebe3ee8e484323fc3644c628c1f83c2baef9fc400b644a99553f304b"
+    "avutil-59.dll"    = "8a6cfc56b0c28b1d143068b4198fb0f556d73fc0e84ffb76c62a6177b8f23b7a"
+    "postproc-58.dll"  = "c5ae8bd2f60791c5b5bc746f8d48ea557c0a30832b8963b814393c4557d95797"
+    "swresample-5.dll" = "79d7b27e209976715001525df230fa0f7f5ab2f2dc86810b117699b883031e36"
+    "swscale-8.dll"    = "9a379004bf735fffb94aa81d833408119d30e1e5ea782001f4293d7dd7ce1250"
+}
+
+function Assert-Sha256($path, $expected) {
+    if (-not (Test-Path $path)) {
+        throw "missing expected file: $path (has the FFmpeg install moved?)"
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
+    if ($actual -ne $expected) {
+        throw "$path failed its integrity check (expected SHA-256 $expected, found $actual) -- it has changed since it was vetted; reinstall it, or re-pin it deliberately (see docs/security.md)"
+    }
+}
 
 Write-Host "Building release..."
 Push-Location $repoRoot
@@ -48,6 +66,12 @@ try {
 $builtExe = Join-Path $repoRoot "target\release\nle.exe"
 if (-not (Test-Path $builtExe)) {
     throw "expected $builtExe to exist after a successful build"
+}
+
+# Checked before anything in the install directory is touched, so a bad DLL
+# leaves the previous install working rather than half-replaced.
+foreach ($dll in $requiredDlls.Keys) {
+    Assert-Sha256 (Join-Path $ffmpegBin $dll) $requiredDlls[$dll]
 }
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
@@ -64,12 +88,10 @@ if ($running) {
 
 Write-Host "Copying exe and FFmpeg dependencies to $installDir..."
 Copy-Item $builtExe $installDir -Force
-foreach ($dll in $requiredDlls) {
-    $src = Join-Path $ffmpegBin $dll
-    if (-not (Test-Path $src)) {
-        throw "missing expected FFmpeg DLL: $src (has the FFmpeg install moved?)"
-    }
-    Copy-Item $src $installDir -Force
+foreach ($dll in $requiredDlls.Keys) {
+    Copy-Item (Join-Path $ffmpegBin $dll) $installDir -Force
+    # Again after copying: what the app loads is the copy, not the source.
+    Assert-Sha256 (Join-Path $installDir $dll) $requiredDlls[$dll]
 }
 
 function Set-AppShortcut($path) {

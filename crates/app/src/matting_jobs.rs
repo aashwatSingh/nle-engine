@@ -91,7 +91,7 @@ impl MattingJobs {
         self.in_flight.insert(asset);
         std::thread::spawn(move || {
             let result = (|| {
-                let mut session = matting::RvmSession::load(std::path::Path::new(matting::ONNXRUNTIME_MODEL_DEFAULT))
+                let mut session = matting::RvmSession::load(&matting::default_model())
                     .map_err(|e| format!("could not load background-removal model: {e}"))?;
                 let options = media_ffmpeg::MatteVideoOptions::default();
                 // 0.25 matches RVM's own reference guidance for roughly

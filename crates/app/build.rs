@@ -21,11 +21,23 @@
 // produces an ABI-mismatched binary. Shipping only the one missing file
 // removes that ambiguity — nothing else in this directory can shadow
 // anything the self-contained toolchain already provides.
+//
+// Its provenance is proven, not just recorded: it's byte-identical to
+// `x86_64-w64-mingw32/lib/libshlwapi.a` in winlibs' MinGW-w64 build (GCC
+// 16.1.0 r4, by Brecht Sanders) — the toolchain it was copied from.
+const LIBSHLWAPI_SHA256: &str = "7ebcf0a50d860377af1fa308a541cadbecd0d79bd481969f635a67f4f44e1fb2";
+
 fn main() {
-    println!(
-        "cargo:rustc-link-search=native={}/vendor-lib",
-        std::env::var("CARGO_MANIFEST_DIR").unwrap()
-    );
+    let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    // Pinned because it's linked straight into nle.exe. An import library
+    // should hold only stubs, but nothing stops a swapped one from carrying
+    // real object code, and nothing else in the build would notice. See
+    // docs/security.md.
+    let vendored = manifest_dir.join("vendor-lib").join("libshlwapi.a");
+    if let Err(e) = integrity::verify(&integrity::Pin::new(&vendored, LIBSHLWAPI_SHA256)) {
+        panic!("{e}");
+    }
+    println!("cargo:rustc-link-search=native={}", manifest_dir.join("vendor-lib").display());
 
     // Embeds assets/icon.ico into the .exe (Explorer, taskbar, Alt+Tab, and
     // any shortcut that doesn't override its own icon all pick it up from
@@ -45,8 +57,8 @@ fn main() {
     // the vendor-lib link-search above uses — see that comment for why a
     // *global* PATH/link-search change previously corrupted unrelated
     // builds, which a build-script-local env var can't do.
-    let mingw_bin = r"C:\Users\aashw\tools\mingw64\bin";
+    let mingw_bin = integrity::tools_dir().join(r"mingw64\bin");
     let path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var("PATH", format!("{mingw_bin};{path}"));
+    std::env::set_var("PATH", format!("{};{path}", mingw_bin.display()));
     embed_resource::compile("assets/icon.rc", embed_resource::NONE);
 }

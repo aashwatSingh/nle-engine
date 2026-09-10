@@ -59,7 +59,7 @@ pub fn generate_matte_video(
     mut alpha_of: impl FnMut(&[u8], usize, usize) -> Vec<f32>,
     output: &Path,
 ) -> Result<(), ProbeError> {
-    let mut input = ffmpeg_next::format::input(source)?;
+    let mut input = crate::open_input(source)?;
     let in_stream_index = input
         .streams()
         .best(ffmpeg_next::media::Type::Video)

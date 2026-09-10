@@ -36,3 +36,5 @@ tempfile = "3"
 # already required for FFmpeg linking) rather than assuming MSVC's `rc.exe`,
 # which is what the older, more commonly-suggested `winres` crate requires.
 embed-resource = "2"
+# Pins vendor-lib/libshlwapi.a, and locates the mingw64 toolchain — see build.rs.
+integrity = { workspace = true }

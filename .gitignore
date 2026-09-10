@@ -6,6 +6,10 @@
 # Stray directory from an unexpanded %SystemDrive% in a script; not source.
 %SystemDrive%/
 
+# Generated per machine by scripts/configure-machine.ps1: absolute tool paths,
+# which include the local account name.
+/.cargo/config.toml
+
 # Never publish local environment files.
 .env
 .env.*

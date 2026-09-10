@@ -53,7 +53,7 @@ fn proxy_dimensions(width: u32, height: u32, max_dimension: u32) -> (u32, u32) {
 /// proxies to video and the originals to audio. All-intra: every frame is a keyframe,
 /// so seeking within the proxy is trivial — that's the point of a proxy.
 pub fn generate_proxy(source: &Path, options: &ProxyOptions, output: &Path) -> Result<(), ProbeError> {
-    let mut input = ffmpeg_next::format::input(source)?;
+    let mut input = crate::open_input(source)?;
     let in_stream_index = input
         .streams()
         .best(ffmpeg_next::media::Type::Video)

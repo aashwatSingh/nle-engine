@@ -33,7 +33,7 @@ pub struct AudioDecoderStream {
 
 impl AudioDecoderStream {
     pub fn open(path: &Path, target_rate: u32, target_channels: u16) -> Result<Self, ProbeError> {
-        let input = ffmpeg_next::format::input(path)?;
+        let input = crate::open_input(path)?;
         let stream_index = input
             .streams()
             .best(ffmpeg_next::media::Type::Audio)

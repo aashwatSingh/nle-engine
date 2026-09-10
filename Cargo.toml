@@ -19,6 +19,7 @@ members = [
     "crates/audio_source",
     "crates/speech",
     "crates/matting",
+    "crates/integrity",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ command = { path = "crates/command" }
 audio_source = { path = "crates/audio_source" }
 playback = { path = "crates/playback" }
 speech = { path = "crates/speech" }
+integrity = { path = "crates/integrity" }
 
 [profile.dev]
 opt-level = 1

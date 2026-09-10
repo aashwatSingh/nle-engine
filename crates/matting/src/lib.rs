@@ -50,17 +50,63 @@ pub struct Matte {
     pub alpha: Vec<f32>,
 }
 
-/// Where the manually-downloaded ONNX Runtime DLL lives on this machine —
-/// same trade this project already made for FFmpeg and Whisper: hardcoded,
-/// not searched for, since a search path would fail silently on a
-/// different machine anyway. `ort`'s own prebuilt-binary fetch has no
-/// x86_64-pc-windows-gnu build, so this points `ort` at Microsoft's
-/// official release DLL instead (see this crate's Cargo.toml).
-pub const ONNXRUNTIME_DLL: &str = r"C:\Users\aashw\tools\onnxruntime\extracted\onnxruntime-win-x64-1.29.0\lib\onnxruntime.dll";
+/// Where Microsoft's ONNX Runtime release was unpacked, under
+/// `integrity::tools_dir` — same trade this project already made for FFmpeg
+/// and Whisper: a fixed place, not searched for, since a search path would
+/// fail silently on a different machine anyway. `ort`'s own prebuilt-binary
+/// fetch has no x86_64-pc-windows-gnu build, so this points `ort` at
+/// Microsoft's official release DLL instead (see this crate's Cargo.toml).
+fn onnxruntime_lib_dir() -> std::path::PathBuf {
+    integrity::tools_dir().join(r"onnxruntime\extracted\onnxruntime-win-x64-1.29.0\lib")
+}
 
-/// Where the downloaded RVM model lives on this machine — same trade as
-/// `ONNXRUNTIME_DLL` above.
-pub const ONNXRUNTIME_MODEL_DEFAULT: &str = r"C:\Users\aashw\tools\rvm-models\rvm_mobilenetv3_fp32.onnx";
+/// Where the downloaded RVM model lives — same trade as `onnxruntime_lib_dir`.
+fn default_model_path() -> std::path::PathBuf {
+    integrity::tools_dir().join(r"rvm-models\rvm_mobilenetv3_fp32.onnx")
+}
+
+// SHA-256 pins for everything above, as vetted — see the `integrity` crate for
+// why, and docs/security.md for how to re-pin after a deliberate upgrade.
+// The two DLLs come from Microsoft's official onnxruntime-win-x64-1.29.0.zip.
+const ONNXRUNTIME_DLL_SHA256: &str = "69d8e6d3879a3b4001cdc74c8ed9ccc7e7f799a5b847059738323404519ec471";
+
+/// `onnxruntime_providers_shared.dll` ships beside `onnxruntime.dll` in the
+/// same release, and the runtime can load it from that directory, so it's
+/// pinned along with the runtime.
+const ONNXRUNTIME_PROVIDERS_SHARED_SHA256: &str = "87f6878cdc1f80b3a9afa5b0c84663315030b4957f5bbb6b66470557cb2f48d8";
+
+pub const DEFAULT_MODEL_SHA256: &str = "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828";
+
+/// The RVM model this app uses, with its pin.
+pub fn default_model() -> integrity::Pin {
+    integrity::Pin::new(default_model_path(), DEFAULT_MODEL_SHA256)
+}
+
+/// Why `RvmSession::load` failed.
+#[derive(Debug)]
+pub enum LoadError {
+    /// The model or a runtime DLL isn't the vetted file; nothing was loaded.
+    Integrity(integrity::IntegrityError),
+    /// ONNX Runtime refused to start or to load the model.
+    Runtime(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Integrity(e) => write!(f, "{e}"),
+            LoadError::Runtime(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+impl From<ort::Error> for LoadError {
+    fn from(e: ort::Error) -> Self {
+        LoadError::Runtime(e.to_string())
+    }
+}
 
 /// Copies an extracted `(shape, data)` tensor view into a fresh owned
 /// `Tensor`, for carrying a recurrent-state output forward as next frame's
@@ -76,11 +122,26 @@ macro_rules! owned_tensor {
 }
 
 impl RvmSession {
-    pub fn load(model_path: &std::path::Path) -> ort::Result<Self> {
-        ort::init_from(ONNXRUNTIME_DLL)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-            .commit();
-        let session = Session::builder()?.commit_from_file(model_path)?;
+    pub fn load(model: &integrity::Pin) -> Result<Self, LoadError> {
+        // Checked before anything is loaded or parsed, and held until the
+        // session exists, so neither the runtime nor the model can be swapped
+        // between the check and its use. The model is checked first, which is
+        // also why the tampered-model test doesn't need the runtime installed.
+        let lib_dir = onnxruntime_lib_dir();
+        let runtime = lib_dir.join("onnxruntime.dll");
+        let _verified = integrity::verify_all(&[
+            model.clone(),
+            integrity::Pin::new(&runtime, ONNXRUNTIME_DLL_SHA256),
+            integrity::Pin::new(lib_dir.join("onnxruntime_providers_shared.dll"), ONNXRUNTIME_PROVIDERS_SHARED_SHA256),
+        ])
+        .map_err(LoadError::Integrity)?;
+        // Stringified rather than converted into `ort::Error`: building one
+        // initialises `ort`'s API, and before `init_from` has succeeded that
+        // means `LoadLibrary("onnxruntime.dll")` by bare name — which found an
+        // unrelated 1.17.1 copy elsewhere on this machine's search path and
+        // panicked on the version mismatch.
+        ort::init_from(&runtime).map_err(|e| LoadError::Runtime(e.to_string()))?.commit();
+        let session = Session::builder()?.commit_from_file(&model.path)?;
         let state = RecurrentState::zeroed()?;
         Ok(RvmSession { session, state })
     }
@@ -148,8 +209,24 @@ impl RvmSession {
 mod tests {
     use super::*;
 
-    fn model_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(r"C:\Users\aashw\tools\rvm-models\rvm_mobilenetv3_fp32.onnx")
+    /// A model file that isn't the vetted one must be refused before ONNX
+    /// Runtime parses it. Not `#[ignore]`d: the model is checked first, so
+    /// this doesn't need the runtime installed to reach its assertion.
+    #[test]
+    fn a_model_that_fails_its_pin_is_refused_before_it_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("swapped-rvm.onnx");
+        std::fs::write(&model, b"not the vetted model").unwrap();
+
+        let err = RvmSession::load(&integrity::Pin::new(&model, DEFAULT_MODEL_SHA256))
+            .err()
+            .expect("a model that doesn't match its pin must be refused");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("integrity check") && message.contains("swapped-rvm.onnx"),
+            "should say which file failed and why: {message}"
+        );
     }
 
     /// Spike test: loads the real model and runs two frames of inference
@@ -160,10 +237,10 @@ mod tests {
     #[test]
     #[ignore]
     fn loads_the_real_model_and_infers_two_frames() {
-        let path = model_path();
-        assert!(path.is_file(), "model not found at {path:?} — see docs/decisions-log.md's matting entry");
+        let model = default_model();
+        assert!(model.path.is_file(), "model not found at {:?} — see docs/decisions-log.md's matting entry", model.path);
 
-        let mut session = RvmSession::load(&path).expect("failed to load RVM model");
+        let mut session = RvmSession::load(&model).expect("failed to load RVM model");
         let (w, h) = (64, 48);
         let frame = vec![128u8; w * h * 3];
 

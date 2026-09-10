@@ -731,7 +731,7 @@ change it to also call the new dialog:
 
 - [ ] **Step 6: Build and fix any compile errors**
 
-Run: `export PATH="/c/Users/aashw/tools/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin:$PATH" && cargo build -p app --bin nle`
+Run: `export PATH="$HOME/tools/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin:$PATH" && cargo build -p app --bin nle`
 Expected: builds clean. If there's a borrow-checker error about `export`
 being borrowed both immutably (for `export.job.is_none()` in the File
 menu) and mutably elsewhere in the same closure, resolve it the same way
@@ -911,7 +911,7 @@ argument right after `&mut scopes_panel_state,`:
 
 - [ ] **Step 5: Build and fix any compile errors**
 
-Run: `export PATH="/c/Users/aashw/tools/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin:$PATH" && cargo build -p app --bin nle`
+Run: `export PATH="$HOME/tools/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin:$PATH" && cargo build -p app --bin nle`
 Expected: builds clean.
 
 - [ ] **Step 6: Verify live**
@@ -1063,7 +1063,7 @@ Add directly after the closing `}` of that block (i.e. right after
 
 - [ ] **Step 5: Build and fix any compile errors**
 
-Run: `export PATH="/c/Users/aashw/tools/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin:$PATH" && cargo build -p app --bin nle`
+Run: `export PATH="$HOME/tools/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin:$PATH" && cargo build -p app --bin nle`
 Expected: builds clean.
 
 - [ ] **Step 6: Verify live**
@@ -1099,7 +1099,7 @@ After all five tasks are complete:
 - [ ] Run the full workspace test suite:
 
 ```bash
-export PATH="/c/Users/aashw/tools/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin:$PATH"
+export PATH="$HOME/tools/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin:$PATH"
 cargo test --workspace 2>&1 | grep -E "FAILED|error\[|^error:|test result:"
 ```
 

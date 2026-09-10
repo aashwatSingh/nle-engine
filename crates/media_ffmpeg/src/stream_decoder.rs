@@ -24,7 +24,7 @@ pub struct VideoDecoderStream {
 
 impl VideoDecoderStream {
     pub fn open(path: &Path) -> Result<Self, ProbeError> {
-        let input = ffmpeg_next::format::input(path)?;
+        let input = crate::open_input(path)?;
         let stream_index = input
             .streams()
             .best(ffmpeg_next::media::Type::Video)

@@ -1,0 +1,14 @@
+# Machine-specific toolchain setup for building crates/media_ffmpeg (and, in
+# future, anything else linking FFmpeg). See docs/decisions-log.md for why
+# each of these exists.
+#
+# This is a template. scripts/configure-machine.ps1 writes .cargo/config.toml
+# from it, filling in the tools directory (NLE_TOOLS_DIR if set, otherwise
+# %USERPROFILE%\tools). The generated file is gitignored: cargo can't expand
+# environment variables here, so it has to hold absolute paths, and those
+# include the local account name.
+
+[env]
+FFMPEG_DIR = "{TOOLS_DIR}/ffmpeg-n7.1-latest-win64-gpl-shared-7.1"
+LIBCLANG_PATH = "{TOOLS_DIR}/libclang-pip/clang/native"
+BINDGEN_EXTRA_CLANG_ARGS = "--target=x86_64-w64-mingw32 -I{TOOLS_DIR}/mingw64/x86_64-w64-mingw32/include -I{TOOLS_DIR}/mingw64/lib/gcc/x86_64-w64-mingw32/16.1.0/include"

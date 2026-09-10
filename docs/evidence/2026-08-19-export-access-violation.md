@@ -6,7 +6,7 @@ Reproduced 1 time in 6 full-workspace runs; 0 in 12 isolated runs of the same bi
 ```
 
 Caused by:
-  process didn't exit successfully: `C:\Users\aashw\Downloads\nle-engine\target\debug\deps\export_sequence-b1b963a4a8ec458d.exe` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
+  process didn't exit successfully: `<repo>\target\debug\deps\export_sequence-b1b963a4a8ec458d.exe` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
 note: test exited abnormally; to see the full output pass --no-capture to the harness.
 ```
 

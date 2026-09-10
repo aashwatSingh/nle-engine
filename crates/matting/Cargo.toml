@@ -20,6 +20,14 @@ license.workspace = true
 # no build-time linking against a target-specific import lib at all, so the
 # GNU/MSVC ABI mismatch that sank whisper-rs's from-source build doesn't
 # apply here: this is a plain C-API DLL, not something being compiled.
-ort = { version = "2.0.0-rc.9", features = ["load-dynamic"] }
+#
+# `default-features = false`: the defaults add `download-binaries` and
+# `tls-native` (a build-time HTTP client and native TLS stack for fetching a
+# runtime this crate never uses, since it loads the pinned DLL itself), plus
+# `copy-dylibs`, `ndarray` and `tracing`, none of which this code touches.
+# `api-27` is kept from the defaults so the API surface doesn't change.
+ort = { version = "2.0.0-rc.9", default-features = false, features = ["load-dynamic", "api-27"] }
+integrity = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"

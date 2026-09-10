@@ -44,7 +44,7 @@ impl AudioPeaks {
 }
 
 pub fn generate_audio_peaks(source: &Path, samples_per_peak: u32) -> Result<AudioPeaks, ProbeError> {
-    let mut input = ffmpeg_next::format::input(source)?;
+    let mut input = crate::open_input(source)?;
     let stream_index = input
         .streams()
         .best(ffmpeg_next::media::Type::Audio)

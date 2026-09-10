@@ -82,6 +82,31 @@ pub fn init() -> Result<(), ProbeError> {
     Ok(())
 }
 
+/// Demuxers media import can need: the MP4/QuickTime family (which also
+/// covers this app's own proxies, mattes and exports), Matroska/WebM, AVI,
+/// MPEG-TS, ASF/WMV, FLV, and the common audio containers. Names are matched
+/// against each demuxer's whole alias list, so `mov` also admits mp4, m4a and
+/// 3gp, and `matroska` admits webm.
+const ALLOWED_DEMUXERS: &str = "mov,matroska,avi,mpegts,asf,flv,wav,mp3,flac,ogg,aac";
+
+/// Opens `path` for demuxing, restricted to what media import needs. Every
+/// open in this crate goes through here.
+///
+/// Every file this crate reads is untrusted — it's whatever the user
+/// imported — and FFmpeg parses it in-process, unsandboxed. Two limits
+/// shrink what that parsing can reach. FFmpeg picks a demuxer by content, not
+/// by extension, so a file named `.mp4` could otherwise select any of several
+/// hundred, including ones that go on to open other files or URLs (concat
+/// scripts, HLS playlists, image sequences); `format_whitelist` refuses all
+/// but `ALLOWED_DEMUXERS`. And `protocol_whitelist=file` keeps even an
+/// allowed demuxer from reaching past local files.
+pub(crate) fn open_input(path: &Path) -> Result<ffmpeg_next::format::context::Input, ffmpeg_next::Error> {
+    let mut options = ffmpeg_next::Dictionary::new();
+    options.set("format_whitelist", ALLOWED_DEMUXERS);
+    options.set("protocol_whitelist", "file");
+    ffmpeg_next::format::input_with_dictionary(path, options)
+}
+
 fn to_rational(r: ffmpeg_next::Rational) -> Rational {
     Rational { num: r.numerator().max(0) as u32, den: r.denominator().max(1) as u32 }
 }
@@ -146,7 +171,7 @@ fn content_hash(path: &Path) -> Result<[u8; 32], std::io::Error> {
 /// PTS index) in a single demux pass. Returns an immutable `MediaAsset` —
 /// nothing here is re-probed later, per spec 4.1.
 pub fn probe(path: &Path) -> Result<MediaAsset, ProbeError> {
-    let mut input = ffmpeg_next::format::input(path)?;
+    let mut input = open_input(path)?;
 
     let video_stream_index = input
         .streams()
@@ -301,7 +326,7 @@ pub struct DecodedRgbaFrame {
 /// thing that proves decode-to-pixels works at all, per spec M1's "display
 /// any frame from any file" acceptance bar.
 pub fn decode_frame_at(path: &Path, target_ticks: i64) -> Result<DecodedRgbaFrame, ProbeError> {
-    let mut input = ffmpeg_next::format::input(path)?;
+    let mut input = open_input(path)?;
     let stream_index = input
         .streams()
         .best(ffmpeg_next::media::Type::Video)
@@ -424,6 +449,25 @@ mod tests {
         let asset = probe(&fixture("test_prores.mov")).unwrap();
         let video = asset.video.expect("prores fixture has video");
         assert_eq!((video.width, video.height), (640, 360));
+    }
+
+    /// An imported "video" that is really a concat script makes FFmpeg open
+    /// whatever files it names — the same class of trick as an HLS playlist
+    /// pointing at local files or URLs. Nothing a user imports as media needs
+    /// a demuxer that opens other files, so those demuxers must be refused.
+    #[test]
+    fn a_concat_script_disguised_as_media_is_refused() {
+        init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(fixture("test_h264.mp4"), dir.path().join("inner.mp4")).unwrap();
+        let script = dir.path().join("holiday.mp4");
+        std::fs::write(&script, "ffconcat version 1.0\nfile 'inner.mp4'\n").unwrap();
+
+        assert!(probe(&script).is_err(), "a concat script must not open as media");
+        assert!(
+            decode_frame_at(&script, 0).is_err(),
+            "decode must refuse it too — every open goes through the same allowlist"
+        );
     }
 
     #[test]
