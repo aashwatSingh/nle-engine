@@ -253,6 +253,9 @@ fn main() {
                         // proxies sit on the channel and are never adopted.
                         proxies.poll();
                         matting_jobs.poll();
+                        // Scene cuts, silence, captions and the rest: their
+                        // results are edits, applied here on the UI thread.
+                        state.poll_analysis();
                         // One import, one undo step, however many files landed.
                         if !pending_drops.is_empty() {
                             state.import_assets(std::mem::take(&mut pending_drops));

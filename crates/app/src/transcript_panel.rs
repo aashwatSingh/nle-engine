@@ -58,17 +58,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut TranscriptPa
     sync_selected_clip(panel, clip_id);
 
     ui.horizontal(|ui| {
-        if ui
+        let kind = crate::state::AnalysisKind::Transcribe;
+        if state.analysis_running(clip_id, kind) {
+            ui.spinner();
+            ui.label(kind.running_label());
+        } else if ui
             .button("Transcribe")
-            .on_hover_text("local Whisper transcription of this clip's audio — fully offline, can take a while on long clips")
+            .on_hover_text("local Whisper transcription of this clip's audio — fully offline, runs in the background")
             .clicked()
         {
             panel.anchor = None;
             panel.end = None;
-            let found = state.transcribe_clip(clip_id);
-            if !found && state.status.is_empty() {
-                state.status = "no speech found".into();
-            }
+            state.start_analysis(clip_id, kind, 0.0);
         }
     });
 

@@ -1084,7 +1084,8 @@ fn match_clip_loudness_runs_end_to_end_on_real_footage() {
     // signal in dB, which is what a linear gain stage does) should land
     // at the target — the honest way to confirm this isn't just
     // "produced *a* number" but produced the *right* number.
-    let (interleaved, sample_rate) = state.decode_clip_interleaved_audio(&clip).unwrap();
+    let sample_rate = state.sequence().settings.sample_rate;
+    let interleaved = super::analysis::decode_interleaved(&state.asset_paths, sample_rate, &clip).unwrap();
     let raw = audio::loudness::LoudnessMeasurement::analyze(&interleaved, audio::CHANNELS, sample_rate);
     let achieved = raw.integrated_lufs as f64 + gain;
     if gain.abs() < 23.9 {
@@ -1790,6 +1791,255 @@ fn state_with_three_clips() -> (EditorState, Vec<ClipInstanceId>) {
     state.undo.push("setup", std::sync::Arc::new(project));
     state.selected_clips.clear();
     (state, ids)
+}
+
+// ---- Background analysis: applying finished jobs --------------------------
+
+fn placement_now(state: &EditorState, clip: ClipInstanceId) -> analysis_jobs::Placement {
+    let (track, instance) = state.find_clip(clip).expect("fixture clip exists");
+    analysis_jobs::Placement::of(track, &instance)
+}
+
+/// Queues a result as if a worker had just finished computing it against
+/// `placement`.
+fn finish_analysis(
+    state: &mut EditorState,
+    clip: ClipInstanceId,
+    kind: AnalysisKind,
+    placement: analysis_jobs::Placement,
+    result: Result<analysis_jobs::Outcome, analysis_jobs::AnalysisError>,
+) {
+    state.analysis.inject_for_test(analysis_jobs::Finished { clip_id: clip, kind, placement, result });
+}
+
+#[test]
+fn a_finished_analysis_is_applied_when_its_clip_is_unchanged() {
+    let (mut state, ids) = state_with_three_clips();
+    let placement = placement_now(&state, ids[1]);
+    finish_analysis(
+        &mut state,
+        ids[1],
+        AnalysisKind::SceneCuts,
+        placement,
+        Ok(analysis_jobs::Outcome::SceneCuts(vec![TIMEBASE / 2])),
+    );
+
+    state.poll_analysis();
+
+    assert_eq!(state.sequence().tracks[0].clips.len(), 4, "the cut should split the middle clip");
+    assert_eq!(clip_starts(&state), vec![0, TIMEBASE, TIMEBASE + TIMEBASE / 2, 2 * TIMEBASE]);
+    assert_eq!(state.status, "found and split at 1 scene cut");
+    assert!(!state.analysis_running(ids[1], AnalysisKind::SceneCuts));
+}
+
+/// The case the whole `Placement` check exists for: the cut positions were
+/// computed against where the clip *was*, so applying them after a move
+/// would razor some other part of the timeline.
+#[test]
+fn a_finished_analysis_is_discarded_if_its_clip_moved_while_it_ran() {
+    let (mut state, ids) = state_with_three_clips();
+    let placement = placement_now(&state, ids[2]);
+    state.begin_drag_edit("move clip");
+    state.move_clip(ids[2], TrackId(1), 5 * TIMEBASE);
+    state.end_drag_edit();
+    assert_ne!(placement_now(&state, ids[2]), placement, "setup: the clip should have moved");
+    let before = (**state.project()).clone();
+    finish_analysis(
+        &mut state,
+        ids[2],
+        AnalysisKind::SceneCuts,
+        placement,
+        Ok(analysis_jobs::Outcome::SceneCuts(vec![TIMEBASE / 2])),
+    );
+
+    state.poll_analysis();
+
+    assert_eq!(**state.project(), before, "a stale result must not edit the project");
+    assert!(state.status.contains("run it again"), "status should say why nothing happened: {:?}", state.status);
+}
+
+#[test]
+fn a_finished_analysis_is_discarded_if_its_clip_was_deleted_while_it_ran() {
+    let (mut state, ids) = state_with_three_clips();
+    let placement = placement_now(&state, ids[2]);
+    assert!(state.apply_op("delete", EditOp::Extract { clip: ids[2] }));
+    let before = (**state.project()).clone();
+    finish_analysis(
+        &mut state,
+        ids[2],
+        AnalysisKind::Silence,
+        placement,
+        Ok(analysis_jobs::Outcome::Silence(vec![(0.2, 0.6)])),
+    );
+
+    state.poll_analysis();
+
+    assert_eq!(**state.project(), before);
+    assert!(state.status.contains("deleted"), "status should say why nothing happened: {:?}", state.status);
+}
+
+/// Discarding on *any* edit would make these actions useless on a long clip:
+/// nobody sits idle for minutes. Only edits to what the result was computed
+/// against should invalidate it.
+#[test]
+fn a_finished_analysis_still_applies_after_an_unrelated_edit_to_the_same_clip() {
+    let (mut state, ids) = state_with_three_clips();
+    let placement = placement_now(&state, ids[0]);
+    assert!(state.apply_loudness_match_gain(ids[0], -3.0), "setup: change the clip's gain meanwhile");
+    finish_analysis(
+        &mut state,
+        ids[0],
+        AnalysisKind::Beats,
+        placement,
+        Ok(analysis_jobs::Outcome::Beats(vec![0.5])),
+    );
+
+    state.poll_analysis();
+
+    assert_eq!(state.sequence().markers.len(), 1);
+    assert_eq!(state.sequence().markers[0].position, TimeTick(TIMEBASE / 2));
+    assert_eq!(state.status, "added 1 beat marker");
+}
+
+#[test]
+fn a_failed_analysis_reports_why_and_leaves_the_project_alone() {
+    let (mut state, ids) = state_with_three_clips();
+    let before = (**state.project()).clone();
+    let placement = placement_now(&state, ids[0]);
+    finish_analysis(&mut state, ids[0], AnalysisKind::Beats, placement, Err(analysis_jobs::AnalysisError::NoAudio));
+
+    state.poll_analysis();
+
+    assert_eq!(**state.project(), before);
+    assert_eq!(state.status, "couldn't detect beats — this clip has no audio to analyse");
+}
+
+#[test]
+fn a_finished_loudness_measurement_sets_the_clips_gain() {
+    let (mut state, ids) = state_with_three_clips();
+    let placement = placement_now(&state, ids[0]);
+    finish_analysis(
+        &mut state,
+        ids[0],
+        AnalysisKind::Loudness,
+        placement,
+        Ok(analysis_jobs::Outcome::Loudness { gain_db: -6.0, target_lufs: -14.0 }),
+    );
+
+    state.poll_analysis();
+
+    let (_, clip) = state.find_clip(ids[0]).unwrap();
+    assert_eq!(clip.audio_gain_db.default, ParamValue::Number(-6.0));
+    assert_eq!(state.status, "applied -6.0dB to reach -14 LUFS");
+}
+
+/// A result for clip 20 of the *previous* project must not razor clip 20 of
+/// the one just opened — ids restart per project, so they collide routinely.
+#[test]
+fn analysis_still_running_when_a_project_is_opened_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.nleproj");
+    let (mut state, ids) = state_with_three_clips();
+    state.save_to(&path);
+    let placement = placement_now(&state, ids[1]);
+    finish_analysis(
+        &mut state,
+        ids[1],
+        AnalysisKind::SceneCuts,
+        placement,
+        Ok(analysis_jobs::Outcome::SceneCuts(vec![TIMEBASE / 2])),
+    );
+
+    assert!(state.open_from(&path));
+    state.poll_analysis();
+
+    assert_eq!(state.sequence().tracks[0].clips.len(), 3, "the old project's result must not apply");
+    assert!(!state.analysis_running(ids[1], AnalysisKind::SceneCuts));
+}
+
+#[test]
+fn starting_a_speed_dependent_analysis_on_a_keyframed_clip_is_refused_up_front() {
+    let (mut state, ids) = state_with_three_clips();
+    let mut project = (**state.project()).clone();
+    project.sequences[0].tracks[0].clips[0].speed =
+        SpeedCurve::Keyframed(timeline::ParamTrack::constant(ParamValue::Number(1.0)));
+    state.undo.push("keyframe speed", std::sync::Arc::new(project));
+
+    assert!(!state.start_analysis(ids[0], AnalysisKind::SceneCuts, -14.0));
+
+    assert!(!state.analysis_running(ids[0], AnalysisKind::SceneCuts), "no work should have been started");
+    assert!(state.status.contains("constant speed"), "status should say why: {:?}", state.status);
+}
+
+#[test]
+fn finished_captions_land_on_a_new_track_and_fill_the_transcript() {
+    let (mut state, ids) = state_with_three_clips();
+    // The fixture hand-picks its ids without advancing `next_id`, so the new
+    // caption track would otherwise be allocated V1's own id.
+    state.next_id = 1000;
+    let placement = placement_now(&state, ids[0]);
+    let segments = vec![speech::Segment {
+        text: "hi there".into(),
+        start_ms: 100,
+        end_ms: 900,
+        words: vec![
+            speech::Word { text: "hi".into(), start_ms: 100, end_ms: 300 },
+            speech::Word { text: "there".into(), start_ms: 300, end_ms: 900 },
+        ],
+    }];
+    finish_analysis(&mut state, ids[0], AnalysisKind::Captions, placement, Ok(analysis_jobs::Outcome::Captions(segments)));
+
+    state.poll_analysis();
+
+    assert_eq!(state.sequence().tracks.len(), 2, "V1 is occupied there, so captions need a track above");
+    let captions = &state.sequence().tracks[1].clips;
+    assert_eq!(captions.len(), 1);
+    assert!(matches!(captions[0].source, ClipSource::Title(_)));
+    assert_eq!(state.transcripts.get(&ids[0]).map(Vec::len), Some(2));
+    assert_eq!(state.status, "generated 1 caption");
+}
+
+#[test]
+fn a_finished_transcription_is_stored_without_touching_the_timeline() {
+    let (mut state, ids) = state_with_three_clips();
+    let before = (**state.project()).clone();
+    let placement = placement_now(&state, ids[0]);
+    let segments = vec![dummy_segment("", 0, 900)];
+    let mut with_words = segments.clone();
+    with_words[0].words = vec![speech::Word { text: "hello".into(), start_ms: 100, end_ms: 400 }];
+    finish_analysis(&mut state, ids[0], AnalysisKind::Transcribe, placement, Ok(analysis_jobs::Outcome::Transcribe(with_words)));
+
+    state.poll_analysis();
+
+    assert_eq!(**state.project(), before);
+    assert_eq!(
+        state.transcripts.get(&ids[0]),
+        Some(&vec![TimelineWord { text: "hello".into(), start_tick: TIMEBASE / 10, end_tick: TIMEBASE * 4 / 10 }])
+    );
+    assert_eq!(state.status, "transcribed 1 word");
+}
+
+/// End to end through a real worker thread: the click returns immediately,
+/// a second click while it runs is refused, and the failure (this fixture's
+/// media file doesn't exist) arrives through `poll_analysis`.
+#[test]
+fn start_analysis_runs_in_the_background_and_reports_back_through_poll() {
+    let (mut state, ids) = state_with_three_clips();
+
+    assert!(state.start_analysis(ids[0], AnalysisKind::SceneCuts, -14.0));
+    assert!(state.analysis_running(ids[0], AnalysisKind::SceneCuts));
+    assert_eq!(state.status, "Detecting scene cuts…");
+    assert!(!state.start_analysis(ids[0], AnalysisKind::SceneCuts, -14.0), "a duplicate must be refused");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.analysis_running(ids[0], AnalysisKind::SceneCuts) && std::time::Instant::now() < deadline {
+        state.poll_analysis();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert!(!state.analysis_running(ids[0], AnalysisKind::SceneCuts), "the job never reported back");
+    assert_eq!(state.status, "couldn't detect scene cuts — the clip's media file can't be found");
+    assert_eq!(state.sequence().tracks[0].clips.len(), 3);
 }
 
 fn clip_starts(state: &EditorState) -> Vec<i64> {

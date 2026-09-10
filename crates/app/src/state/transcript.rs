@@ -1,49 +1,77 @@
 //! Speech: transcription, caption generation, and transcript-based editing.
 
+use super::analysis::{decode_mono, AssetPaths};
+use super::analysis_jobs::AnalysisError;
 use super::*;
 
+/// Transcribes `clip`'s audio with local Whisper — the slow half of both
+/// `generate_captions` and `transcribe_clip`, free of `EditorState` so it can
+/// run on a worker thread.
+pub(super) fn transcribe_segments(
+    asset_paths: &AssetPaths,
+    sample_rate: u32,
+    clip: &ClipInstance,
+) -> Result<Vec<speech::Segment>, AnalysisError> {
+    let mono = decode_mono(asset_paths, sample_rate, clip)?;
+    speech::transcribe(&mono, 1, sample_rate, &speech::WhisperConfig::default())
+        .map(|transcript| transcript.segments)
+        .map_err(|e| AnalysisError::Failed(format!("transcription failed: {e}")))
+}
+
 impl EditorState {
-    /// Transcribes `clip_id`'s audio (local Whisper, via the `speech` crate)
-    /// and places one title clip per segment on the topmost video track —
-    /// creating a new one above if the top track is occupied, same "never
-    /// overwrite existing material" rule `add_title_at_playhead` follows.
-    /// All segments land as a single undo step. Returns how many captions
-    /// were placed.
+    /// Transcribes `clip_id`'s audio and places one title clip per segment
+    /// on the topmost video track — see `apply_captions`. Blocking, so
+    /// test-only; the editor goes through `start_analysis`. Returns how many
+    /// captions were placed.
+    #[cfg(test)]
     pub fn generate_captions(&mut self, clip_id: ClipInstanceId) -> usize {
         let Some((_, clip)) = self.find_clip(clip_id) else { return 0 };
-        // Checked before transcribing (not just before placing captions):
-        // this method also caches the transcript into `self.transcripts`
-        // for the transcript panel, and doing that ahead of this guard used
-        // to let a refused (keyframed-speed) attempt silently overwrite a
-        // real, previously-stored transcript for the same clip with an
+        // Checked before transcribing, not only in `apply_captions`: there's
+        // no point running Whisper over a clip whose captions will be
+        // refused.
+        if !matches!(clip.speed, SpeedCurve::Constant { .. }) {
+            return 0;
+        }
+        let sample_rate = self.sequence().settings.sample_rate;
+        match transcribe_segments(&self.asset_paths, sample_rate, &clip) {
+            Ok(segments) => self.apply_captions(clip_id, &clip, &segments),
+            Err(AnalysisError::Failed(message)) => {
+                self.status = message;
+                0
+            }
+            Err(_) => 0,
+        }
+    }
+
+
+    /// Places one title clip per segment on the topmost video track —
+    /// creating a new one above if the top track is occupied, same "never
+    /// overwrite existing material" rule `add_title_at_playhead` follows.
+    /// All segments land as a single undo step. Also stores the words for
+    /// the transcript panel. Returns how many captions were placed.
+    pub(super) fn apply_captions(&mut self, clip_id: ClipInstanceId, clip: &ClipInstance, segments: &[speech::Segment]) -> usize {
+        // Checked before storing the transcript: storing ahead of this guard
+        // used to let a refused (keyframed-speed) attempt silently overwrite
+        // a real, previously-stored transcript for the same clip with an
         // empty one — see
         // `generate_captions_on_a_keyframed_clip_does_not_clobber_an_existing_transcript`.
         let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return 0 };
-        let Some((mono, sample_rate)) = self.decode_clip_mono_audio(&clip) else { return 0 };
-
-        let transcript = match speech::transcribe(&mono, 1, sample_rate, &speech::WhisperConfig::default()) {
-            Ok(t) => t,
-            Err(e) => {
-                self.status = format!("transcription failed: {e}");
-                return 0;
-            }
-        };
-        if transcript.segments.is_empty() {
+        if segments.is_empty() {
             return 0;
         }
-        // Stored for the transcript panel too — it already did the work of
-        // transcribing, so `transcribe_clip` doesn't need to run Whisper
-        // again over the same audio just to get word-level ticks.
-        let words = self.timeline_words_from_transcript(&clip, &transcript.segments);
+        // Stored for the transcript panel too — the work of transcribing is
+        // already done, so the panel's Transcribe button doesn't need to run
+        // Whisper again over the same audio just to get word-level ticks.
+        let words = self.timeline_words_from_transcript(clip, segments);
         self.transcripts.insert(clip_id, words);
 
         // Reuses `add_title_at_playhead`'s track-selection rule (top track if
-        // free, else a new one above) by targeting the first segment's own
-        // span, then placing every other segment on whatever track that
-        // resolved to — captions from one transcription run always belong
-        // together on one track, not scattered across several.
-        let source_span_start = transcript.segments[0].start_ms as f64 / 1000.0;
-        let source_span_end = transcript.segments.last().unwrap().end_ms as f64 / 1000.0;
+        // free, else a new one above) by targeting the whole transcribed
+        // span, then placing every segment on whatever track that resolved
+        // to — captions from one transcription run always belong together on
+        // one track, not scattered across several.
+        let source_span_start = segments[0].start_ms as f64 / 1000.0;
+        let source_span_end = segments.last().unwrap().end_ms as f64 / 1000.0;
         let to_timeline_tick = |source_seconds: f64| -> i64 {
             let source_offset = (source_seconds * TIMEBASE as f64).round() as i64;
             clip.timeline_in.0 + source_offset * denominator / numerator
@@ -82,7 +110,7 @@ impl EditorState {
             }
         };
 
-        let ops = self.caption_ops(track, &clip, &transcript.segments);
+        let ops = self.caption_ops(track, clip, segments);
         if ops.is_empty() {
             return 0;
         }
@@ -145,22 +173,12 @@ impl EditorState {
     // ---- Transcript panel -------------------------------------------------
 
 
-    /// Transcribes `clip_id`'s audio and stores the result in
-    /// `self.transcripts` for `title_panel`'s transcript view — no timeline
-    /// clips created, unlike `generate_captions`. Returns whether a
-    /// transcript with at least one word was stored.
-    pub fn transcribe_clip(&mut self, clip_id: ClipInstanceId) -> bool {
-        let Some((_, clip)) = self.find_clip(clip_id) else { return false };
-        let Some((mono, sample_rate)) = self.decode_clip_mono_audio(&clip) else { return false };
-        let transcript = match speech::transcribe(&mono, 1, sample_rate, &speech::WhisperConfig::default()) {
-            Ok(t) => t,
-            Err(e) => {
-                self.status = format!("transcription failed: {e}");
-                return false;
-            }
-        };
-        let words = self.timeline_words_from_transcript(&clip, &transcript.segments);
-        let found = !words.is_empty();
+    /// Stores already-transcribed segments as `clip_id`'s transcript for the
+    /// transcript panel, replacing any earlier one — no timeline clips
+    /// created, unlike `apply_captions`. Returns how many words it holds.
+    pub(super) fn store_transcript(&mut self, clip_id: ClipInstanceId, clip: &ClipInstance, segments: &[speech::Segment]) -> usize {
+        let words = self.timeline_words_from_transcript(clip, segments);
+        let found = words.len();
         self.transcripts.insert(clip_id, words);
         found
     }

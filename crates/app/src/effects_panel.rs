@@ -51,7 +51,7 @@
 //! "SetEffectParam" op because nothing about it needs the invariant-checked
 //! machinery that op set exists for.
 
-use crate::state::EditorState;
+use crate::state::{AnalysisKind, EditorState};
 use render::{chroma_key, color_correction, crop, gaussian_blur, mask, transform, ParamSchema, ParamType};
 use timeline::{
     ClipInstanceId, EffectInstance, EffectInstanceId, InterpolationMode, ParamValue, TimeTick,
@@ -143,6 +143,28 @@ fn available_effects() -> Vec<render::EffectDescriptor> {
     ]
 }
 
+/// One clip-analysis action: a button while idle, a spinner saying what it's
+/// doing while its background job runs. `target_lufs` is only read by
+/// `AnalysisKind::Loudness`.
+fn analysis_button(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    clip_id: ClipInstanceId,
+    kind: AnalysisKind,
+    label: &str,
+    hover: &str,
+    target_lufs: f64,
+) {
+    if state.analysis_running(clip_id, kind) {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(kind.running_label());
+        });
+    } else if ui.button(label).on_hover_text(hover).clicked() {
+        state.start_analysis(clip_id, kind, target_lufs);
+    }
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     state: &mut EditorState,
@@ -169,91 +191,68 @@ pub fn show(
     });
 
     if matches!(clip.source, timeline::ClipSource::Media(_)) {
-        // Synchronous and, honestly, slow — `detect_scene_cuts` reopens and
-        // seeks the source file per sample (the same trade
-        // `media_ffmpeg::decode_frame_at` makes everywhere else in this
-        // project), so this blocks the UI thread for the duration rather
-        // than running on a background job the way proxy generation does.
-        // Real follow-up work if this becomes a common enough action to be
-        // worth a progress bar; not built speculatively here.
-        if ui
-            .button("Detect Scene Cuts")
-            .on_hover_text("splits this clip at hard cuts — analyses the whole clip, can take a while on long footage")
-            .clicked()
-        {
-            let found = state.detect_scene_cuts(clip_id);
-            state.status = if found > 0 {
-                format!("found and split at {found} scene cut{}", if found == 1 { "" } else { "s" })
-            } else {
-                "no scene cuts found".into()
-            };
-        }
-        if ui
-            .button("Remove Silence")
-            .on_hover_text("ripple-deletes pauses below -40dBFS longer than 0.3s — decodes the whole clip's audio, can take a while")
-            .clicked()
-        {
-            let removed = state.detect_silence_and_ripple_delete(clip_id);
-            state.status = if removed > 0 {
-                format!("removed {removed} silent gap{}", if removed == 1 { "" } else { "s" })
-            } else {
-                "no silence found to remove".into()
-            };
-        }
-        if ui
-            .button("Detect Beats")
-            .on_hover_text("adds a snap-to marker at each detected beat in this clip's audio — decodes the whole clip, can take a while")
-            .clicked()
-        {
-            let added = state.detect_beats_and_add_markers(clip_id);
-            state.status = if added > 0 {
-                format!("added {added} beat marker{}", if added == 1 { "" } else { "s" })
-            } else {
-                "no beats found".into()
-            };
-        }
+        // Each of these decodes the whole clip, which on long footage takes
+        // minutes. They run as background jobs (`EditorState::start_analysis`)
+        // so the editor stays usable meanwhile; the result lands as one undo
+        // step when it's ready.
+        let target_lufs = panel.target_lufs;
+        analysis_button(
+            ui,
+            state,
+            clip_id,
+            AnalysisKind::SceneCuts,
+            "Detect Scene Cuts",
+            "splits this clip at hard cuts — analyses the whole clip in the background",
+            target_lufs,
+        );
+        analysis_button(
+            ui,
+            state,
+            clip_id,
+            AnalysisKind::Silence,
+            "Remove Silence",
+            "ripple-deletes pauses below -40dBFS longer than 0.3s — decodes the whole clip's audio in the background",
+            target_lufs,
+        );
+        analysis_button(
+            ui,
+            state,
+            clip_id,
+            AnalysisKind::Beats,
+            "Detect Beats",
+            "adds a snap-to marker at each detected beat in this clip's audio — runs in the background",
+            target_lufs,
+        );
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut panel.target_lufs).speed(0.5).suffix(" LUFS"));
-            if ui
-                .button("Match Loudness")
-                .on_hover_text("measures this clip's real EBU R128 loudness and sets its gain to reach the target above")
-                .clicked()
-            {
-                match state.match_clip_loudness(clip_id, panel.target_lufs) {
-                    Some(gain) => state.status = format!("applied {gain:+.1}dB to reach {:.0} LUFS", panel.target_lufs),
-                    None => {
-                        state.status = "couldn't match loudness — no audio, or gain is already keyframed".into()
-                    }
-                }
-            }
+            analysis_button(
+                ui,
+                state,
+                clip_id,
+                AnalysisKind::Loudness,
+                "Match Loudness",
+                "measures this clip's real EBU R128 loudness and sets its gain to reach the target",
+                panel.target_lufs,
+            );
         });
-        if ui
-            .button("Stabilize")
-            .on_hover_text("corrects handheld pan/shake by keyframing position — translation only, no rotation/zoom/crop; decodes and analyses the whole clip, can take a while")
-            .clicked()
-        {
-            let applied = state.stabilize_clip(clip_id);
-            state.status = if applied > 0 {
-                format!("wrote {applied} stabilization keyframe{}", if applied == 1 { "" } else { "s" })
-            } else {
-                "couldn't stabilize — no video, too short, or position is already keyframed".into()
-            };
-        }
-        if ui
-            .button("Generate Captions")
-            .on_hover_text("transcribes this clip's audio with local Whisper and places a title per line — fully offline, no data leaves this machine; can take a while on long clips")
-            .clicked()
-        {
-            let added = state.generate_captions(clip_id);
-            if added > 0 {
-                state.status = format!("generated {added} caption{}", if added == 1 { "" } else { "s" });
-            } else if state.status.is_empty() {
-                // `generate_captions` already set a specific message for a
-                // real failure (e.g. transcription error) — only fall back
-                // to this generic one when it didn't.
-                state.status = "no speech found to caption".into();
-            }
-        }
+        analysis_button(
+            ui,
+            state,
+            clip_id,
+            AnalysisKind::Stabilize,
+            "Stabilize",
+            "corrects handheld pan/shake by keyframing position — translation only, no rotation/zoom/crop; runs in the background",
+            target_lufs,
+        );
+        analysis_button(
+            ui,
+            state,
+            clip_id,
+            AnalysisKind::Captions,
+            "Generate Captions",
+            "transcribes this clip's audio with local Whisper and places a title per line — fully offline, no data leaves this machine; runs in the background",
+            target_lufs,
+        );
 
         if let timeline::ClipSource::Media(asset_id) = clip.source {
             ui.horizontal(|ui| {

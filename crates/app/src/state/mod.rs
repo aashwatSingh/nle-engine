@@ -121,12 +121,15 @@ pub struct EditorState {
     /// Per-clip transcripts, for `title_panel`'s transcript view — words
     /// already mapped to timeline ticks (not source milliseconds), so the
     /// panel can click-to-seek and range-select without re-doing the speed/
-    /// trim arithmetic every frame. Populated by `transcribe_clip` and by
-    /// `generate_captions` (which transcribes anyway, so it stores the same
-    /// result rather than throwing it away). Not persisted in the project
+    /// trim arithmetic every frame. Populated by the Transcribe and Generate
+    /// Captions analyses (captioning transcribes anyway, so it stores the
+    /// same result rather than throwing it away). Not persisted in the project
     /// file — regenerating on demand is cheap enough, and a session-only
     /// cache avoids growing the save format for derived data.
     pub transcripts: std::collections::HashMap<ClipInstanceId, Vec<TimelineWord>>,
+    /// Scene-cut, silence, beat, loudness, stabilize, caption and transcribe
+    /// jobs running in the background — see `analysis_jobs`.
+    analysis: analysis_jobs::AnalysisJobs,
     next_id: u64,
 }
 
@@ -145,7 +148,10 @@ mod selection;
 mod tracks;
 mod titles;
 mod analysis;
+mod analysis_jobs;
 mod transcript;
+
+pub use analysis_jobs::AnalysisKind;
 mod editing;
 mod keyframes;
 mod project_io;
@@ -201,6 +207,7 @@ impl EditorState {
             asset_paths: std::collections::HashMap::new(),
             project_path: None,
             transcripts: std::collections::HashMap::new(),
+            analysis: analysis_jobs::AnalysisJobs::default(),
             next_id: 1,
         }
     }

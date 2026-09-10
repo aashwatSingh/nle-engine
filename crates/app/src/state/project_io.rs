@@ -403,6 +403,10 @@ impl EditorState {
         // previous project's clip ids could otherwise silently attach
         // itself to an unrelated clip that happens to reuse the same id.
         self.transcripts.clear();
+        // Same collision, worse outcome: an analysis still running for the
+        // old project would razor or re-gain whichever new clip reuses its
+        // id. A fresh channel orphans those workers; what they send is dropped.
+        self.analysis = super::analysis_jobs::AnalysisJobs::default();
         for r in &doc.media_references {
             let candidate = base_dir
                 .map(|d| d.join(&r.relative_path))
