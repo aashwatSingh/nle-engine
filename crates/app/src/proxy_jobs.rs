@@ -140,10 +140,18 @@ impl ProxyJobs {
         self.in_flight.insert(asset);
         std::thread::spawn(move || {
             let options = media_ffmpeg::ProxyOptions { max_dimension: PROXY_MAX_DIMENSION };
-            let result = match media_ffmpeg::generate_proxy(&source, &options, &output) {
-                Ok(()) => Ok(output),
-                Err(e) => Err(format!("proxy failed for {}: {e:?}", source.display())),
-            };
+            // Guarded because `request` refuses anything not in state
+            // `None`: a job that never reports leaves the asset reading
+            // "building" forever with no way to ask for it again.
+            let result = crate::background::catch_panic(|| {
+                match media_ffmpeg::generate_proxy(&source, &options, &output) {
+                    Ok(()) => Ok(output.clone()),
+                    Err(e) => Err(format!("proxy failed for {}: {e:?}", source.display())),
+                }
+            })
+            .unwrap_or_else(|| {
+                Err(format!("proxy failed for {}: it crashed partway through", source.display()))
+            });
             let _ = tx.send(Done { asset, result });
         });
         true

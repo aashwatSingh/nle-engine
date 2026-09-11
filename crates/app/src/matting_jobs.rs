@@ -90,7 +90,10 @@ impl MattingJobs {
         let tx = self.tx.clone();
         self.in_flight.insert(asset);
         std::thread::spawn(move || {
-            let result = (|| {
+            // Guarded for the same reason as `ProxyJobs::request`, and with
+            // more to guard: this one runs ONNX inference per frame, so it
+            // has the most third-party code in it of any job here.
+            let result = crate::background::catch_panic(|| {
                 let mut session = matting::RvmSession::load(&matting::default_model())
                     .map_err(|e| format!("could not load background-removal model: {e}"))?;
                 let options = media_ffmpeg::MatteVideoOptions::default();
@@ -114,7 +117,13 @@ impl MattingJobs {
                 )
                 .map_err(|e| format!("background removal failed for {}: {e:?}", source.display()))?;
                 Ok(output)
-            })();
+            })
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "background removal failed for {}: it crashed partway through",
+                    source.display()
+                ))
+            });
             let _ = tx.send(Done { asset, result });
         });
         true

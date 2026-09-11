@@ -1534,3 +1534,74 @@ Checked: a new regression test starts a job with an unrelated message already
 in `status` and asserts starting doesn't touch it — failing against the
 pre-fix code, passing after. 566 tests pass across the workspace, clippy clean.
 
+## 2026-09-11 — the panic guard reaches the other four background jobs
+
+The August audit's "worker panic strands jobs" finding was fixed in
+`AnalysisJobs::spawn` and nowhere else — its own comment says so ("Export and
+proxy jobs don't do this… New code shouldn't repeat it"), which turned out to
+be a note about the other four rather than a note about the past. Export,
+proxies, matting and waveforms all still spawned a bare thread whose last
+statement was the send (or the store) that reports the result, so a panic
+skipped it and left the job marked as running forever.
+
+Each one wedges differently, and none of them recover:
+
+- **Export** — `result` stays `None`, which is exactly what "still rendering"
+  looks like. The progress window sits at its last frame, Cancel sets a flag
+  no live thread reads, and `start_export`'s `if export.job.is_some()` refuses
+  every later export for the rest of the session, silently.
+- **Waveforms** — worst of the four, because nothing user-initiated is needed
+  to reach it: peaks generate on their own for every audio clip. A stranded
+  job holds one of only `MAX_CONCURRENT_JOBS` (2) slots permanently, so a
+  second one deadlocks the queue and no clip ever gets a waveform again. Its
+  `is_busy()` also feeds `request_repaint`, so the editor redraws at full rate
+  forever.
+- **Proxies and matting** — the asset reads "building" forever, and `request`
+  refuses anything not in state `None`, so it can never be asked for again.
+
+Fixed with one `catch_panic` in `background.rs` rather than a fifth and sixth
+copy of the `catch_unwind` incantation: it runs the work, returns `None` if it
+panicked, and each caller turns that `None` into whatever "this failed" already
+means for its own job type. So a panic now surfaces through the same path as an
+unreadable file — a failure the user can see and retry — instead of a job that
+quietly never ends. `AnalysisJobs` keeps its own inline guard; it is already
+correct and tested, and rewriting working code for uniformity is not worth the
+diff.
+
+The honest limit of the tests: `catch_panic` itself is covered both ways (a
+panicking closure returns `None`, a normal one passes through), but the four
+call sites are one-line wiring verified by compiling and by reading, because
+none of those work functions can be made to panic from a test without
+reshaping their APIs to take injectable work the way `AnalysisJobs::spawn`
+already does.
+
+## 2026-09-11 — a media file's own time base could divide by zero
+
+Found while looking for something that could actually trigger the panics
+above. A stream's time base is container metadata — `open_input`'s demuxer
+and protocol allowlist restricts which parsers run, not what they report — so
+a malformed or crafted file can declare a denominator of `0`.
+`VideoDecoderStream::convert_to_rgba` and `AudioDecoderStream::next_chunk`
+both divided by it unchecked when converting a frame's pts to ticks.
+
+The same bug class as the zero-speed crash the day before, reached through a
+media file instead of a project file, and the asymmetry is what gives it
+away: every *other* reader of a raw FFmpeg time base in this crate already
+guards the denominator — `to_rational` clamps with `.max(1)`, `probe`'s
+duration maths tests `!= 0`, and both the proxy and matte encoders check
+before inverting the frame rate. Only the two decoder streams didn't.
+
+Fixed with a shared `pts_to_ticks(Option<i64>, Rational)`, so the two of them
+now share one guard instead of holding a third and fourth copy of the check.
+A frame whose timestamp can't be placed lands at tick 0 — the same answer the
+old code already gave for a frame carrying no timestamp at all.
+
+Where it landed mattered as much as the panic: both streams run on worker
+threads (playback's mix and decode threads, export, and peaks generation), so
+before the fix above this surfaced not as a visible crash but as one of those
+silent permanent wedges.
+
+Checked: a new test asserts a zero denominator returns 0 rather than panicking,
+and the pre-fix arithmetic was confirmed to panic on the same input. 570 tests
+pass across the workspace, clippy clean.
+

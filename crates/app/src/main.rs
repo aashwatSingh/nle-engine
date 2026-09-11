@@ -11,6 +11,7 @@
 //! context for both, no separate render loop to keep in sync.
 
 mod autosave;
+mod background;
 mod cache_dirs;
 mod effects_panel;
 mod export_job;

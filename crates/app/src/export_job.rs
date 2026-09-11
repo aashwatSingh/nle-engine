@@ -44,19 +44,28 @@ impl ExportJob {
         };
 
         std::thread::spawn(move || {
-            let outcome = export::export_sequence(
-                &project,
-                sequence,
-                &asset_paths,
-                &output,
-                &options,
-                |frame, total| {
-                    frames_done.store(frame, Ordering::Relaxed);
-                    total_frames.store(total, Ordering::Relaxed);
-                    !cancel.load(Ordering::Relaxed)
-                },
-            );
-            *result.lock().unwrap() = Some(outcome.map_err(|e| format!("{e:?}")));
+            // Guarded because `result` staying `None` is indistinguishable
+            // from "still rendering": the progress window would sit at its
+            // last frame forever, Cancel would set a flag no live thread
+            // reads, and `start_export`'s "already exporting" check would
+            // refuse every later export for the rest of the session.
+            let outcome = crate::background::catch_panic(|| {
+                export::export_sequence(
+                    &project,
+                    sequence,
+                    &asset_paths,
+                    &output,
+                    &options,
+                    |frame, total| {
+                        frames_done.store(frame, Ordering::Relaxed);
+                        total_frames.store(total, Ordering::Relaxed);
+                        !cancel.load(Ordering::Relaxed)
+                    },
+                )
+                .map_err(|e| format!("{e:?}"))
+            })
+            .unwrap_or_else(|| Err("the export crashed partway through".to_string()));
+            *result.lock().unwrap() = Some(outcome);
         });
 
         job

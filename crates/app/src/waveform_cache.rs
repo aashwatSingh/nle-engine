@@ -111,7 +111,15 @@ impl WaveformCache {
         self.in_flight.insert(asset);
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = media_ffmpeg::generate_audio_peaks(&path, SAMPLES_PER_PEAK).ok();
+            // Guarded because a stranded job here costs more than one
+            // waveform: it holds one of only `MAX_CONCURRENT_JOBS` slots
+            // forever, so a second one deadlocks the queue and no clip ever
+            // gets a waveform again. `None` marks it failed, which is the
+            // same outcome as an unreadable file.
+            let result = crate::background::catch_panic(|| {
+                media_ffmpeg::generate_audio_peaks(&path, SAMPLES_PER_PEAK).ok()
+            })
+            .flatten();
             // A closed receiver just means the editor shut down mid-job.
             let _ = tx.send((asset, result));
         });
