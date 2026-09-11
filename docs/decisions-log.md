@@ -1468,3 +1468,39 @@ Checked:
   file it replaced.
 - No tracked or unignored file contains the account name.
 
+## 2026-09-10 — a crafted project file could crash the editor with a divide-by-zero
+
+Found in a follow-up check right after the fixes above shipped. Project files
+are untrusted input (opened from disk, no schema-level bounds on the values
+they carry), and nothing validated a clip's `SpeedCurve::Constant` before
+seven call sites divided by its numerator: `scene_cut_ops`,
+`silence_removal_ops`, `beat_markers` and `stabilization_keyframes` in
+`analysis.rs`, and `apply_captions`, `caption_ops` and
+`timeline_words_from_transcript` in `transcript.rs`. A clip with numerator `0`
+reached `* denominator / numerator` on the UI thread the moment any of Detect
+Scene Cuts, Remove Silence, Detect Beats or Generate Captions ran against it
+— divide-by-zero panics in Rust, so the editor exited outright. `start_analysis`'s
+up-front check only tested for `SpeedCurve::Constant { .. }`, which a zero or
+negative numerator or denominator still matches.
+
+Fixed with one guard, not seven: `constant_speed(&SpeedCurve) -> Option<(i64,
+i64)>` in `state/mod.rs`, returning the pair only for a `Constant` with both
+numerator and denominator positive — the shape every legitimate speed (the
+UI never creates anything else) already has. Every division site now
+destructures through it instead of the raw `SpeedCurve::Constant` pattern,
+and `start_analysis`'s guard calls it too, so a crafted zero-speed clip is
+refused before a worker thread even starts rather than discovered after
+decoding.
+
+Stabilize was already safe by construction: its division runs inside the
+worker closure, which `AnalysisJobs::spawn` wraps in `catch_unwind`, so it
+would have reported a failure rather than crashing. Fixed anyway, for the
+same reason `start_analysis` now refuses it up front — decoding a whole clip
+only to report "the analysis crashed" is worse than refusing immediately.
+
+Checked: three new tests, each failing against the pre-fix code — poll_analysis
+applying five different finished results against a zero-speed clip (all
+discarded, nothing computed), start_analysis refused for numerator or
+denominator zero or negative, and stabilization_keyframes returning empty
+instead of panicking. 565 tests pass across the workspace, clippy clean.
+
