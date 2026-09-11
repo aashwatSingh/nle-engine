@@ -345,6 +345,28 @@ impl EditorState {
 }
 
 
+/// The `(numerator, denominator)` behind a `SpeedCurve::Constant`, if it's one
+/// every analysis action in `analysis.rs`/`transcript.rs` can safely map
+/// timeline ticks through — `None` for `Keyframed` (see `scene_cut_ops`'s doc
+/// for why a keyframed curve can't use this closed-form mapping) and for a
+/// zero or negative numerator or denominator, which nothing in the UI can
+/// create but a hand-edited or corrupted project file can.
+///
+/// A project file is untrusted input, and until this existed nothing checked
+/// a clip's speed before dividing by it: `* denominator / numerator` reached
+/// a zero numerator directly, panicking with a divide-by-zero on the UI
+/// thread the moment a scene-cut, silence, beat or caption result was applied
+/// against such a clip. Every one of those call sites should go through this
+/// rather than destructuring `SpeedCurve::Constant` directly.
+fn constant_speed(speed: &SpeedCurve) -> Option<(i64, i64)> {
+    match *speed {
+        SpeedCurve::Constant { numerator, denominator } if numerator > 0 && denominator > 0 => {
+            Some((numerator, denominator))
+        }
+        _ => None,
+    }
+}
+
 /// Converts an RGBA frame to a box-downsampled Rec.709 luma buffer, `factor`
 /// pixels averaged into one, for `EditorState::stabilize_clip`'s motion
 /// search. Downsampling isn't just a speed optimisation there: block

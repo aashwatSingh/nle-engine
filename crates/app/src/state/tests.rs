@@ -1971,6 +1971,81 @@ fn starting_a_speed_dependent_analysis_on_a_keyframed_clip_is_refused_up_front()
     assert!(state.status.contains("constant speed"), "status should say why: {:?}", state.status);
 }
 
+/// A project file is untrusted input, and nothing validates clip speeds when
+/// one is opened. A zero numerator used to reach `* denominator / numerator`
+/// in the analysis apply helpers — on the UI thread, so the editor exited.
+fn state_with_zero_speed_first_clip() -> (EditorState, Vec<ClipInstanceId>) {
+    let (mut state, ids) = state_with_three_clips();
+    let mut project = (**state.project()).clone();
+    project.sequences[0].tracks[0].clips[0].speed = SpeedCurve::Constant { numerator: 0, denominator: 1 };
+    state.undo.push("crafted speed", std::sync::Arc::new(project));
+    state.next_id = 1000;
+    (state, ids)
+}
+
+#[test]
+fn finished_results_for_a_zero_speed_clip_are_refused_instead_of_crashing() {
+    let (mut state, ids) = state_with_zero_speed_first_clip();
+    let before = (**state.project()).clone();
+    let placement = placement_now(&state, ids[0]);
+    let segments = vec![speech::Segment {
+        text: "hi".into(),
+        start_ms: 100,
+        end_ms: 400,
+        words: vec![speech::Word { text: "hi".into(), start_ms: 100, end_ms: 400 }],
+    }];
+    let outcomes = [
+        (AnalysisKind::SceneCuts, analysis_jobs::Outcome::SceneCuts(vec![TIMEBASE / 2])),
+        (AnalysisKind::Silence, analysis_jobs::Outcome::Silence(vec![(0.2, 0.6)])),
+        (AnalysisKind::Beats, analysis_jobs::Outcome::Beats(vec![0.5])),
+        (AnalysisKind::Captions, analysis_jobs::Outcome::Captions(segments.clone())),
+        (AnalysisKind::Transcribe, analysis_jobs::Outcome::Transcribe(segments)),
+    ];
+    for (kind, outcome) in outcomes {
+        finish_analysis(&mut state, ids[0], kind, placement.clone(), Ok(outcome));
+    }
+
+    state.poll_analysis();
+
+    assert_eq!(**state.project(), before, "nothing computed against a zero speed may be applied");
+    assert!(
+        state.transcripts.get(&ids[0]).is_none_or(Vec::is_empty),
+        "no words can be placed on the timeline at zero speed"
+    );
+}
+
+#[test]
+fn starting_an_analysis_on_a_zero_or_negative_speed_clip_is_refused_up_front() {
+    for (numerator, denominator) in [(0, 1), (-1, 1), (1, 0), (1, -2)] {
+        let (mut state, ids) = state_with_three_clips();
+        let mut project = (**state.project()).clone();
+        project.sequences[0].tracks[0].clips[0].speed = SpeedCurve::Constant { numerator, denominator };
+        state.undo.push("crafted speed", std::sync::Arc::new(project));
+
+        assert!(
+            !state.start_analysis(ids[0], AnalysisKind::SceneCuts, -14.0),
+            "a {numerator}/{denominator} speed must be refused before any work starts"
+        );
+        assert!(state.status.contains("constant speed"), "status should say why: {:?}", state.status);
+    }
+}
+
+/// Stabilize divides on the worker thread, where a panic is caught and
+/// reported rather than crashing — but it should never get that far.
+#[test]
+fn stabilizing_a_zero_speed_clip_returns_nothing_instead_of_dividing_by_zero() {
+    media_ffmpeg::init().unwrap();
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/test_h264.mp4");
+    let (state, ids) = state_with_zero_speed_first_clip();
+    let (_, clip) = state.find_clip(ids[0]).unwrap();
+    let ClipSource::Media(asset) = clip.source else { panic!("the fixture clip is media") };
+    let paths = std::collections::HashMap::from([(asset, fixture)]);
+
+    let keyframes = super::analysis::stabilization_keyframes(&paths, &clip).expect("the fixture decodes");
+
+    assert!(keyframes.is_empty());
+}
+
 #[test]
 fn finished_captions_land_on_a_new_track_and_fill_the_transcript() {
     let (mut state, ids) = state_with_three_clips();

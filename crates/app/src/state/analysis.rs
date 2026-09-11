@@ -170,7 +170,7 @@ pub(super) fn stabilization_keyframes(
     clip: &ClipInstance,
 ) -> Result<StabilizationKeyframes, AnalysisError> {
     let path = media_path(asset_paths, clip)?;
-    let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return Ok(Vec::new()) };
+    let Some((numerator, denominator)) = constant_speed(&clip.speed) else { return Ok(Vec::new()) };
 
     let source_span = clip.source_out.0 - clip.source_in.0;
     if source_span <= 0 {
@@ -271,7 +271,7 @@ impl EditorState {
     /// constant speed and not cheap in general for a keyframed one — the same
     /// scope line clip-speed audio retiming draws.
     pub(super) fn scene_cut_ops(&mut self, track: TrackId, clip: &ClipInstance, source_cut_ticks: &[i64]) -> Vec<EditOp> {
-        let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return Vec::new() };
+        let Some((numerator, denominator)) = constant_speed(&clip.speed) else { return Vec::new() };
         source_cut_ticks
             .iter()
             .filter(|&&t| t > clip.source_in.0 && t < clip.source_out.0)
@@ -338,7 +338,7 @@ impl EditorState {
         clip: &ClipInstance,
         removed_source_seconds: &[(f64, f64)],
     ) -> Vec<EditOp> {
-        let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return Vec::new() };
+        let Some((numerator, denominator)) = constant_speed(&clip.speed) else { return Vec::new() };
         let to_timeline_tick = |source_seconds: f64| -> i64 {
             let source_offset = (source_seconds * TIMEBASE as f64).round() as i64;
             clip.timeline_in.0 + source_offset * denominator / numerator
@@ -411,7 +411,7 @@ impl EditorState {
     /// the clip's own source bounds are dropped rather than placing a marker
     /// outside the material it's supposed to mark.
     pub(super) fn beat_markers(&mut self, clip: &ClipInstance, onset_source_seconds: &[f64]) -> Vec<timeline::Marker> {
-        let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return Vec::new() };
+        let Some((numerator, denominator)) = constant_speed(&clip.speed) else { return Vec::new() };
         onset_source_seconds
             .iter()
             .filter_map(|&onset_s| {

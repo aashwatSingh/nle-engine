@@ -246,7 +246,7 @@ impl EditorState {
             self.status = format!("couldn't {} — the clip no longer exists", kind.verb());
             return false;
         };
-        if kind.needs_constant_speed() && !matches!(clip.speed, SpeedCurve::Constant { .. }) {
+        if kind.needs_constant_speed() && constant_speed(&clip.speed).is_none() {
             self.status = format!("couldn't {} — this only works on clips playing at a constant speed", kind.verb());
             return false;
         }

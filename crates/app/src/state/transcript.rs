@@ -29,7 +29,7 @@ impl EditorState {
         // Checked before transcribing, not only in `apply_captions`: there's
         // no point running Whisper over a clip whose captions will be
         // refused.
-        if !matches!(clip.speed, SpeedCurve::Constant { .. }) {
+        if constant_speed(&clip.speed).is_none() {
             return 0;
         }
         let sample_rate = self.sequence().settings.sample_rate;
@@ -55,7 +55,7 @@ impl EditorState {
         // a real, previously-stored transcript for the same clip with an
         // empty one — see
         // `generate_captions_on_a_keyframed_clip_does_not_clobber_an_existing_transcript`.
-        let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return 0 };
+        let Some((numerator, denominator)) = constant_speed(&clip.speed) else { return 0 };
         if segments.is_empty() {
             return 0;
         }
@@ -129,7 +129,7 @@ impl EditorState {
     /// legible default with no background box (`TitleSpec` has none to give
     /// it — see `render::text`'s known limits).
     pub(super) fn caption_ops(&mut self, track: TrackId, clip: &ClipInstance, segments: &[speech::Segment]) -> Vec<EditOp> {
-        let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return Vec::new() };
+        let Some((numerator, denominator)) = constant_speed(&clip.speed) else { return Vec::new() };
         let to_timeline_tick = |ms: u32| -> i64 {
             let source_offset = ((ms as f64 / 1000.0) * TIMEBASE as f64).round() as i64;
             clip.timeline_in.0 + source_offset * denominator / numerator
@@ -190,7 +190,7 @@ impl EditorState {
     /// own source bounds are dropped rather than producing a tick outside
     /// the clip.
     pub(super) fn timeline_words_from_transcript(&mut self, clip: &ClipInstance, segments: &[speech::Segment]) -> Vec<TimelineWord> {
-        let SpeedCurve::Constant { numerator, denominator } = clip.speed else { return Vec::new() };
+        let Some((numerator, denominator)) = constant_speed(&clip.speed) else { return Vec::new() };
         let to_timeline_tick = |ms: u32| -> i64 {
             let source_offset = ((ms as f64 / 1000.0) * TIMEBASE as f64).round() as i64;
             clip.timeline_in.0 + source_offset * denominator / numerator
