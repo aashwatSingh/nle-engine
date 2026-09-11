@@ -284,7 +284,15 @@ impl EditorState {
         if !self.analysis.spawn(clip_id, kind, placement, work) {
             return false;
         }
-        self.status = kind.running_label().into();
+        // Deliberately doesn't touch `status`: `analysis_button` already
+        // shows `kind.running_label()` in the button's own place for as long
+        // as the job runs. Writing the same text into the shared status line
+        // used to mean a *different* job finishing while this one was still
+        // running would silently overwrite it — the status line would say
+        // e.g. "removed 47 silent gaps" while scene-cut detection was still
+        // going, making it look like that job had stopped. Since the button
+        // already carries that information, the status line is free to stay
+        // reserved for one-shot events (refusals, results, errors).
         true
     }
 

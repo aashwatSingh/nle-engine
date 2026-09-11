@@ -1504,3 +1504,33 @@ discarded, nothing computed), start_analysis refused for numerator or
 denominator zero or negative, and stabilization_keyframes returning empty
 instead of panicking. 565 tests pass across the workspace, clippy clean.
 
+## 2026-09-11 — a finished analysis could clobber a still-running one's status
+
+Found by hand, on the deployed build: importing a real recording and running
+Detect Scene Cuts, then Remove Silence on the same clip while it was still
+going. Remove Silence finished first, and "removed 47 silent gaps" replaced
+"Detecting scene cuts…" in the status line — while scene-cut detection was
+still visibly running. Both jobs are independent by design (different
+`AnalysisKind`s on one clip run concurrently, see the 09-10 entry above), so
+this wasn't rare; it's the normal shape of using two of these buttons close
+together.
+
+Root cause: `start_analysis` wrote `kind.running_label()` into the single
+shared `EditorState::status` the moment a job started, alongside whatever a
+different, still-in-flight job had already put there. But `analysis_button`
+already shows that exact label in the button's own place for as long as the
+job runs — the write to `status` was pure redundancy, and the one place nothing
+else was competing to keep it accurate.
+
+Fixed by deleting the write, not by adding bookkeeping to arbitrate between
+jobs: `status` is now left alone on a successful start, same as it already was
+on a refused duplicate start ("its spinner is already showing"). The button
+remains the one source of truth for "is this job still running"; `status` goes
+back to being what it is everywhere else in the app — a one-shot line for
+refusals, results and errors, with no job's "in progress" state competing to
+own it.
+
+Checked: a new regression test starts a job with an unrelated message already
+in `status` and asserts starting doesn't touch it — failing against the
+pre-fix code, passing after. 566 tests pass across the workspace, clippy clean.
+

@@ -2103,7 +2103,6 @@ fn start_analysis_runs_in_the_background_and_reports_back_through_poll() {
 
     assert!(state.start_analysis(ids[0], AnalysisKind::SceneCuts, -14.0));
     assert!(state.analysis_running(ids[0], AnalysisKind::SceneCuts));
-    assert_eq!(state.status, "Detecting scene cuts…");
     assert!(!state.start_analysis(ids[0], AnalysisKind::SceneCuts, -14.0), "a duplicate must be refused");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2115,6 +2114,28 @@ fn start_analysis_runs_in_the_background_and_reports_back_through_poll() {
     assert!(!state.analysis_running(ids[0], AnalysisKind::SceneCuts), "the job never reported back");
     assert_eq!(state.status, "couldn't detect scene cuts — the clip's media file can't be found");
     assert_eq!(state.sequence().tracks[0].clips.len(), 3);
+}
+
+/// Live bug (2026-09-11): running Remove Silence to completion while Detect
+/// Scene Cuts was still going on the same clip replaced "Detecting scene
+/// cuts…" in the status line with "removed 47 silent gaps" — making the
+/// still-running job look like it had vanished. The button already shows
+/// `kind.running_label()` in place of itself for as long as the job runs
+/// (see `analysis_button`), so `start_analysis` writing the same text into
+/// the shared status line was pure redundancy — and the one thing with
+/// nothing else competing to overwrite it wasn't the button, it was this
+/// field. Fix: starting a job no longer touches `status` at all.
+#[test]
+fn starting_an_analysis_does_not_touch_the_status_line() {
+    let (mut state, ids) = state_with_three_clips();
+    state.status = "an earlier, unrelated message".into();
+
+    assert!(state.start_analysis(ids[0], AnalysisKind::SceneCuts, -14.0));
+
+    assert_eq!(
+        state.status, "an earlier, unrelated message",
+        "the button shows the running label; the shared status line must be left for one-shot events only"
+    );
 }
 
 fn clip_starts(state: &EditorState) -> Vec<i64> {
