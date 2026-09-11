@@ -73,19 +73,25 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut TranscriptPa
         }
     });
 
-    let Some(words) = state.transcripts.get(&clip_id) else {
-        ui.weak("No transcript yet.");
-        return;
+    let words = match state.transcript(clip_id) {
+        crate::state::Transcript::Missing => {
+            ui.weak("No transcript yet.");
+            return;
+        }
+        crate::state::Transcript::Stale => {
+            ui.weak("This transcript is out of date — the clip has been moved, trimmed or re-timed since. Transcribe again.");
+            return;
+        }
+        crate::state::Transcript::Ready(words) => words,
     };
     if words.is_empty() {
         ui.weak("No speech detected in this clip.");
         return;
     }
-    // Cloned so the click-handling loop below can call `&mut state` (to
-    // seek the playhead) without fighting a live borrow of
-    // `state.transcripts` — these are small (one clip's word list), so the
-    // clone is not a real cost.
-    let words = words.clone();
+    // Copied out so the click-handling loop below can call `&mut state` (to
+    // seek the playhead) without fighting a live borrow of the transcript —
+    // these are small (one clip's word list), so the copy is not a real cost.
+    let words = words.to_vec();
 
     let selection_range = match (panel.anchor, panel.end) {
         (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
@@ -122,11 +128,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut TranscriptPa
                     state.status = format!("removed {count} word{}", if count == 1 { "" } else { "s" });
                     panel.anchor = None;
                     panel.end = None;
-                    // The clip's own ticks (and the transcript mapped onto
-                    // them) are now stale after the ripple — clearing avoids
-                    // showing word positions that no longer match the
-                    // timeline until the clip is re-transcribed.
-                    state.transcripts.remove(&clip_id);
+                    // No need to drop the transcript here: the ripple shortens
+                    // the clip, so `state.transcript` already reports what's
+                    // left as out of date.
                 } else {
                     state.status = "couldn't delete that range — it touches the clip's own edge".into();
                 }

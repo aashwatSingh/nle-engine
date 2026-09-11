@@ -6,6 +6,17 @@
 
 use super::*;
 
+/// The words `state` will actually hand out for `clip`, or `None` when it
+/// has none to give — either never transcribed, or transcribed before an
+/// edit that moved them. Most tests only care about that distinction; the
+/// ones that care *which* of the two it is match on `transcript` directly.
+fn words_of(state: &EditorState, clip: ClipInstanceId) -> Option<Vec<TimelineWord>> {
+    match state.transcript(clip) {
+        Transcript::Ready(words) => Some(words.to_vec()),
+        Transcript::Missing | Transcript::Stale => None,
+    }
+}
+
 fn fake_asset(id: u128, path: &str) -> media::MediaAsset {
     media::MediaAsset {
         id: media::MediaAssetId(id),
@@ -471,14 +482,34 @@ fn open_from_clears_stale_transcripts_from_the_previous_project() {
     let path = dir.path().join("p.nleproj");
     state_with_high_ids().save_to(&path);
 
-    let mut fresh = EditorState::new();
-    fresh.transcripts.insert(
-        ClipInstanceId(900),
-        vec![TimelineWord { text: "stale".into(), start_tick: 0, end_tick: TIMEBASE }],
-    );
+    // Transcribed against a clip that really exists in the outgoing
+    // project, so this is the id collision as it would actually happen.
+    let (mut fresh, ids) = state_with_three_clips();
+    fresh.store_words(ids[0], vec![TimelineWord { text: "stale".into(), start_tick: 0, end_tick: TIMEBASE }]);
+    assert!(words_of(&fresh, ids[0]).is_some(), "fixture should start with a transcript to lose");
+
     assert!(fresh.open_from(&path));
 
     assert!(fresh.transcripts.is_empty(), "transcripts from the previous project must not survive open_from");
+}
+
+#[test]
+fn open_from_clears_the_previous_projects_in_and_out_marks() {
+    // Marks are positions in a sequence, so they mean nothing in a
+    // different one. Left in place they draw markers over the newly
+    // opened timeline at ticks nothing put there, and "export range"
+    // silently scopes the export to them.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.nleproj");
+    state_with_high_ids().save_to(&path);
+
+    let mut fresh = EditorState::new();
+    fresh.in_point = Some(TIMEBASE);
+    fresh.out_point = Some(TIMEBASE * 5);
+    assert!(fresh.open_from(&path));
+
+    assert_eq!((fresh.in_point, fresh.out_point), (None, None));
+    assert_eq!(fresh.marked_range(), None, "a range from the previous project must not survive open_from");
 }
 
 #[test]
@@ -1500,14 +1531,14 @@ fn generate_captions_on_a_keyframed_clip_does_not_clobber_an_existing_transcript
     state.next_id = 1000;
 
     let real_transcript = vec![TimelineWord { text: "hello".into(), start_tick: 0, end_tick: TIMEBASE / 2 }];
-    state.transcripts.insert(ClipInstanceId(1), real_transcript.clone());
+    state.store_words(ClipInstanceId(1), real_transcript.clone());
 
     let added = state.generate_captions(ClipInstanceId(1));
 
     assert_eq!(added, 0, "keyframed-speed clips aren't supported yet, so no captions should be created");
     assert_eq!(
-        state.transcripts.get(&ClipInstanceId(1)),
-        Some(&real_transcript),
+        words_of(&state, ClipInstanceId(1)),
+        Some(real_transcript),
         "the real transcript from the earlier transcribe_clip call must survive the refused caption attempt"
     );
 }
@@ -1583,7 +1614,7 @@ fn delete_word_range_ripple_deletes_the_spanned_words_timeline_range() {
     // work rather than something to half-solve here.
     let (mut state, ids) = state_with_three_clips();
     let clip_id = ids[0]; // spans [0, TIMEBASE)
-    state.transcripts.insert(
+    state.store_words(
         clip_id,
         vec![
             TimelineWord { text: "one".into(), start_tick: 0, end_tick: TIMEBASE / 5 },
@@ -1617,7 +1648,7 @@ fn delete_word_range_ripple_deletes_the_spanned_words_timeline_range() {
 fn delete_word_range_returns_false_for_an_edge_touching_selection() {
     let (mut state, ids) = state_with_three_clips();
     let clip_id = ids[0];
-    state.transcripts.insert(
+    state.store_words(
         clip_id,
         vec![TimelineWord { text: "one".into(), start_tick: 0, end_tick: TIMEBASE / 2 }],
     );
@@ -1635,7 +1666,7 @@ fn delete_word_range_never_reaches_into_the_next_clip_on_the_track() {
     // sitting right after it on the same track.
     let (mut state, ids) = state_with_three_clips(); // clip0 [0,1s), clip1 [1s,2s)
     let clip_id = ids[0];
-    state.transcripts.insert(
+    state.store_words(
         clip_id,
         vec![TimelineWord { text: "one".into(), start_tick: TIMEBASE / 10, end_tick: TIMEBASE + TIMEBASE / 10 }],
     );
@@ -1649,9 +1680,67 @@ fn delete_word_range_never_reaches_into_the_next_clip_on_the_track() {
 fn delete_word_range_returns_false_for_an_out_of_range_selection() {
     let (mut state, ids) = state_with_three_clips();
     let clip_id = ids[0];
-    state.transcripts.insert(clip_id, vec![TimelineWord { text: "one".into(), start_tick: 0, end_tick: TIMEBASE / 2 }]);
+    state.store_words(clip_id, vec![TimelineWord { text: "one".into(), start_tick: 0, end_tick: TIMEBASE / 2 }]);
     let track = state.sequence().tracks[0].id;
     assert!(!state.delete_word_range(track, clip_id, 5, 9));
+}
+
+#[test]
+fn moving_a_clip_makes_its_transcript_stale_instead_of_silently_wrong() {
+    // Word ticks are derived from where the clip sat when it was
+    // transcribed, and nothing recomputes them afterwards. Left unchecked
+    // the panel would keep offering those words: clicking one seeks to
+    // where it used to be, and deleting a run ripple-deletes whatever now
+    // occupies that span. `Placement` already encodes "this result no
+    // longer describes this clip" for in-flight analyses; a stored
+    // transcript is the same claim, just cached for longer.
+    let (mut state, ids) = state_with_three_clips();
+    let clip_id = ids[0];
+    let track = state.sequence().tracks[0].id;
+    state.store_words(
+        clip_id,
+        vec![
+            TimelineWord { text: "one".into(), start_tick: 0, end_tick: TIMEBASE / 5 },
+            TimelineWord { text: "two".into(), start_tick: TIMEBASE / 5, end_tick: TIMEBASE * 2 / 5 },
+            TimelineWord { text: "three".into(), start_tick: TIMEBASE * 2 / 5, end_tick: TIMEBASE },
+        ],
+    );
+    assert!(matches!(state.transcript(clip_id), Transcript::Ready(_)));
+
+    // Out to empty timeline past the other two, so the move is
+    // unobstructed and the only thing that changed is where this clip sits.
+    state.begin_drag_edit("move clip");
+    state.move_clip(clip_id, track, TIMEBASE * 10);
+    state.end_drag_edit();
+
+    assert!(
+        matches!(state.transcript(clip_id), Transcript::Stale),
+        "a moved clip's transcript must report itself out of date"
+    );
+    let before = state.project().clone();
+    assert!(
+        !state.delete_word_range(track, clip_id, 1, 1),
+        "and must not be usable to cut footage at ticks it no longer describes"
+    );
+    assert_eq!(**state.project(), *before, "a refused deletion must leave the project untouched");
+}
+
+#[test]
+fn re_transcribing_a_moved_clip_makes_its_transcript_usable_again() {
+    // The other half: staleness has to be recoverable, or the panel's
+    // "transcribe again" is a dead end.
+    let (mut state, ids) = state_with_three_clips();
+    let clip_id = ids[0];
+    state.store_words(clip_id, vec![TimelineWord { text: "one".into(), start_tick: 0, end_tick: TIMEBASE / 5 }]);
+    let track = state.sequence().tracks[0].id;
+    state.begin_drag_edit("move clip");
+    state.move_clip(clip_id, track, TIMEBASE * 10);
+    state.end_drag_edit();
+    assert!(matches!(state.transcript(clip_id), Transcript::Stale));
+
+    state.store_words(clip_id, vec![TimelineWord { text: "one".into(), start_tick: TIMEBASE * 10, end_tick: TIMEBASE * 10 + TIMEBASE / 5 }]);
+
+    assert!(matches!(state.transcript(clip_id), Transcript::Ready(_)));
 }
 
 /// Runs `detect_scene_cuts` against a real file, decoding real frames
@@ -2009,7 +2098,7 @@ fn finished_results_for_a_zero_speed_clip_are_refused_instead_of_crashing() {
 
     assert_eq!(**state.project(), before, "nothing computed against a zero speed may be applied");
     assert!(
-        state.transcripts.get(&ids[0]).is_none_or(Vec::is_empty),
+        words_of(&state, ids[0]).is_none_or(|w| w.is_empty()),
         "no words can be placed on the timeline at zero speed"
     );
 }
@@ -2070,7 +2159,7 @@ fn finished_captions_land_on_a_new_track_and_fill_the_transcript() {
     let captions = &state.sequence().tracks[1].clips;
     assert_eq!(captions.len(), 1);
     assert!(matches!(captions[0].source, ClipSource::Title(_)));
-    assert_eq!(state.transcripts.get(&ids[0]).map(Vec::len), Some(2));
+    assert_eq!(words_of(&state, ids[0]).map(|w| w.len()), Some(2));
     assert_eq!(state.status, "generated 1 caption");
 }
 
@@ -2088,8 +2177,8 @@ fn a_finished_transcription_is_stored_without_touching_the_timeline() {
 
     assert_eq!(**state.project(), before);
     assert_eq!(
-        state.transcripts.get(&ids[0]),
-        Some(&vec![TimelineWord { text: "hello".into(), start_tick: TIMEBASE / 10, end_tick: TIMEBASE * 4 / 10 }])
+        words_of(&state, ids[0]),
+        Some(vec![TimelineWord { text: "hello".into(), start_tick: TIMEBASE / 10, end_tick: TIMEBASE * 4 / 10 }])
     );
     assert_eq!(state.status, "transcribed 1 word");
 }

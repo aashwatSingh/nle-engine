@@ -1605,3 +1605,57 @@ Checked: a new test asserts a zero denominator returns 0 rather than panicking,
 and the pre-fix arithmetic was confirmed to panic on the same input. 570 tests
 pass across the workspace, clippy clean.
 
+## 2026-09-11 — a stored transcript now expires the same way an in-flight one does
+
+Two leftovers from the same hunt, both about state that outlived the thing it
+described.
+
+**In/out marks survived `open_from`.** That loader is careful — it clears
+transcripts and asset paths, resets `next_id` past every id in the incoming
+file, drops the selection and the playhead — but not the marks. Marks are
+positions in *a* sequence, so they mean nothing in a different one, and they
+aren't inert: `start_export` scopes a range export to them. Now cleared with
+the rest.
+
+**Stored transcripts were never revalidated.** `Placement` exists because an
+analysis result computed against where a clip *was* must not be applied after
+it moves, and `apply_finished` enforces that for results still in flight. But
+once the words reached `EditorState::transcripts` nothing checked them again,
+and word ticks are derived from exactly what `Placement` fingerprints — the
+clip's `timeline_in`, its speed, and which slice of the source was
+transcribed. So moving or trimming a transcribed clip left the panel offering
+words whose ticks pointed somewhere else: clicking one seeks to where it used
+to be, and `delete_word_range` ripple-deletes by those ticks.
+
+What kept that from being a wrong cut was `delete_word_range`'s existing bounds
+guard — a moved clip's stale ticks usually fall outside its new bounds and get
+refused. "Usually" is the problem, and the message it refuses with ("it touches
+the clip's own edge") describes a different situation entirely. The edits that
+would defeat the guard outright while keeping the words in bounds — slip and
+rate-stretch, which change what plays without changing where — exist in
+`edit_ops` but aren't wired to any UI gesture yet, so this was a wart today and
+a real miscut the moment a slip tool lands.
+
+Fixed by storing the `Placement` next to the words and checking it on the way
+out, through a new `EditorState::transcript` returning `Missing` / `Stale` /
+`Ready`. Reusing `Placement` rather than working out a narrower rule is the
+point: it is already the codebase's answer to "does this result still describe
+this clip", and a second, subtly different answer to the same question is how
+the two drift apart. It inherits the same conservatism — a nudge that happened
+to leave the words valid still costs a re-transcribe, which is the cheaper of
+the two mistakes.
+
+The field is private now, so the panel and any future caller have to come
+through that check; the panel gained a "this transcript is out of date —
+transcribe again" state, which is also what it shows after a word-range delete
+(the ripple shortens the clip, so the remaining words report themselves stale
+on their own — the manual `transcripts.remove` that used to do that job is
+gone, one mechanism instead of two).
+
+Checked: two new tests — a moved clip's transcript reports `Stale` and refuses
+to cut, and re-transcribing makes it `Ready` again, so staleness is
+recoverable rather than a dead end — plus one that the marks don't survive a
+load. The existing transcript tests moved onto `store_words`/`transcript`
+rather than poking the map, so they now exercise the same path the editor
+does. 573 tests pass across the workspace, clippy clean.
+

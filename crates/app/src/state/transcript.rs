@@ -1,8 +1,26 @@
 //! Speech: transcription, caption generation, and transcript-based editing.
 
 use super::analysis::{decode_mono, AssetPaths};
-use super::analysis_jobs::AnalysisError;
+use super::analysis_jobs::{AnalysisError, Placement};
 use super::*;
+
+/// A stored transcript, with the clip layout its ticks were computed
+/// against.
+pub(super) struct StoredTranscript {
+    words: Vec<TimelineWord>,
+    /// Checked before the words are handed out — see `EditorState::transcript`.
+    placement: Placement,
+}
+
+/// What the transcript panel should show for a clip.
+pub enum Transcript<'a> {
+    /// Never transcribed, or transcribed and found to contain no speech.
+    Missing,
+    /// Transcribed, but the clip has been moved, trimmed or re-timed since,
+    /// so the stored ticks no longer point at the words they name.
+    Stale,
+    Ready(&'a [TimelineWord]),
+}
 
 /// Transcribes `clip`'s audio with local Whisper — the slow half of both
 /// `generate_captions` and `transcribe_clip`, free of `EditorState` so it can
@@ -19,6 +37,32 @@ pub(super) fn transcribe_segments(
 }
 
 impl EditorState {
+    /// `clip_id`'s transcript, if it still describes where the clip is now.
+    ///
+    /// The staleness rule is `Placement`'s, deliberately reused rather than
+    /// reasoned out a second time: word ticks are derived from the clip's
+    /// `timeline_in`, its speed and which slice of the source was
+    /// transcribed, so the same edits that make an in-flight analysis's
+    /// result unsafe to apply also make a stored transcript's ticks point
+    /// somewhere they no longer belong. Same conservatism too — a nudge that
+    /// happened to leave the words valid still costs a re-transcribe, which
+    /// is the cheaper mistake of the two.
+    pub fn transcript(&self, clip_id: ClipInstanceId) -> Transcript<'_> {
+        let Some(stored) = self.transcripts.get(&clip_id) else { return Transcript::Missing };
+        let Some((track, clip)) = self.find_clip(clip_id) else { return Transcript::Stale };
+        if Placement::of(track, &clip) != stored.placement {
+            return Transcript::Stale;
+        }
+        Transcript::Ready(&stored.words)
+    }
+
+    /// Stores `words` against the clip layout they were computed from.
+    pub(super) fn store_words(&mut self, clip_id: ClipInstanceId, words: Vec<TimelineWord>) {
+        let Some((track, clip)) = self.find_clip(clip_id) else { return };
+        let placement = Placement::of(track, &clip);
+        self.transcripts.insert(clip_id, StoredTranscript { words, placement });
+    }
+
     /// Transcribes `clip_id`'s audio and places one title clip per segment
     /// on the topmost video track — see `apply_captions`. Blocking, so
     /// test-only; the editor goes through `start_analysis`. Returns how many
@@ -63,7 +107,10 @@ impl EditorState {
         // already done, so the panel's Transcribe button doesn't need to run
         // Whisper again over the same audio just to get word-level ticks.
         let words = self.timeline_words_from_transcript(clip, segments);
-        self.transcripts.insert(clip_id, words);
+        // Stored before the captions are placed, and that order is safe:
+        // captioning only ever adds title clips on another track, so the
+        // transcribed clip's own placement is the same before and after.
+        self.store_words(clip_id, words);
 
         // Reuses `add_title_at_playhead`'s track-selection rule (top track if
         // free, else a new one above) by targeting the whole transcribed
@@ -179,7 +226,7 @@ impl EditorState {
     pub(super) fn store_transcript(&mut self, clip_id: ClipInstanceId, clip: &ClipInstance, segments: &[speech::Segment]) -> usize {
         let words = self.timeline_words_from_transcript(clip, segments);
         let found = words.len();
-        self.transcripts.insert(clip_id, words);
+        self.store_words(clip_id, words);
         found
     }
 
@@ -214,7 +261,12 @@ impl EditorState {
     /// is a trim (shorten the clip), not an isolate-and-extract — handling
     /// both shapes in one action is real, separate follow-up work.
     pub fn delete_word_range(&mut self, track: TrackId, clip_id: ClipInstanceId, first_word: usize, last_word: usize) -> bool {
-        let Some(words) = self.transcripts.get(&clip_id) else { return false };
+        // Goes through `transcript` rather than the map directly: this is the
+        // one caller that turns word indices into a ripple delete of real
+        // footage, so acting on ticks that predate an edit is the difference
+        // between cutting the words the user picked and cutting whatever now
+        // occupies that span.
+        let Transcript::Ready(words) = self.transcript(clip_id) else { return false };
         if first_word > last_word || last_word >= words.len() {
             return false;
         }

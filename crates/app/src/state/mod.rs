@@ -126,7 +126,11 @@ pub struct EditorState {
     /// same result rather than throwing it away). Not persisted in the project
     /// file — regenerating on demand is cheap enough, and a session-only
     /// cache avoids growing the save format for derived data.
-    pub transcripts: std::collections::HashMap<ClipInstanceId, Vec<TimelineWord>>,
+    ///
+    /// Private, and read through `EditorState::transcript`: those ticks are
+    /// only meaningful while the clip still sits where it did when they were
+    /// computed, and the accessor is what enforces that.
+    transcripts: std::collections::HashMap<ClipInstanceId, transcript::StoredTranscript>,
     /// Scene-cut, silence, beat, loudness, stabilize, caption and transcribe
     /// jobs running in the background — see `analysis_jobs`.
     analysis: analysis_jobs::AnalysisJobs,
@@ -152,6 +156,7 @@ mod analysis_jobs;
 mod transcript;
 
 pub use analysis_jobs::AnalysisKind;
+pub use transcript::Transcript;
 mod editing;
 mod keyframes;
 mod project_io;
