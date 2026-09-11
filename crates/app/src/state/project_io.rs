@@ -470,6 +470,10 @@ impl EditorState {
         self.playhead = 0;
         self.selected_clips.clear();
         self.selected_item = None;
+        // Marks are positions in a sequence, so they carry no meaning into a
+        // different one — and they aren't inert: `start_export` scopes a
+        // range export to them.
+        self.clear_marks();
         self.playing = false;
         self.play_anchor = None;
         self.drag = None;
