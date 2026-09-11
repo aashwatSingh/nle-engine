@@ -111,6 +111,26 @@ fn to_rational(r: ffmpeg_next::Rational) -> Rational {
     Rational { num: r.numerator().max(0) as u32, den: r.denominator().max(1) as u32 }
 }
 
+/// Converts a packet/frame presentation timestamp in `time_base` units to
+/// timeline ticks, treating a timestamp that can't be placed as tick 0.
+///
+/// The zero-denominator guard is the point. A stream's time base comes
+/// straight out of the container's own metadata — `open_input` restricts
+/// which demuxers run, not what they report — and a file declaring `0`
+/// there would otherwise reach an integer division and panic the decode
+/// thread. Every other reader of a raw FFmpeg time base in this crate
+/// already guards it (`to_rational` clamps, `probe`'s duration maths and
+/// both encoders test explicitly); the two decoder streams divided by it
+/// unchecked, so this is the shared version they now share rather than a
+/// third and fourth copy of the same check.
+pub(crate) fn pts_to_ticks(pts: Option<i64>, time_base: ffmpeg_next::Rational) -> i64 {
+    let (Some(pts), den) = (pts, time_base.denominator() as i128) else { return 0 };
+    if den == 0 {
+        return 0;
+    }
+    (pts as i128 * timeline_timebase() as i128 * time_base.numerator() as i128 / den) as i64
+}
+
 fn map_pixel_format(fmt: ffmpeg_next::format::Pixel) -> PixelFormat {
     use ffmpeg_next::format::Pixel;
     match fmt {
@@ -421,6 +441,28 @@ mod tests {
             timeline_timebase(),
             timeline::TIMEBASE,
             "media_ffmpeg's duplicated timebase has drifted from timeline::TIMEBASE"
+        );
+    }
+
+    #[test]
+    fn a_zero_time_base_denominator_does_not_panic_the_decode() {
+        // A stream's time base is the container's own metadata, so `0` is
+        // something a malformed or crafted file can declare. Before the
+        // guard this divided by it and panicked — on a worker thread, where
+        // the panic is silent and strands the job rather than crashing
+        // visibly. Placing the frame at 0 is the same answer as for a frame
+        // carrying no timestamp at all.
+        assert_eq!(pts_to_ticks(Some(9000), ffmpeg_next::Rational::new(1, 0)), 0);
+        assert_eq!(pts_to_ticks(Some(9000), ffmpeg_next::Rational::new(0, 0)), 0);
+        assert_eq!(pts_to_ticks(None, ffmpeg_next::Rational::new(1, 90_000)), 0);
+    }
+
+    #[test]
+    fn pts_converts_through_the_stream_time_base() {
+        // One second at a 90kHz time base is one second of timeline ticks.
+        assert_eq!(
+            pts_to_ticks(Some(90_000), ffmpeg_next::Rational::new(1, 90_000)),
+            timeline_timebase()
         );
     }
 

@@ -109,13 +109,7 @@ impl VideoDecoderStream {
     }
 
     fn convert_to_rgba(&mut self, decoded: &ffmpeg_next::frame::Video) -> Result<DecodedRgbaFrame, ProbeError> {
-        let pts_ticks = decoded
-            .pts()
-            .map(|p| {
-                (p as i128 * crate::timeline_timebase() as i128 * self.time_base.numerator() as i128
-                    / self.time_base.denominator() as i128) as i64
-            })
-            .unwrap_or(0);
+        let pts_ticks = crate::pts_to_ticks(decoded.pts(), self.time_base);
         let mut rgba_frame = ffmpeg_next::frame::Video::empty();
         self.scaler.run(decoded, &mut rgba_frame)?;
         let width = rgba_frame.width();

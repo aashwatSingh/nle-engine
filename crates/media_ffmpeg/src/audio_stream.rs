@@ -101,13 +101,7 @@ impl AudioDecoderStream {
         let mut decoded = ffmpeg_next::frame::Audio::empty();
         loop {
             if self.decoder.receive_frame(&mut decoded).is_ok() {
-                let pts_ticks = decoded
-                    .pts()
-                    .map(|p| {
-                        (p as i128 * crate::timeline_timebase() as i128 * self.time_base.numerator() as i128
-                            / self.time_base.denominator() as i128) as i64
-                    })
-                    .unwrap_or(0);
+                let pts_ticks = crate::pts_to_ticks(decoded.pts(), self.time_base);
                 if let Some(target) = self.discard_before_ticks {
                     if pts_ticks < target {
                         continue;
