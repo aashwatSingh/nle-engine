@@ -35,6 +35,9 @@ impl VideoDecoderStream {
         let decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?
             .decoder()
             .video()?;
+        // Refused here rather than per frame: this stream decodes every
+        // frame of the clip, so the first allocation is the one to stop.
+        crate::rgba_buffer_len(decoder.width(), decoder.height())?;
         let scaler = ffmpeg_next::software::scaling::Context::get(
             decoder.format(),
             decoder.width(),
@@ -116,7 +119,7 @@ impl VideoDecoderStream {
         let height = rgba_frame.height();
         let stride = rgba_frame.stride(0);
         let data = rgba_frame.data(0);
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        let mut rgba = vec![0u8; crate::rgba_buffer_len(width, height)?];
         for row in 0..height as usize {
             let src = &data[row * stride..row * stride + (width as usize * 4)];
             let dst_start = row * width as usize * 4;

@@ -62,6 +62,9 @@ pub enum ProbeError {
     Io(std::io::Error),
     Ffmpeg(ffmpeg_next::Error),
     NoDecodableStreams,
+    /// The file declares a frame too large to decode — see
+    /// `MAX_DECODED_PIXELS`.
+    FrameTooLarge { width: u32, height: u32 },
 }
 
 impl From<std::io::Error> for ProbeError {
@@ -105,6 +108,31 @@ pub(crate) fn open_input(path: &Path) -> Result<ffmpeg_next::format::context::In
     options.set("format_whitelist", ALLOWED_DEMUXERS);
     options.set("protocol_whitelist", "file");
     ffmpeg_next::format::input_with_dictionary(path, options)
+}
+
+/// The largest frame this editor will decode, in pixels: 8192x8192,
+/// comfortably above 8K DCI (8192x4320) and every format an editor
+/// plausibly ingests.
+///
+/// A limit has to exist somewhere. FFmpeg's own default (`max_pixels` =
+/// `INT_MAX`) is far too generous for a buffer we allocate per frame at 4
+/// bytes a pixel, and dimensions come from the file's own headers — so
+/// without a bound, a file declaring an absurd frame size decides how much
+/// memory this process asks for. At the very top of that range the
+/// arithmetic stops being merely large and starts being wrong: `width *
+/// height * 4` is `u32`, which wraps in release builds, and a wrapped
+/// length allocates a buffer far too small for the copy that follows.
+const MAX_DECODED_PIXELS: u64 = 8192 * 8192;
+
+/// Rejects a frame the editor won't decode, and returns its RGBA buffer
+/// size. Checked in `u64` on purpose: the multiplication this replaces
+/// overflowed silently in exactly the case worth catching.
+pub(crate) fn rgba_buffer_len(width: u32, height: u32) -> Result<usize, ProbeError> {
+    let pixels = width as u64 * height as u64;
+    if pixels == 0 || pixels > MAX_DECODED_PIXELS {
+        return Err(ProbeError::FrameTooLarge { width, height });
+    }
+    Ok((pixels * 4) as usize)
 }
 
 fn to_rational(r: ffmpeg_next::Rational) -> Rational {
@@ -364,6 +392,9 @@ pub fn decode_frame_at(path: &Path, target_ticks: i64) -> Result<DecodedRgbaFram
     let mut decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?
         .decoder()
         .video()?;
+    // Before the scaler, which would otherwise be the first thing to
+    // allocate against these dimensions.
+    rgba_buffer_len(decoder.width(), decoder.height())?;
     let mut scaler = ffmpeg_next::software::scaling::Context::get(
         decoder.format(),
         decoder.width(),
@@ -393,7 +424,7 @@ pub fn decode_frame_at(path: &Path, target_ticks: i64) -> Result<DecodedRgbaFram
             let height = rgba_frame.height();
             let stride = rgba_frame.stride(0);
             let data = rgba_frame.data(0);
-            let mut rgba = vec![0u8; (width * height * 4) as usize];
+            let mut rgba = vec![0u8; rgba_buffer_len(width, height)?];
             for row in 0..height as usize {
                 let src = &data[row * stride..row * stride + (width as usize * 4)];
                 let dst_start = row * width as usize * 4;
@@ -442,6 +473,29 @@ mod tests {
             timeline::TIMEBASE,
             "media_ffmpeg's duplicated timebase has drifted from timeline::TIMEBASE"
         );
+    }
+
+    #[test]
+    fn an_absurd_frame_size_is_refused_instead_of_allocated() {
+        // The dimensions come from the file's own headers, so without this
+        // the file decides how much memory the process asks for. 65535
+        // square is the interesting case: times four it exceeds u32, which
+        // is what the old `width * height * 4` wrapped on, producing a
+        // buffer far too small for the copy that followed.
+        assert!(matches!(
+            rgba_buffer_len(65535, 65535),
+            Err(ProbeError::FrameTooLarge { .. })
+        ));
+        assert!(matches!(rgba_buffer_len(0, 1080), Err(ProbeError::FrameTooLarge { .. })));
+        assert!(matches!(rgba_buffer_len(1920, 0), Err(ProbeError::FrameTooLarge { .. })));
+    }
+
+    #[test]
+    fn real_frame_sizes_up_to_8k_are_still_allowed() {
+        // The guard against a limit set so low it refuses real footage.
+        assert_eq!(rgba_buffer_len(1920, 1080).unwrap(), 1920 * 1080 * 4);
+        assert_eq!(rgba_buffer_len(3840, 2160).unwrap(), 3840 * 2160 * 4);
+        assert_eq!(rgba_buffer_len(8192, 4320).unwrap(), 8192 * 4320 * 4);
     }
 
     #[test]
