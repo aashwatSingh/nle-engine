@@ -62,6 +62,11 @@ impl Default for Autosave {
     }
 }
 
+/// Names the temp-directory recovery files belonging to untitled
+/// projects, so `find_recovery` can pick one out of whatever else is in
+/// there. Anything not carrying it belongs to somebody else.
+const UNTITLED_RECOVERY_PREFIX: &str = "nle-untitled-recovery-";
+
 impl Autosave {
     /// Recovery path for a project: beside it, prefixed so it sorts next to the
     /// original and is obviously not the user's file. Never-saved projects go to
@@ -75,7 +80,14 @@ impl Autosave {
                     .unwrap_or_else(|| "project.nleproj".into());
                 p.with_file_name(format!(".recover-{name}"))
             }
-            None => std::env::temp_dir().join("nle-untitled-recovery.nleproj"),
+            // Per-process, for the reason `cache_dirs` is: a saved project's
+            // recovery file is already unique to that project, but every
+            // untitled session would otherwise share one path and overwrite
+            // whatever the other was holding. `find_recovery` searches the
+            // prefix rather than a fixed name so a crash is still
+            // recoverable across the pid change.
+            None => std::env::temp_dir()
+                .join(format!("{UNTITLED_RECOVERY_PREFIX}{}.nleproj", std::process::id())),
         }
     }
 
@@ -113,15 +125,63 @@ impl Autosave {
     }
 
     /// The recovery file left by a previous session, if there is one.
+    ///
+    /// For an untitled project that means searching, not just testing one
+    /// path: the file that matters was written by a process that no longer
+    /// exists, under its own pid. The newest wins, and this process's own
+    /// file is skipped — it holds the session being started, not a
+    /// previous one. Another *live* editor's file can be offered here,
+    /// which is the same answer the single fixed path gave and strictly
+    /// better than silently overwriting it.
     pub fn find_recovery(project_path: Option<&Path>) -> Option<PathBuf> {
-        let path = Self::recovery_path_for(project_path);
-        path.exists().then_some(path)
+        if project_path.is_some() {
+            let path = Self::recovery_path_for(project_path);
+            return path.exists().then_some(path);
+        }
+        let ours = Self::recovery_path_for(None);
+        let entries = std::fs::read_dir(std::env::temp_dir()).ok()?;
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| *p != ours)
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(UNTITLED_RECOVERY_PREFIX) && n.ends_with(".nleproj"))
+            })
+            .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_untitled_sessions_do_not_share_one_recovery_file() {
+        // They used to: a single fixed temp path meant whichever editor
+        // autosaved last overwrote the other's unsaved work, and the
+        // survivor was the only one offered back on the next launch.
+        let path = Autosave::recovery_path_for(None);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "an untitled recovery file must be per-process, got {name}"
+        );
+        assert!(name.starts_with(UNTITLED_RECOVERY_PREFIX), "and must carry the prefix find_recovery searches");
+    }
+
+    #[test]
+    fn find_recovery_ignores_this_sessions_own_file() {
+        // Our own file holds the session being started, not a previous
+        // one — offering it back would prompt to restore work the editor
+        // already has open.
+        let ours = Autosave::recovery_path_for(None);
+        std::fs::write(&ours, b"x").unwrap();
+        let found = Autosave::find_recovery(None);
+        let _ = std::fs::remove_file(&ours);
+        assert_ne!(found.as_ref(), Some(&ours), "our own recovery file must never be offered");
+    }
 
     #[test]
     fn a_recovery_file_sits_beside_its_project_and_is_clearly_not_the_project() {
