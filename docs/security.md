@@ -113,10 +113,52 @@ which sets two FFmpeg options:
 - `protocol_whitelist=file` keeps even an allowed demuxer from reaching past
   local files.
 
+Frame dimensions are bounded too (`MAX_DECODED_PIXELS`, 8192x8192 — above 8K
+DCI). They come from the file's own headers and size a buffer allocated per
+frame at four bytes a pixel, so without a cap the file decides how much memory
+the process asks for; FFmpeg's own default (`max_pixels` = `INT_MAX`) is far
+too generous for that. At the top of that range the arithmetic also stopped
+being merely large and started being wrong — `width * height * 4` was `u32`,
+which wraps in release builds, and a wrapped length allocated a buffer too
+small for the copy that followed. It is computed in `u64` now and checked
+before the decoder is used.
+
 **What that doesn't cover.** Decoders aren't allowlisted; the allowlist bounds
 containers, not codecs. The allowed demuxers are themselves large parsers. A
 real sandbox — decoding in a separate low-privilege process — is the only
 complete answer, and it isn't built.
+
+## Untrusted project files
+
+A `.nleproj` is untrusted input in the same way media is: it can arrive by
+download or email, and nothing about opening one implies the user vouched for
+its contents.
+
+- **Structure is validated on load.** `timeline::model::invariants::check_project`
+  holds an arriving project to the same standard `edit_ops::apply` holds its
+  own results to — no overlapping clips, no clip ending before it starts, no
+  duplicate clip/track/sequence ids, no negative start, a usable sample rate
+  and frame size. `apply` re-checks the *whole* project after every edit, so a
+  file skipping that check didn't merely load something wrong, it loaded
+  something that made every later edit fail while blaming the edit. Storage
+  order is normalised rather than rejected, because `apply` sorts before it
+  checks and an unsorted vec is not corruption. Undo history is held to the
+  same standard but dropped rather than refused — it's recoverable context,
+  not the work itself.
+- **Media paths can't escape the project folder.** `relative_path` exists so a
+  self-contained project folder can be moved wholesale, and `Path::join`
+  silently discards the base when handed an absolute path — so the field
+  marked "relative" could otherwise name any file on the machine and the
+  editor would try to decode it. `resolve_relative_media` refuses anything
+  absolute or climbing through `..`. Media genuinely stored elsewhere still
+  resolves through `original_absolute_path`, which is what that field is for.
+
+**What that doesn't cover.** `original_absolute_path` is by design an
+arbitrary path, so a crafted project can still name any file and have the
+editor attempt to decode it. The demuxer allowlist bounds what that attempt
+can do — no allowed demuxer can reference further files or URLs, and there is
+no network path out of this process — so the residual is file-existence
+probing and a decode attempt that almost always fails.
 
 ### Update status (checked 2026-09-10)
 

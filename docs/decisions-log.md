@@ -1659,3 +1659,76 @@ load. The existing transcript tests moved onto `store_words`/`transcript`
 rather than poking the map, so they now exercise the same path the editor
 does. 573 tests pass across the workspace, clippy clean.
 
+## 2026-09-13 — a project file is untrusted input, and now gets checked like one
+
+A security pass over the whole codebase, not just the recent diff. The
+reassuring half first: there is no `unsafe` anywhere in the workspace, the one
+subprocess builds its argv as separate `.arg()` calls with nothing
+user-controlled in it, the demuxer and protocol allowlists hold, and the
+scratch directories are already per-process. With no network surface and no
+privilege boundary in a single-user desktop app, the realistic ceiling for a
+hostile file is a crash or a corrupted document — not code execution. Nothing
+found was critical in that sense.
+
+What the pass did find was a hole with a clear shape: **every defence this
+project has was built around edits, and none of it was pointed at files.**
+
+**Loaded projects skipped every invariant.** `edit_ops::apply` re-validates
+the entire project after every single edit and refuses to hand back a result
+that breaks the rules — the whole reason that check exists is that the
+property suite kept finding corruption an operation's own logic couldn't see.
+`project::load` checked the schema version and nothing else. So a file was the
+one way into the editor that bypassed the check entirely, and the failure mode
+was worse than "opens something wrong": because `apply` validates the *whole*
+project, a single pre-existing overlap made every subsequent edit fail, with an
+error naming the edit the user had just tried rather than the file they had
+opened. The project loaded, played, and could not be worked on, and nothing
+said why.
+
+`invariants::check_project` now holds an arriving project to the same standard
+as an edited one, and `load` refuses what fails — refusing rather than
+repairing for the reason the schema-version check right above it already gives:
+guessing at what a broken file meant is how the next save destroys the work.
+Two deliberate asymmetries. Clip storage order is *normalised*, not rejected,
+because `apply` sorts before it checks and an out-of-order vec is a thing the
+editor itself writes. And undo history is checked but dropped rather than
+refused — it is recoverable context rather than the work, schema v3 already set
+that precedent, and left in place a poisoned entry would just move the failure
+one Ctrl+Z away.
+
+This also closed the `sample_rate` question the pass opened separately: it is
+project-controlled and was never validated. Tracing it showed it never reaches
+an integer divisor — export hardcodes 48kHz and playback uses the device rate —
+so it was not the third divide-by-zero it first looked like, but a rate of zero
+still produced `inf` timings in silence and beat detection. It is bounds-checked
+on load now with the rest.
+
+**Frame dimensions were whatever the file said.** `width * height * 4` was
+`u32`, which wraps in release, and nothing capped the values going into it —
+so a file's headers decided how much memory the process asked for, and at the
+top of the range decided it *wrongly*, allocating a buffer too small for the
+copy that followed. Now computed in `u64` against `MAX_DECODED_PIXELS`
+(8192x8192, above 8K DCI) and checked once when the decoder is created, before
+the scaler — which would otherwise be the first thing to allocate against
+those dimensions — rather than per frame.
+
+**A "relative" media path could be absolute.** `Path::join` silently discards
+the base when the joined path is absolute, so the project field documented as
+relative could name any file on the machine, and the editor would open and try
+to decode it. `resolve_relative_media` refuses anything absolute or climbing
+through `..`. The residual is deliberate and documented: `original_absolute_path`
+is *supposed* to be an arbitrary path, so a crafted file can still point at one
+— bounded by the allowlist, which admits no demuxer that can reach further
+files or URLs, and by there being no network path out of this process.
+
+**Untitled sessions shared one recovery file.** `cache_dirs` is per-process
+precisely so two editors can't overwrite each other; the untitled recovery file
+sat at one fixed temp path and did exactly that — last autosave wins, and the
+loser's unsaved work is gone. Per-process now, with `find_recovery` searching
+the prefix rather than testing one path, because the file that matters was
+written by a process that no longer exists.
+
+Checked: 13 new tests, including the ones that guard against overcorrecting —
+an ordinary project still opens, out-of-order storage still opens and comes
+back sorted, and real frame sizes up to 8K are still allowed. 586 tests
+pass across the workspace, clippy clean.
