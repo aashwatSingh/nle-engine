@@ -238,6 +238,17 @@ fn ripple_shift(seq: &mut Sequence, source_track: TrackId, at_or_after: TimeTick
                     clip.timeline_out = TimeTick(clip.timeline_out.0 + delta);
                 }
             }
+            // Transitions ride along. A transition is a position on this
+            // track that names a cut between two clips, so a ripple that
+            // moves the clips has to move it too — left behind, it stops
+            // describing the cut it was placed on and starts describing
+            // whatever cut now sits at that tick, which is a different pair
+            // of shots dissolving and no indication anything changed.
+            for transition in track.transitions.iter_mut() {
+                if transition.at >= at_or_after {
+                    transition.at = TimeTick(transition.at.0 + delta);
+                }
+            }
             track.clips.sort_by_key(|c| c.timeline_in.0);
             if crate::model::invariants::check_no_overlaps(track).is_err() {
                 return Err(EditError::WouldOverlap);
@@ -1071,5 +1082,52 @@ mod tests {
         assert_eq!((host_clips[0].timeline_in.0, host_clips[0].timeline_out.0), (10, 50));
         assert_eq!(host_clips[0].source, ClipSource::NestedSequence(SequenceId(99)));
         assert_no_overlaps(&p2);
+    }
+
+    #[test]
+    fn a_ripple_carries_transitions_along_with_the_clips_they_sit_on() {
+        use crate::model::{Transition, TransitionId, TransitionKind};
+        // A[0,1000) B[1000,2000) C[2000,3000) with a dissolve on the A|B cut.
+        let mut project = project_with(vec![track(1, TrackKind::Video, vec![
+            clip(1, 0, 1000), clip(2, 1000, 2000), clip(3, 2000, 3000),
+        ])]);
+        project.sequences[0].tracks[0].transitions = vec![Transition {
+            id: TransitionId(9),
+            kind: TransitionKind::CrossDissolve,
+            at: TimeTick(1000),
+            duration: TimeTick(400),
+        }];
+
+        // Ripple-delete A. B and C each slide 1000 ticks left.
+        let after = apply(&project, &EditOp::Extract { clip: ClipInstanceId(1) }).unwrap();
+        let t = &after.sequences[0].tracks[0];
+        assert_eq!(
+            t.clips.iter().map(|c| c.timeline_in.0).collect::<Vec<_>>(),
+            vec![0, 1000],
+            "setup: the ripple should have moved both survivors"
+        );
+        assert_eq!(
+            t.transitions[0].at.0, 0,
+            "the transition must move with them — left at 1000 it would sit on the B|C cut              and silently dissolve a different pair of shots"
+        );
+    }
+
+    #[test]
+    fn a_transition_before_the_ripple_point_stays_put() {
+        use crate::model::{Transition, TransitionId, TransitionKind};
+        // Nothing upstream of an edit should move, transitions included.
+        let mut project = project_with(vec![track(1, TrackKind::Video, vec![
+            clip(1, 0, 1000), clip(2, 1000, 2000), clip(3, 2000, 3000),
+        ])]);
+        project.sequences[0].tracks[0].transitions = vec![Transition {
+            id: TransitionId(9),
+            kind: TransitionKind::CrossDissolve,
+            at: TimeTick(1000),
+            duration: TimeTick(400),
+        }];
+
+        // Ripple-delete C, the last clip: nothing before it should shift.
+        let after = apply(&project, &EditOp::Extract { clip: ClipInstanceId(3) }).unwrap();
+        assert_eq!(after.sequences[0].tracks[0].transitions[0].at.0, 1000);
     }
 }

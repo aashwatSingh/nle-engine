@@ -379,7 +379,7 @@ impl<R: EffectRegistry> GraphCompiler<R> {
             // half the incoming clip doesn't contain `at` at all — sampling it
             // early, into its handles, is exactly what a transition is.
             let (plan, transition) = match track.transition_at(at) {
-                Some(tr) => {
+                Some(tr) if track.clips_at_cut(tr.at) != (None, None) => {
                     let (left, right) = track.clips_at_cut(tr.at);
                     let incoming = right
                         .and_then(|c| self.plan_clip(project, c, at, ancestors, &mut unknown_effects));
@@ -394,7 +394,15 @@ impl<R: EffectRegistry> GraphCompiler<R> {
                         }),
                     )
                 }
-                None => {
+                // A transition anchored where no clip begins or ends any
+                // more. It describes a cut that no longer exists, and the
+                // branch above resolves its layers purely by matching a
+                // clip edge to `tr.at` — so it would find neither side and
+                // render nothing, punching a hole in footage that is
+                // perfectly intact underneath. Falling through to the
+                // ordinary lookup makes a stale transition invisible
+                // instead of destructive.
+                _ => {
                     let active = track
                         .clips
                         .iter()
@@ -1103,5 +1111,51 @@ mod tests {
             cache.get_or_compile(&c, &p, SequenceId(1), TimeTick(tick)).unwrap();
         }
         assert!(cache.len() <= 4, "cache grew past max_entries: {}", cache.len());
+    }
+
+    #[test]
+    fn a_transition_anchored_where_no_cut_exists_shows_the_footage_underneath() {
+        // The shape a ripple used to leave behind. The clip covering this
+        // tick is intact; only the transition's anchor is stale. Rendering
+        // nothing here blacked out real footage in the preview and the
+        // export, for the transition's whole duration.
+        let mut track = video_track(1, vec![clip(1, 0, 4000)]);
+        track.transitions = vec![Transition {
+            id: timeline::TransitionId(1),
+            kind: TransitionKind::CrossDissolve,
+            at: TimeTick(2000), // mid-clip: nothing starts or ends here
+            duration: TimeTick(400),
+        }];
+        let p = Project { sequences: vec![sequence(1, vec![track])], assets: vec![], bins: vec![] };
+
+        // Tick 2000 sits inside the stale region (1800..2200).
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(2000)).unwrap();
+        assert!(
+            g.track_plans[0].active_clip.is_some(),
+            "the clip covering this tick must still render"
+        );
+        assert!(
+            g.track_plans[0].transition.is_none(),
+            "and the stale transition must not be applied to it"
+        );
+        assert_eq!(g.media_requests().len(), 1, "the frame must still be requested");
+    }
+
+    #[test]
+    fn a_transition_at_a_clips_head_is_still_a_fade_not_a_stale_anchor() {
+        // Guard against over-correcting: one-sided transitions are the
+        // documented way a fade in/out is expressed, so only a transition
+        // with *neither* side must fall through.
+        let mut track = video_track(1, vec![clip(1, 1000, 4000)]);
+        track.transitions = vec![Transition {
+            id: timeline::TransitionId(1),
+            kind: TransitionKind::CrossDissolve,
+            at: TimeTick(1000), // the clip's own head — a fade in
+            duration: TimeTick(400),
+        }];
+        let p = Project { sequences: vec![sequence(1, vec![track])], assets: vec![], bins: vec![] };
+
+        let g = compiler().compile(&p, SequenceId(1), TimeTick(1000)).unwrap();
+        assert!(g.track_plans[0].transition.is_some(), "a head fade must still be a transition");
     }
 }

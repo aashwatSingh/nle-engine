@@ -1773,3 +1773,48 @@ Checked: 3 new tests — a keystroke mid-drag commits the drag and applies the
 edit as two separate undo steps, a background analysis result landing mid-drag
 leaves the drag intact, and ending a gesture twice is harmless. 589 tests pass
 across the workspace, clippy clean.
+
+## 2026-09-13 — ripples left transitions behind, and the renderer punished it
+
+`edit_ops` maintains every timeline invariant there is, and it did not know
+transitions existed — it only ever constructed empty `transitions: vec![]`.
+So `ripple_shift` moved a track's clips and left its transitions at their old
+absolute ticks. Measured, on A[0,1000) B[1000,2000) C[2000,3000) with a
+dissolve on the A|B cut: ripple-delete A and the survivors slide to [0,1000)
+and [1000,2000) while the transition stays at 1000 — which is now the *B|C*
+cut. A dissolve placed between two particular shots silently moves to a
+different pair, and exports that way.
+
+The second symptom was worse, and came from the renderer rather than the
+model. The compiler's transition branch resolves its two layers purely by
+matching a clip edge to `tr.at` (`clips_at_cut`), and never falls back to the
+"which clip covers this tick" lookup the ordinary branch uses. So a transition
+whose anchor no longer lands on any cut found neither side and planned
+*nothing* — a hole punched in footage that was perfectly intact underneath,
+for the transition's whole duration, in preview and in export. Confirmed
+directly: one clip [0,4000), stale transition at 2000, and the compiled plan
+came back with no active clip and zero media requests, while the same clip one
+tick outside the region planned fine.
+
+Fixed at both ends, because each fix alone leaves a real gap. Ripples now
+carry transitions using the same `>= at_or_after` rule the clips use, on
+sync-locked sibling tracks too, so a transition can no longer drift onto a
+neighbouring cut. And the compiler falls through to the ordinary lookup when a
+transition's anchor matches neither a clip start nor a clip end, so any stale
+anchor that still arises — from an older project file, say — is invisible
+rather than destructive.
+
+Deliberately narrow on that second one: a transition with only *one* side is
+how a fade in/out is expressed (`clips_at_cut`'s own doc says so), so only a
+transition with neither side falls through. A test pins that a head fade is
+still a transition, because the obvious over-correction here is to treat every
+one-sided transition as stale and quietly delete every fade in the project.
+
+Not adding transitions to the loader's `check_project`: with the fallback in
+place a stale anchor is harmless, and refusing to open a file over something
+the renderer now handles gracefully would be the worse trade.
+
+Checked: 4 new tests — a ripple carries a transition, a transition upstream of
+the edit stays put, a stale anchor shows the footage underneath, and a head
+fade still renders as a transition. 593 tests pass across the workspace,
+clippy clean.
