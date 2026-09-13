@@ -510,6 +510,94 @@ pub mod invariants {
         }
         Ok(())
     }
+
+    /// Why a whole project is structurally unusable.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ProjectViolation {
+        Overlap { track: super::TrackId },
+        /// A clip that ends before it starts, or occupies no time at all.
+        EmptyOrInvertedClip { clip: super::ClipInstanceId },
+        /// A clip starting before the beginning of the sequence.
+        NegativeStart { clip: super::ClipInstanceId },
+        /// A clip whose source range runs backwards.
+        InvertedSourceRange { clip: super::ClipInstanceId },
+        DuplicateClipId(super::ClipInstanceId),
+        DuplicateTrackId(super::TrackId),
+        DuplicateSequenceId(super::SequenceId),
+        /// A sequence whose audio rate can't be used as one.
+        InvalidSampleRate { sequence: super::SequenceId, rate: u32 },
+        /// A sequence with no frame to render into.
+        InvalidFrameSize { sequence: super::SequenceId, width: u32, height: u32 },
+    }
+
+    /// Checks a whole project the way `edit_ops::apply` checks its own
+    /// result — the same standard, applied to projects that arrive from
+    /// disk rather than from an edit.
+    ///
+    /// Clip storage order is *normalised* first rather than rejected:
+    /// `apply` sorts before it checks for exactly this reason (operations
+    /// that move a clip in place leave the vec out of order without
+    /// anything being wrong), so a differently-ordered vec is not
+    /// corruption and must not be treated as any.
+    ///
+    /// Everything else here is a claim no edit could have produced, and
+    /// that later code is entitled to assume: a mixer asked for a clip
+    /// ending before it starts, or two clips answering to one id, has no
+    /// correct behaviour available to it.
+    pub fn check_project(project: &mut super::Project) -> Result<(), ProjectViolation> {
+        let mut seen_sequences = std::collections::HashSet::new();
+        let mut seen_tracks = std::collections::HashSet::new();
+        let mut seen_clips = std::collections::HashSet::new();
+
+        for sequence in &mut project.sequences {
+            if !seen_sequences.insert(sequence.id) {
+                return Err(ProjectViolation::DuplicateSequenceId(sequence.id));
+            }
+            // Divided by and used to size buffers all over the audio path,
+            // and a frame of no size is not something the renderer can
+            // target. Bounds rather than "nonzero": a rate of four billion
+            // is as unusable as a rate of zero, just further from the
+            // arithmetic that would notice.
+            if !(8_000..=768_000).contains(&sequence.settings.sample_rate) {
+                return Err(ProjectViolation::InvalidSampleRate {
+                    sequence: sequence.id,
+                    rate: sequence.settings.sample_rate,
+                });
+            }
+            if sequence.settings.width == 0 || sequence.settings.height == 0 {
+                return Err(ProjectViolation::InvalidFrameSize {
+                    sequence: sequence.id,
+                    width: sequence.settings.width,
+                    height: sequence.settings.height,
+                });
+            }
+
+            for track in &mut sequence.tracks {
+                if !seen_tracks.insert(track.id) {
+                    return Err(ProjectViolation::DuplicateTrackId(track.id));
+                }
+                for clip in &track.clips {
+                    if !seen_clips.insert(clip.id) {
+                        return Err(ProjectViolation::DuplicateClipId(clip.id));
+                    }
+                    if clip.timeline_in.0 < 0 {
+                        return Err(ProjectViolation::NegativeStart { clip: clip.id });
+                    }
+                    if clip.timeline_out.0 <= clip.timeline_in.0 {
+                        return Err(ProjectViolation::EmptyOrInvertedClip { clip: clip.id });
+                    }
+                    if clip.source_out.0 < clip.source_in.0 {
+                        return Err(ProjectViolation::InvertedSourceRange { clip: clip.id });
+                    }
+                }
+                track.clips.sort_by_key(|c| c.timeline_in.0);
+                if check_no_overlaps(track).is_err() {
+                    return Err(ProjectViolation::Overlap { track: track.id });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -13,6 +13,9 @@ pub enum LoadError {
     Io(io::Error),
     Decode(ciborium::de::Error<io::Error>),
     UnsupportedSchemaVersion(u32),
+    /// The file decoded, but describes a project the editor's own
+    /// operations could never have produced.
+    Corrupt(timeline::model::invariants::ProjectViolation),
 }
 
 impl From<io::Error> for LoadError {
@@ -58,7 +61,33 @@ pub fn save(doc: &ProjectDocument, path: &Path) -> Result<(), SaveError> {
 pub fn load(path: &Path) -> Result<ProjectDocument, LoadError> {
     let file = File::open(path)?;
     let doc: ProjectDocument = ciborium::from_reader(file).map_err(LoadError::Decode)?;
-    migrate(doc)
+    let mut doc = migrate(doc)?;
+    // Decoding proves the file is shaped like a project; this proves it
+    // describes one. `edit_ops::apply` re-checks the whole project after
+    // every single edit and refuses to hand back a result that breaks
+    // these rules — so without the same check here, a file is the one way
+    // into the editor that skips it entirely. What arrives that way isn't
+    // merely wrong, it's unworkable: `apply` validates the *whole* project,
+    // so one pre-existing overlap makes every future edit fail, and the
+    // error names the edit the user just tried instead of the file.
+    //
+    // Refusing rather than repairing, for the reason the schema-version
+    // check just above gives: guessing at what a broken file meant is how
+    // you corrupt the user's work on the next save.
+    timeline::model::invariants::check_project(&mut doc.project).map_err(LoadError::Corrupt)?;
+    // Undo history is held to the same standard but is not worth refusing
+    // the file over — it's recoverable context, not the work itself, and
+    // schema v3 already set the precedent of dropping history it couldn't
+    // trust. Left in place, a corrupt entry would simply move the problem
+    // one Ctrl+Z away.
+    if doc
+        .undo_history
+        .iter_mut()
+        .any(|entry| timeline::model::invariants::check_project(&mut entry.before).is_err())
+    {
+        doc.undo_history.clear();
+    }
+    Ok(doc)
 }
 
 /// Brings `doc` up to `CURRENT_SCHEMA_VERSION`, one version at a time.
@@ -128,7 +157,7 @@ pub fn migrate(mut doc: ProjectDocument) -> Result<ProjectDocument, LoadError> {
 mod tests {
     use super::*;
     use crate::schema::ProjectDocument;
-    use timeline::Project;
+    use timeline::{Project, TIMEBASE};
 
     #[test]
     fn round_trips_an_empty_project() {
@@ -141,6 +170,171 @@ mod tests {
 
         assert_eq!(loaded.schema_version, doc.schema_version);
         assert_eq!(loaded.project, doc.project);
+    }
+
+    /// A one-track, one-clip sequence built field by field, so each test
+    /// below can break exactly one rule and leave the rest valid.
+    fn sequence_with(clips: Vec<timeline::ClipInstance>) -> timeline::Sequence {
+        timeline::Sequence {
+            id: timeline::SequenceId(1),
+            name: "S1".into(),
+            settings: timeline::SequenceSettings {
+                frame_rate: timeline::FrameRate::Fps30,
+                width: 1920,
+                height: 1080,
+                sample_rate: 48_000,
+                working_color_primaries: media::ColorPrimaries::Rec709,
+                drop_frame_timecode: false,
+            },
+            tracks: vec![timeline::Track {
+                id: timeline::TrackId(1),
+                kind: timeline::TrackKind::Video,
+                name: "V1".into(),
+                clips,
+                transitions: vec![],
+                gain_db: timeline::unity_gain(),
+                pan: 0.0,
+                locked: false,
+                sync_locked: true,
+                muted: false,
+                solo: false,
+                height_px: 60,
+            }],
+            markers: vec![],
+        }
+    }
+
+    fn clip_at(id: u64, timeline_in: i64, timeline_out: i64) -> timeline::ClipInstance {
+        timeline::ClipInstance {
+            id: timeline::ClipInstanceId(id),
+            source: timeline::ClipSource::Media(media::MediaAssetId(1)),
+            source_in: timeline::TimeTick(0),
+            source_out: timeline::TimeTick(timeline_out - timeline_in),
+            timeline_in: timeline::TimeTick(timeline_in),
+            timeline_out: timeline::TimeTick(timeline_out),
+            speed: timeline::SpeedCurve::Constant { numerator: 1, denominator: 1 },
+            effects: vec![],
+            audio_gain_db: timeline::ParamTrack::constant(timeline::ParamValue::Number(0.0)),
+            audio_pan: timeline::ParamTrack::constant(timeline::ParamValue::Number(0.0)),
+            linked_group: None,
+        }
+    }
+
+    fn save_and_load(sequence: timeline::Sequence) -> Result<ProjectDocument, LoadError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.nleproj");
+        let doc = ProjectDocument::new(
+            Project { sequences: vec![sequence], assets: vec![], bins: vec![] },
+            vec![],
+        );
+        save(&doc, &path).unwrap();
+        load(&path)
+    }
+
+    #[test]
+    fn a_project_whose_clips_overlap_is_refused_rather_than_opened_unusable() {
+        // The failure this exists to prevent isn't the overlap itself, it's
+        // what the overlap does to everything after: `edit_ops::apply`
+        // validates the whole project after every edit, so a file carrying
+        // one makes every subsequent edit fail — and blames the edit.
+        let loaded = save_and_load(sequence_with(vec![
+            clip_at(1, 0, 2 * TIMEBASE),
+            clip_at(2, TIMEBASE, 3 * TIMEBASE),
+        ]));
+        assert!(
+            matches!(loaded, Err(LoadError::Corrupt(_))),
+            "an overlapping project must be refused, got {loaded:?}"
+        );
+    }
+
+    #[test]
+    fn a_clip_that_ends_before_it_starts_is_refused() {
+        let loaded = save_and_load(sequence_with(vec![clip_at(1, 2 * TIMEBASE, TIMEBASE)]));
+        assert!(matches!(loaded, Err(LoadError::Corrupt(_))), "got {loaded:?}");
+    }
+
+    #[test]
+    fn two_clips_sharing_one_id_are_refused() {
+        // Every lookup in the editor is by id, so a duplicate doesn't fail
+        // loudly — it silently edits whichever one was found first.
+        let loaded = save_and_load(sequence_with(vec![
+            clip_at(7, 0, TIMEBASE),
+            clip_at(7, TIMEBASE, 2 * TIMEBASE),
+        ]));
+        assert!(matches!(loaded, Err(LoadError::Corrupt(_))), "got {loaded:?}");
+    }
+
+    #[test]
+    fn an_unusable_sample_rate_is_refused() {
+        let mut sequence = sequence_with(vec![clip_at(1, 0, TIMEBASE)]);
+        sequence.settings.sample_rate = 0;
+        let loaded = save_and_load(sequence);
+        assert!(matches!(loaded, Err(LoadError::Corrupt(_))), "got {loaded:?}");
+    }
+
+    #[test]
+    fn a_clip_starting_before_zero_is_refused() {
+        let loaded = save_and_load(sequence_with(vec![clip_at(1, -TIMEBASE, TIMEBASE)]));
+        assert!(matches!(loaded, Err(LoadError::Corrupt(_))), "got {loaded:?}");
+    }
+
+    #[test]
+    fn clips_stored_out_of_order_are_sorted_rather_than_rejected() {
+        // Storage order is not corruption: `apply` sorts before it checks,
+        // because operations that move a clip in place leave the vec
+        // unsorted without anything being wrong. Rejecting it would refuse
+        // files the editor itself writes.
+        let loaded = save_and_load(sequence_with(vec![
+            clip_at(2, 2 * TIMEBASE, 3 * TIMEBASE),
+            clip_at(1, 0, TIMEBASE),
+        ]))
+        .expect("out-of-order storage must still open");
+        let clips = &loaded.project.sequences[0].tracks[0].clips;
+        assert_eq!(
+            clips.iter().map(|c| c.id.0).collect::<Vec<_>>(),
+            vec![1, 2],
+            "and must come back in timeline order"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_project_still_opens() {
+        // The guard against a validator so strict it refuses real work.
+        let loaded = save_and_load(sequence_with(vec![
+            clip_at(1, 0, TIMEBASE),
+            clip_at(2, TIMEBASE, 2 * TIMEBASE),
+        ]));
+        assert!(loaded.is_ok(), "a valid project must still load: {loaded:?}");
+    }
+
+    #[test]
+    fn corrupt_undo_history_is_dropped_without_refusing_the_file() {
+        // History is recoverable context, not the work itself. Left in
+        // place a corrupt entry would just move the problem one Ctrl+Z away.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.nleproj");
+        let good = Project {
+            sequences: vec![sequence_with(vec![clip_at(1, 0, TIMEBASE)])],
+            assets: vec![],
+            bins: vec![],
+        };
+        let corrupt = Project {
+            sequences: vec![sequence_with(vec![
+                clip_at(1, 0, 2 * TIMEBASE),
+                clip_at(2, TIMEBASE, 3 * TIMEBASE),
+            ])],
+            assets: vec![],
+            bins: vec![],
+        };
+        let mut doc = ProjectDocument::new(good, vec![]);
+        doc.undo_history = vec![crate::schema::PersistedCommand {
+            label: "poisoned".into(),
+            before: corrupt,
+        }];
+        save(&doc, &path).unwrap();
+
+        let loaded = load(&path).expect("a sound project must still open");
+        assert!(loaded.undo_history.is_empty(), "history that fails the same check must be dropped");
     }
 
     #[test]

@@ -381,6 +381,17 @@ impl EditorState {
     pub fn open_from(&mut self, path: &std::path::Path) -> bool {
         let doc = match project::load(path) {
             Ok(doc) => doc,
+            // Worth its own wording: every other open failure is about the
+            // file being unreadable, and telling someone their intact,
+            // openable project "failed to open" with a struct dump invites
+            // them to go looking for a disk problem that isn't there.
+            Err(project::LoadError::Corrupt(violation)) => {
+                self.status = format!(
+                    "couldn't open {} — the file describes a damaged project ({violation:?})",
+                    path.display()
+                );
+                return false;
+            }
             Err(e) => {
                 self.status = format!("open failed: {e:?}");
                 return false;
@@ -409,7 +420,7 @@ impl EditorState {
         self.analysis = super::analysis_jobs::AnalysisJobs::default();
         for r in &doc.media_references {
             let candidate = base_dir
-                .map(|d| d.join(&r.relative_path))
+                .and_then(|d| resolve_relative_media(d, &r.relative_path))
                 .filter(|p| p.exists())
                 .or_else(|| {
                     let abs = PathBuf::from(&r.original_absolute_path);
@@ -489,4 +500,27 @@ impl EditorState {
         };
         true
     }
+}
+
+/// Joins a saved relative media path onto the project's own folder, or
+/// `None` if it isn't the relative path it claims to be.
+///
+/// `relative_path` exists so a self-contained project folder can be moved
+/// or copied wholesale and still find its footage. A project file is
+/// ordinary untrusted input — it can arrive by download or email like any
+/// document — and `Path::join` silently discards the base when handed an
+/// absolute path, so without this check the field marked "relative" could
+/// name any file on the machine and the editor would try to decode it.
+/// `..` gets the same treatment for the same reason.
+///
+/// Media genuinely stored outside the project folder isn't affected: that
+/// case is what `original_absolute_path` is for, and the caller still
+/// falls back to it.
+pub(super) fn resolve_relative_media(base: &std::path::Path, relative: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let relative = std::path::Path::new(relative);
+    let escapes = relative.components().any(|c| {
+        matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+    });
+    (!relative.is_absolute() && !escapes).then(|| base.join(relative))
 }

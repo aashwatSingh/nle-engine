@@ -3506,3 +3506,25 @@ fn open_resolves_media_that_moved_with_the_project_folder() {
         "should resolve via the relative path, not the stale absolute one"
     );
 }
+
+#[test]
+fn a_project_file_cannot_point_its_relative_media_path_anywhere_on_disk() {
+    // `relative_path` is joined onto the project's own folder, and
+    // `Path::join` silently throws the folder away when handed an absolute
+    // path — so the field marked "relative" could name any file on the
+    // machine, and the editor would open and try to decode it. A project
+    // file arrives by download or email like any other document.
+    let base = std::path::Path::new("C:/projects/mine");
+    assert_eq!(
+        super::project_io::resolve_relative_media(base, "footage/a.mp4"),
+        Some(base.join("footage/a.mp4")),
+        "an ordinary relative path must still resolve"
+    );
+    for hostile in ["C:/Windows/System32/config/SAM", "/etc/shadow", "../../../secrets.mp4", r"..\..\secrets.mp4"] {
+        assert_eq!(
+            super::project_io::resolve_relative_media(base, hostile),
+            None,
+            "{hostile} must not resolve"
+        );
+    }
+}
