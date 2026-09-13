@@ -1732,3 +1732,44 @@ Checked: 13 new tests, including the ones that guard against overcorrecting —
 an ordinary project still opens, out-of-order storage still opens and comes
 back sorted, and real frame sizes up to 8K are still allowed. 586 tests
 pass across the workspace, clippy clean.
+
+## 2026-09-13 — an edit arriving mid-drag crashed the editor
+
+`UndoStack::push` asserted that no coalescing group was open, and that
+assert was reachable from ordinary use. Hold the mouse down on a clip and
+press Delete: `lift_selection` -> `apply_ops` -> `push` -> panic, process
+gone, unsaved project with it. Worse, no keystroke is needed — `poll_analysis`
+runs every frame whatever the pointer is doing, so a scene-cut or silence job
+finishing while a clip is being dragged lands on the open group by itself.
+
+The per-frame safety net (`force_close_stale_drag`) was already wired up and
+is not at fault: it closes a group whose mouse-up was never observed, and it
+correctly does *not* fire while the pointer is still down, because at that
+moment the gesture really is still live. That is precisely the window the
+assert made fatal. (Worth recording that the first diagnosis of this claimed
+the safety net was dead code — that was a bad grep for a function name that
+doesn't exist, and it was wrong. The crash was real and reproduced; the
+explanation of it wasn't.)
+
+Fixed in the stack rather than at the keyboard. `push`, `push_or_amend` and
+`begin_coalescing` now commit an open group instead of asserting, and
+`end_coalescing` is idempotent — the widget that opened a gesture has no way
+to know the stack already closed it underneath. Doing it there covers all 24
+`undo.push` call sites and the background-job path at once; gating the key
+handler would have fixed one of the two triggers and left the other.
+
+The invariant the assert protected still holds. It existed so a drag couldn't
+be recorded as 400 separate steps; closing the group first yields exactly two
+— the gesture as one step, then the edit as its own — which is also the order
+Ctrl+Z walks back through, and is what the new tests pin.
+
+`EditorState::coalescing_open` stopped being a stored bool and became a read
+of `undo.is_coalescing()`. It had always been a mirror of the stack's state,
+which was survivable while only the widgets could open and close groups; now
+that the stack closes one on its own, a mirrored flag has no way to learn that
+happened. One source of truth removes the drift rather than documenting it.
+
+Checked: 3 new tests — a keystroke mid-drag commits the drag and applies the
+edit as two separate undo steps, a background analysis result landing mid-drag
+leaves the drag intact, and ending a gesture twice is harmless. 589 tests pass
+across the workspace, clippy clean.

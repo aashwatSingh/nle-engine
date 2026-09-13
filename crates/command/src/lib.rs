@@ -110,7 +110,20 @@ impl UndoStack {
     /// instead for interactive drags — spec 4.3: "dragging a clip is one
     /// undo step, not 400."
     pub fn push(&mut self, label: impl Into<String>, after: Arc<Project>) {
-        assert!(self.coalescing.is_none(), "cannot push while a coalescing group is open");
+        // An edit arriving mid-gesture commits the gesture first rather than
+        // panicking. This used to assert, and the assert was reachable from
+        // ordinary use: a keystroke while the mouse is still down, or a
+        // background analysis landing on a frame during a drag — `poll` runs
+        // every frame whatever the pointer is doing. Crashing the editor and
+        // taking the unsaved project with it is a far worse answer to "these
+        // two overlapped" than deciding what the overlap means.
+        //
+        // The invariant the assert protected still holds. It existed so a
+        // drag couldn't be recorded as 400 separate steps; closing the group
+        // first yields exactly two — the gesture as one step, then this edit
+        // as its own — which is also what someone pressing Ctrl+Z would
+        // expect to walk back through.
+        self.close_open_group();
         let before = std::mem::replace(&mut self.current, after.clone());
         self.revision += 1;
         self.history.push(CommandEntry { label: label.into(), before, after });
@@ -138,7 +151,8 @@ impl UndoStack {
     /// by including a clip id), or edits to two different titles would fold
     /// into a single entry that undoes both.
     pub fn push_or_amend(&mut self, label: impl Into<String>, after: Arc<Project>) {
-        assert!(self.coalescing.is_none(), "cannot amend while a coalescing group is open");
+        // Same reasoning as `push`.
+        self.close_open_group();
         let label = label.into();
         let before = std::mem::replace(&mut self.current, after.clone());
         self.revision += 1;
@@ -161,21 +175,44 @@ impl UndoStack {
     /// Every intermediate state change until `end_coalescing` collapses into
     /// a single undo entry.
     pub fn begin_coalescing(&mut self, label: impl Into<String>) {
-        assert!(self.coalescing.is_none(), "coalescing group already open");
+        // A group still open here means the previous gesture's end was never
+        // observed — a mouse-up lost to a focus change, say. Committing what
+        // it accumulated is better than either panicking or silently folding
+        // two unrelated gestures into one undo entry.
+        self.close_open_group();
         self.coalescing = Some(CoalesceGroup { label: label.into(), before: self.current.clone() });
     }
 
     /// Updates the live project during an open coalescing group (e.g. mouse-move
     /// during a drag) without creating an undo entry yet.
     pub fn update_coalescing(&mut self, after: Arc<Project>) {
-        assert!(self.coalescing.is_some(), "no coalescing group open");
+        // No group open means one was committed underneath this gesture (see
+        // `push`). The update is still a real change the user made, so it
+        // becomes its own entry rather than being dropped.
+        if self.coalescing.is_none() {
+            self.push("edit", after);
+            return;
+        }
         self.current = after;
         self.revision += 1;
     }
 
     /// Commits the coalescing group as a single undo entry (e.g. mouse-up).
+    /// Commits an open group, if there is one. Idempotent: closing a
+    /// gesture that was already committed underneath it is a no-op, not a
+    /// panic, because whoever opened it has no way to know that happened.
     pub fn end_coalescing(&mut self) {
-        let group = self.coalescing.take().expect("no coalescing group open");
+        self.close_open_group();
+    }
+
+    /// Whether a gesture is currently accumulating into one undo entry.
+    /// The single source of truth — callers that track it separately drift.
+    pub fn is_coalescing(&self) -> bool {
+        self.coalescing.is_some()
+    }
+
+    fn close_open_group(&mut self) {
+        let Some(group) = self.coalescing.take() else { return };
         self.history.push(CommandEntry { label: group.label, before: group.before, after: self.current.clone() });
         self.redo.clear();
         if self.history.len() > self.max_history {

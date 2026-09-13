@@ -96,12 +96,6 @@ pub struct EditorState {
     pub playing: bool,
     pub play_anchor: Option<(Instant, i64)>,
     pub drag: Option<Drag>,
-    /// True while a coalescing group is open, regardless of which gesture
-    /// opened it (a timeline drag or an effects-panel slider). Checked once
-    /// per frame in `main.rs` so a group whose `drag_stopped`/mouse-up event
-    /// was missed (e.g. focus lost mid-drag) can't wedge `UndoStack` —
-    /// `begin_coalescing` asserts no group is already open.
-    pub coalescing_open: bool,
     pub status: String,
     /// Live playback-health readout, e.g. "dropped 4". Empty when playback is
     /// keeping up or stopped.
@@ -206,7 +200,6 @@ impl EditorState {
             playing: false,
             play_anchor: None,
             drag: None,
-            coalescing_open: false,
             status: String::new(),
             playback_health: String::new(),
             asset_paths: std::collections::HashMap::new(),
@@ -218,24 +211,38 @@ impl EditorState {
     }
 
 
+    /// Whether a gesture is currently accumulating into one undo entry.
+    ///
+    /// Read from the undo stack rather than tracked alongside it. A separate
+    /// flag was the older shape and it could disagree with the stack — the
+    /// stack now commits an open group on its own when an edit arrives
+    /// mid-gesture, which a mirrored bool has no way to learn about.
+    pub fn coalescing_open(&self) -> bool {
+        self.undo.is_coalescing()
+    }
+
+
     pub fn begin_drag_edit(&mut self, label: &str) {
         self.undo.begin_coalescing(label);
-        self.coalescing_open = true;
     }
 
 
     pub fn end_drag_edit(&mut self) {
         self.undo.end_coalescing();
-        self.coalescing_open = false;
         self.drag = None;
     }
 
 
-    /// Safety net for a coalescing group whose end never got observed by
-    /// the widget that opened it (see `coalescing_open`'s doc comment).
-    /// Call once per frame after building the UI.
+    /// Safety net for a gesture whose end never got observed by the widget
+    /// that opened it — a mouse-up lost to a focus change, or a clip that
+    /// stopped being drawn mid-drag, since `drag_stopped()` only ever fires
+    /// on the widget that is still there to report it.
+    ///
+    /// Called once per frame from the event loop, after the UI is built.
+    /// It has to be: nothing else in the program is in a position to notice
+    /// that the pointer came up somewhere the gesture's own widget never saw.
     pub fn force_close_stale_drag(&mut self, pointer_down: bool) {
-        if self.coalescing_open && !pointer_down {
+        if self.coalescing_open() && !pointer_down {
             self.end_drag_edit();
         }
     }

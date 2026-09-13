@@ -3528,3 +3528,76 @@ fn a_project_file_cannot_point_its_relative_media_path_anywhere_on_disk() {
         );
     }
 }
+
+#[test]
+fn a_keystroke_during_a_drag_commits_the_drag_instead_of_crashing() {
+    // Reachable by holding the mouse down on a clip and pressing Delete.
+    // The per-frame stale-drag guard deliberately doesn't fire here — the
+    // pointer really is still down, the gesture really is still live — so
+    // this is the one window where an edit can arrive on top of an open
+    // group. It used to assert inside UndoStack::push and take the whole
+    // editor, and the unsaved project, with it.
+    let (mut state, ids) = state_with_three_clips();
+    let track = state.sequence().tracks[0].id;
+    state.begin_drag_edit("move clip");
+    state.move_clip(ids[0], track, TIMEBASE * 10);
+
+    state.selected_clips = vec![ids[1]];
+    state.lift_selection();
+
+    // Both survive, as two separate steps: the drag is one, the delete is
+    // the next, which is also the order Ctrl+Z should walk back through.
+    assert!(state.find_clip(ids[1]).is_none(), "the delete must actually have happened");
+    assert_eq!(
+        state.find_clip(ids[0]).map(|(_, c)| c.timeline_in.0),
+        Some(TIMEBASE * 10),
+        "and the drag must have been committed, not discarded"
+    );
+    assert!(state.undo.undo(), "undoing takes back the delete");
+    assert!(state.find_clip(ids[1]).is_some(), "the deleted clip comes back");
+    assert!(state.undo.undo(), "undoing again takes back the drag");
+    assert_eq!(
+        state.find_clip(ids[0]).map(|(_, c)| c.timeline_in.0),
+        Some(0),
+        "the whole drag is one step, not one per mouse-move frame"
+    );
+}
+
+#[test]
+fn a_background_analysis_landing_mid_drag_does_not_crash() {
+    // Needs no keystroke at all: poll_analysis runs every frame whatever
+    // the pointer is doing, so any scene-cut or silence job finishing
+    // while a clip is being dragged used to land on an open group.
+    let (mut state, ids) = state_with_three_clips();
+    let track = state.sequence().tracks[0].id;
+    let placement = placement_now(&state, ids[2]);
+    state.begin_drag_edit("move clip");
+    state.move_clip(ids[0], track, TIMEBASE * 10);
+
+    finish_analysis(
+        &mut state,
+        ids[2],
+        AnalysisKind::SceneCuts,
+        placement,
+        Ok(analysis_jobs::Outcome::SceneCuts(vec![TIMEBASE / 2])),
+    );
+    state.poll_analysis();
+
+    assert_eq!(
+        state.find_clip(ids[0]).map(|(_, c)| c.timeline_in.0),
+        Some(TIMEBASE * 10),
+        "the drag must survive a background result landing on top of it"
+    );
+}
+
+#[test]
+fn ending_a_gesture_twice_is_harmless() {
+    // end_drag_edit is called from whichever widget owns the gesture, and
+    // that widget has no way to know the stack already committed the group
+    // underneath it.
+    let (mut state, _) = state_with_three_clips();
+    state.begin_drag_edit("move clip");
+    state.end_drag_edit();
+    state.end_drag_edit();
+    assert!(!state.coalescing_open());
+}

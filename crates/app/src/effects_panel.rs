@@ -637,7 +637,7 @@ fn keyframe_strip(
     }
 
     if resp.drag_stopped() {
-        if (panel.drag.is_some() || panel.tangent_drag.is_some()) && state.coalescing_open {
+        if (panel.drag.is_some() || panel.tangent_drag.is_some()) && state.coalescing_open() {
             state.end_drag_edit();
         }
         panel.drag = None;
@@ -837,10 +837,10 @@ fn handle_change(
             param_name,
             new_value,
             local,
-            state.coalescing_open,
+            state.coalescing_open(),
         );
     }
-    if resp.drag_stopped() && state.coalescing_open {
+    if resp.drag_stopped() && state.coalescing_open() {
         state.end_drag_edit();
     }
 }

@@ -138,11 +138,11 @@ fn strip(
             }
             if resp.changed() {
                 match track {
-                    Some(id) => state.set_track_gain(id, db, state.coalescing_open),
+                    Some(id) => state.set_track_gain(id, db, state.coalescing_open()),
                     None => state.master_gain_db = db,
                 }
             }
-            if resp.drag_stopped() && state.coalescing_open {
+            if resp.drag_stopped() && state.coalescing_open() {
                 state.end_drag_edit();
             }
         });

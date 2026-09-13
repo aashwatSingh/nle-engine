@@ -488,7 +488,6 @@ impl EditorState {
         self.playing = false;
         self.play_anchor = None;
         self.drag = None;
-        self.coalescing_open = false;
         self.scroll_ticks = 0;
         self.project_path = Some(path.to_path_buf());
         // The "undo history was discarded as inconsistent" branches are gone
