@@ -224,6 +224,22 @@ impl FuzzState {
 }
 
 fn assert_invariants(project: &Project) {
+    // The loader's check, run against projects the editor itself built.
+    //
+    // `check_project` refuses a project file that breaks these rules, which
+    // makes the dangerous direction of that check the *false* one: a
+    // validator that rejects something the editor can legitimately produce
+    // doesn't harden anything, it just makes the user's own saved work
+    // refuse to open. Pointing it at a thousand random edit sequences is a
+    // far stronger statement than opening one file by hand.
+    let mut copy = project.clone();
+    assert_eq!(
+        timeline::model::invariants::check_project(&mut copy),
+        Ok(()),
+        "the loader would reject a project the editor just produced: {:#?}",
+        copy.sequences
+    );
+
     for seq in &project.sequences {
         for track in &seq.tracks {
             assert_eq!(
